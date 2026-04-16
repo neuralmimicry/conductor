@@ -1,0 +1,61 @@
+server:
+  bind_addr: "0.0.0.0:8091"
+  public_base_url: "${CONDUCTOR_PUBLIC_BASE_URL}"
+  dashboard_title: "NeuralMimicry Conductor"
+
+security:
+  admin_token: "${CONDUCTOR_ADMIN_TOKEN}"
+  allow_dashboard_without_token: true
+
+storage:
+  root_dir: "data"
+
+database:
+  url: "${CONDUCTOR_DATABASE_URL}"
+  max_connections: 10
+  run_migrations: true
+
+discovery:
+  ansible_root: "/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible"
+  refresh_interval_seconds: 180
+  probe_services: true
+  service_timeout_seconds: 5
+  repo_hints:
+    gail_repo: "/home/pbisaacs/Developer/neuralmimicry/gail"
+    tracey_repo: "/home/pbisaacs/Developer/neuralmimicry/tracey"
+    continuum_repo: "/home/pbisaacs/Developer/neuralmimicry/nmc"
+    refiner_repo: "/home/pbisaacs/Developer/neuralmimicry/rag_demo"
+    aarnn_repo: "/home/pbisaacs/Developer/neuralmimicry/aarnn_rust"
+
+integrations:
+  gail:
+    enabled: true
+    base_url: "${GAIL_BASE_URL}"
+    bearer_token: "${GAIL_BEARER_TOKEN}"
+    timeout_seconds: 10
+  tracey:
+    enabled: true
+    base_url: "${TRACEY_BASE_URL}"
+    bearer_token: "${TRACEY_BEARER_TOKEN}"
+    timeout_seconds: 5
+  continuum:
+    enabled: true
+    base_url: "${CONTINUUM_BASE_URL}"
+    bearer_token: "${CONTINUUM_BEARER_TOKEN}"
+    timeout_seconds: 5
+  refiner:
+    enabled: true
+    base_url: "${REFINER_BASE_URL}"
+    bearer_token: "${REFINER_BEARER_TOKEN}"
+    timeout_seconds: 10
+  aarnn:
+    enabled: true
+    base_url: "${AARNN_BASE_URL}"
+    bearer_token: "${AARNN_BEARER_TOKEN}"
+    timeout_seconds: 10
+
+planning:
+  refresh_interval_seconds: 240
+  auto_queue: true
+  gail_workflow: "conductor_improvement_planner"
+  minimum_priority: 40

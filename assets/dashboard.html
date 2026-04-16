@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>__TITLE__</title>
+  <style>
+    :root {
+      --bg: radial-gradient(circle at top, #18344a 0%, #09131c 55%, #05080b 100%);
+      --panel: rgba(12, 23, 33, 0.88);
+      --panel-strong: rgba(18, 31, 43, 0.96);
+      --line: rgba(170, 199, 220, 0.16);
+      --text: #eef5f8;
+      --muted: #94aab7;
+      --accent: #d9a441;
+      --accent-soft: rgba(217, 164, 65, 0.18);
+      --ok: #4fba8f;
+      --warn: #f5bf58;
+      --bad: #ef6f59;
+      --ink: #071017;
+      --mono: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+      --serif: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--mono);
+      padding: 24px;
+    }
+    .shell { max-width: 1500px; margin: 0 auto; display: grid; gap: 18px; }
+    .hero { display: grid; grid-template-columns: 1.5fr 1fr; gap: 18px; align-items: stretch; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      padding: 20px;
+      backdrop-filter: blur(16px);
+      box-shadow: 0 24px 90px rgba(0, 0, 0, 0.35);
+    }
+    .title { font-family: var(--serif); font-size: clamp(2rem, 4vw, 3.75rem); line-height: 0.96; margin: 0 0 12px; letter-spacing: 0.02em; }
+    .sub { color: var(--muted); max-width: 62ch; line-height: 1.5; }
+    .login { display: grid; gap: 12px; align-content: start; }
+    .label { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.16em; color: var(--muted); margin-bottom: 6px; }
+    input, textarea, select, button { font: inherit; }
+    input, textarea, select {
+      width: 100%; background: rgba(255,255,255,0.04); border: 1px solid var(--line); color: var(--text); border-radius: 12px; padding: 10px 12px;
+    }
+    textarea { min-height: 88px; resize: vertical; }
+    button {
+      border: 0; border-radius: 999px; background: linear-gradient(135deg, #f1c35e, #b87a23); color: var(--ink); font-weight: 700; padding: 12px 18px; cursor: pointer;
+    }
+    button.secondary { background: rgba(255,255,255,0.06); color: var(--text); border: 1px solid var(--line); }
+    .status {
+      display: inline-flex; align-items: center; gap: 8px; border-radius: 999px; padding: 8px 12px; background: rgba(255,255,255,0.05); border: 1px solid var(--line); color: var(--muted); width: max-content;
+    }
+    .status.ok { color: var(--ok); }
+    .status.warn { color: var(--warn); }
+    .status.bad { color: var(--bad); }
+    .cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+    .card { background: var(--panel-strong); border: 1px solid var(--line); border-radius: 18px; padding: 16px; }
+    .metric { font-size: 2rem; font-weight: 700; margin-top: 10px; }
+    .section-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 14px; }
+    .section-title { margin: 0; font-family: var(--serif); font-size: 1.6rem; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+    .grid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 18px; }
+    .table-wrap { overflow: auto; border-radius: 16px; border: 1px solid var(--line); }
+    table { width: 100%; border-collapse: collapse; min-width: 760px; }
+    th, td { padding: 12px 10px; vertical-align: top; border-bottom: 1px solid rgba(255,255,255,0.06); text-align: left; }
+    th { font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.14em; color: var(--muted); background: rgba(255,255,255,0.02); position: sticky; top: 0; }
+    .pill {
+      display: inline-block; border-radius: 999px; padding: 5px 9px; margin: 0 6px 6px 0; background: var(--accent-soft); border: 1px solid rgba(217, 164, 65, 0.24); color: #f5d79a; font-size: 0.78rem;
+    }
+    .mono { font-family: var(--mono); font-size: 0.85rem; word-break: break-all; }
+    .muted { color: var(--muted); }
+    .row-actions { display: grid; gap: 8px; }
+    .cycle { padding: 14px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
+    .cycle:last-child { border-bottom: 0; }
+    @media (max-width: 1100px) { .hero, .grid, .cards { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<div class="shell">
+  <section class="hero">
+    <div class="panel">
+      <div class="status" id="auth-status">Token not loaded</div>
+      <h1 class="title">Conductor</h1>
+      <p class="sub">Iterative control surface for Gail, Tracey, Continuum, Refiner, AARNN, and the Continuum tenant graph derived from Ansible. The dashboard tracks discovery, planning loops, work queues, and admin overrides.</p>
+    </div>
+    <div class="panel login">
+      <div>
+        <div class="label">Admin Token</div>
+        <input id="token" placeholder="Paste CONDUCTOR_ADMIN_TOKEN if configured" />
+      </div>
+      <div class="actions">
+        <button id="save-token">Use Token</button>
+        <button class="secondary" id="clear-token">Clear</button>
+      </div>
+      <div class="muted">If no token is configured on the server, the dashboard APIs will still respond.</div>
+    </div>
+  </section>
+  <section class="cards" id="summary-cards"></section>
+  <section class="grid">
+    <div class="panel">
+      <div class="section-head">
+        <h2 class="section-title">Work Queue</h2>
+        <div class="actions">
+          <button class="secondary" id="refresh">Refresh</button>
+          <button id="run-discovery">Run Discovery</button>
+          <button id="run-planning">Run Planning</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Work</th><th>Status</th><th>Priority</th><th>Progress</th><th>Schedule</th><th>Target</th><th>Admin</th></tr></thead>
+          <tbody id="work-items"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="section-head"><h2 class="section-title">Improvement Cycles</h2></div>
+      <div id="cycles"></div>
+    </div>
+  </section>
+  <section class="panel">
+    <div class="section-head"><h2 class="section-title">Service Topology</h2></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Service</th><th>Health</th><th>Endpoints</th><th>Dependencies</th><th>Capabilities</th></tr></thead>
+        <tbody id="services"></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+<script>
+const state = { token: localStorage.getItem('conductor_admin_token') || '' };
+const els = {
+  token: document.getElementById('token'), saveToken: document.getElementById('save-token'), clearToken: document.getElementById('clear-token'),
+  authStatus: document.getElementById('auth-status'), summaryCards: document.getElementById('summary-cards'), workItems: document.getElementById('work-items'),
+  services: document.getElementById('services'), cycles: document.getElementById('cycles'), refresh: document.getElementById('refresh'),
+  runDiscovery: document.getElementById('run-discovery'), runPlanning: document.getElementById('run-planning'),
+};
+els.token.value = state.token; updateAuthBadge();
+function updateAuthBadge(message) {
+  if (message) { els.authStatus.textContent = message; els.authStatus.className = 'status warn'; return; }
+  if (state.token) { els.authStatus.textContent = 'Admin token loaded'; els.authStatus.className = 'status ok'; }
+  else { els.authStatus.textContent = 'No admin token loaded'; els.authStatus.className = 'status'; }
+}
+function headers(jsonBody = false) { const out = {}; if (state.token) out['Authorization'] = `Bearer ${state.token}`; if (jsonBody) out['Content-Type'] = 'application/json'; return out; }
+async function fetchJson(path, options = {}) {
+  const response = await fetch(path, { ...options, headers: { ...headers(Boolean(options.body)), ...(options.headers || {}) } });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || `Request failed: ${response.status}`);
+  return payload;
+}
+function toneForHealth(health) { if (health === 'healthy') return 'var(--ok)'; if (health === 'degraded') return 'var(--warn)'; if (health === 'unreachable' || health === 'missing') return 'var(--bad)'; return 'var(--muted)'; }
+function renderSummary(summary) {
+  const cards = [['Services', summary.services_total, `${summary.services_healthy} healthy`], ['Degraded', summary.services_degraded, `${summary.services_unreachable} unreachable`], ['Work Items', summary.work_items_total, 'planned to completed'], ['Cycles', summary.cycles_total, summary.latest_cycle ? summary.latest_cycle.summary : 'no cycles yet']];
+  els.summaryCards.innerHTML = cards.map(([label, metric, detail]) => `<article class="card"><div class="label">${label}</div><div class="metric">${metric}</div><div class="muted">${detail}</div></article>`).join('');
+}
+function renderServices(services) {
+  els.services.innerHTML = services.map((service) => `<tr><td><strong>${service.display_name}</strong><br><span class="muted">${service.kind}</span><br><span class="mono">${service.role_name}</span></td><td><span class="pill" style="color:${toneForHealth(service.health)}; border-color:${toneForHealth(service.health)}33; background:${toneForHealth(service.health)}18;">${service.health}</span></td><td class="mono">${service.public_url ? `public: ${service.public_url}<br>` : ''}${service.internal_url ? `internal: ${service.internal_url}<br>` : ''}${service.repo_path ? `repo: ${service.repo_path}` : '<span class="muted">no repo hint</span>'}</td><td>${(service.dependencies || []).map((item) => `<span class="pill">${item}</span>`).join('') || '<span class="muted">none</span>'}</td><td>${(service.capabilities || []).map((item) => `<span class="pill">${item}</span>`).join('')}</td></tr>`).join('');
+}
+function renderCycles(cycles) {
+  els.cycles.innerHTML = cycles.map((cycle) => `<div class="cycle"><div><strong>${cycle.summary}</strong></div><div class="muted">${new Date(cycle.finished_at).toLocaleString()} · ${cycle.status}</div><div>${(cycle.source_services || []).map((item) => `<span class="pill">${item}</span>`).join('')}</div>${cycle.gail_response ? `<details><summary>Gail advisory</summary><pre class="mono">${JSON.stringify(cycle.gail_response, null, 2)}</pre></details>` : ''}</div>`).join('') || '<div class="muted">No improvement cycles recorded yet.</div>';
+}
+function toDateTimeLocal(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = (item) => String(item).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+function renderWorkItems(items) {
+  const statuses = ['planned', 'scheduled', 'in_operation', 'success', 'failure', 'aborted', 'on_hold'];
+  els.workItems.innerHTML = items.map((item) => `<tr><td><strong>${item.title}</strong><br><div class="muted">${item.summary}</div><div>${(item.tags || []).map((tag) => `<span class="pill">${tag}</span>`).join('')}</div></td><td><select data-field="status" data-id="${item.id}">${statuses.map((status) => `<option value="${status}" ${status === item.status ? 'selected' : ''}>${status}</option>`).join('')}</select></td><td><input type="number" data-field="priority" data-id="${item.id}" value="${item.priority}" /></td><td><input type="number" data-field="progress_pct" data-id="${item.id}" min="0" max="100" value="${item.progress_pct}" /></td><td><input type="datetime-local" data-field="scheduled_for" data-id="${item.id}" value="${toDateTimeLocal(item.scheduled_for)}" /></td><td>${item.target_service || '<span class="muted">none</span>'}</td><td><div class="row-actions"><label><input type="checkbox" data-field="admin_override" data-id="${item.id}" ${item.admin_override ? 'checked' : ''} /> admin override</label><textarea data-field="note" data-id="${item.id}" placeholder="append note"></textarea><button class="secondary" data-action="save" data-id="${item.id}">Save</button></div></td></tr>`).join('');
+  els.workItems.querySelectorAll('button[data-action="save"]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const id = button.dataset.id; const values = {};
+      els.workItems.querySelectorAll(`[data-id="${id}"]`).forEach((el) => {
+        const field = el.dataset.field; if (!field) return;
+        if (field === 'admin_override') values[field] = el.checked;
+        else if (field === 'priority' || field === 'progress_pct') values[field] = Number(el.value);
+        else if (field === 'scheduled_for') {
+          if (el.value) values[field] = new Date(el.value).toISOString();
+          else values.clear_schedule = true;
+        }
+        else if (field === 'note') { if (el.value.trim()) values[field] = el.value.trim(); }
+        else values[field] = el.value;
+      });
+      try { await fetchJson(`/api/v1/work-items/${id}`, { method: 'PATCH', body: JSON.stringify(values) }); await load(); }
+      catch (error) { updateAuthBadge(error.message); }
+    });
+  });
+}
+async function load() {
+  try {
+    const [summary, services, workItems, cycles] = await Promise.all([fetchJson('/api/v1/summary'), fetchJson('/api/v1/services'), fetchJson('/api/v1/work-items'), fetchJson('/api/v1/cycles?limit=10')]);
+    renderSummary(summary); renderServices(services.services || services); renderWorkItems(workItems.work_items || workItems); renderCycles(cycles.cycles || cycles); updateAuthBadge();
+  } catch (error) { updateAuthBadge(error.message); }
+}
+els.saveToken.addEventListener('click', () => { state.token = els.token.value.trim(); localStorage.setItem('conductor_admin_token', state.token); load(); });
+els.clearToken.addEventListener('click', () => { state.token = ''; els.token.value = ''; localStorage.removeItem('conductor_admin_token'); load(); });
+els.refresh.addEventListener('click', load);
+els.runDiscovery.addEventListener('click', async () => { try { await fetchJson('/api/v1/discovery/run', { method: 'POST' }); await load(); } catch (error) { updateAuthBadge(error.message); } });
+els.runPlanning.addEventListener('click', async () => { try { await fetchJson('/api/v1/planning/run', { method: 'POST' }); await load(); } catch (error) { updateAuthBadge(error.message); } });
+load();
+</script>
+</body>
+</html>
