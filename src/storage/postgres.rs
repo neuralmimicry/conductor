@@ -11,8 +11,8 @@ use uuid::Uuid;
 use crate::{
     config::DatabaseConfig,
     models::{
-        DiscoveryRun, ImprovementCycle, RunStatus, ServiceHealth, ServiceSnapshot, WorkItem,
-        WorkItemPatch, WorkStatus,
+        DiscoveryRun, ExecutionStatus, ImprovementCycle, RunStatus, ServiceHealth,
+        ServiceMetricSample, ServiceSnapshot, WorkExecution, WorkItem, WorkItemPatch, WorkStatus,
     },
     repository::ConductorRepository,
 };
@@ -73,17 +73,20 @@ impl ConductorRepository for PostgresRepository {
         sqlx::query("DELETE FROM service_snapshots")
             .execute(&mut *tx)
             .await?;
+
         for service in services {
             sqlx::query(
                 r#"
                 INSERT INTO service_snapshots (
                     service_key, display_name, kind, role_name, playbooks, hosts, namespace,
-                    service_name, internal_url, public_url, repo_path, health, capabilities,
-                    dependencies, storage_paths, raw_defaults, probe, discovered_at, updated_at
+                    service_name, internal_url, public_url, repo_path, repo_url, repo_branch,
+                    health, capabilities, dependencies, storage_paths, raw_defaults, probe,
+                    discovered_at, updated_at
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7,
                     $8, $9, $10, $11, $12, $13,
-                    $14, $15, $16, $17, $18, $19
+                    $14, $15, $16, $17, $18, $19,
+                    $20, $21
                 )
                 "#,
             )
@@ -98,6 +101,8 @@ impl ConductorRepository for PostgresRepository {
             .bind(&service.internal_url)
             .bind(&service.public_url)
             .bind(&service.repo_path)
+            .bind(&service.repo_url)
+            .bind(&service.repo_branch)
             .bind(service.health.as_str())
             .bind(Json(service.capabilities.clone()))
             .bind(Json(service.dependencies.clone()))
@@ -109,6 +114,7 @@ impl ConductorRepository for PostgresRepository {
             .execute(&mut *tx)
             .await?;
         }
+
         tx.commit().await?;
         Ok(())
     }
@@ -134,6 +140,9 @@ impl ConductorRepository for PostgresRepository {
     }
 
     async fn list_discovery_runs(&self, limit: usize) -> Result<Vec<DiscoveryRun>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let rows = sqlx::query("SELECT * FROM discovery_runs ORDER BY finished_at DESC LIMIT $1")
             .bind(limit as i64)
             .fetch_all(&self.pool)
@@ -141,17 +150,81 @@ impl ConductorRepository for PostgresRepository {
         rows.into_iter().map(map_discovery_run).collect()
     }
 
+    async fn insert_service_metric_samples(&self, samples: &[ServiceMetricSample]) -> Result<()> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+        for sample in samples {
+            sqlx::query(
+                r#"
+                INSERT INTO service_metric_samples (
+                    id, discovery_run_id, service_key, metric_source, metrics, sampled_at
+                ) VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (id) DO UPDATE SET
+                    discovery_run_id = EXCLUDED.discovery_run_id,
+                    service_key = EXCLUDED.service_key,
+                    metric_source = EXCLUDED.metric_source,
+                    metrics = EXCLUDED.metrics,
+                    sampled_at = EXCLUDED.sampled_at
+                "#,
+            )
+            .bind(sample.id)
+            .bind(sample.discovery_run_id)
+            .bind(&sample.service_key)
+            .bind(&sample.metric_source)
+            .bind(Json(sample.metrics.clone()))
+            .bind(sample.sampled_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_service_metric_samples(
+        &self,
+        service_key: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ServiceMetricSample>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let rows = if let Some(service_key) =
+            service_key.map(str::trim).filter(|value| !value.is_empty())
+        {
+            sqlx::query(
+                "SELECT * FROM service_metric_samples WHERE service_key = $1 ORDER BY sampled_at DESC LIMIT $2",
+            )
+            .bind(service_key)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query("SELECT * FROM service_metric_samples ORDER BY sampled_at DESC LIMIT $1")
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+        };
+
+        rows.into_iter().map(map_service_metric_sample).collect()
+    }
+
     async fn upsert_work_item(&self, item: &WorkItem) -> Result<()> {
         sqlx::query(
             r#"
             INSERT INTO work_items (
                 id, dedupe_key, title, summary, target_service, status, priority,
-                progress_pct, admin_override, source, tags, plan, notes, scheduled_for,
-                started_at, finished_at, created_at, updated_at
+                progress_pct, admin_override, execution_approved, verification_required,
+                source, tags, plan, notes, scheduled_for, started_at, finished_at,
+                last_execution_id, last_policy, created_at, updated_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7,
-                $8, $9, $10, $11, $12, $13, $14,
-                $15, $16, $17, $18
+                $8, $9, $10, $11,
+                $12, $13, $14, $15, $16, $17, $18,
+                $19, $20, $21, $22
             )
             ON CONFLICT (id) DO UPDATE SET
                 dedupe_key = EXCLUDED.dedupe_key,
@@ -162,6 +235,8 @@ impl ConductorRepository for PostgresRepository {
                 priority = EXCLUDED.priority,
                 progress_pct = EXCLUDED.progress_pct,
                 admin_override = EXCLUDED.admin_override,
+                execution_approved = EXCLUDED.execution_approved,
+                verification_required = EXCLUDED.verification_required,
                 source = EXCLUDED.source,
                 tags = EXCLUDED.tags,
                 plan = EXCLUDED.plan,
@@ -169,6 +244,8 @@ impl ConductorRepository for PostgresRepository {
                 scheduled_for = EXCLUDED.scheduled_for,
                 started_at = EXCLUDED.started_at,
                 finished_at = EXCLUDED.finished_at,
+                last_execution_id = EXCLUDED.last_execution_id,
+                last_policy = EXCLUDED.last_policy,
                 updated_at = EXCLUDED.updated_at
             "#,
         )
@@ -181,6 +258,8 @@ impl ConductorRepository for PostgresRepository {
         .bind(item.priority)
         .bind(item.progress_pct)
         .bind(item.admin_override)
+        .bind(item.execution_approved)
+        .bind(item.verification_required)
         .bind(&item.source)
         .bind(Json(item.tags.clone()))
         .bind(Json(item.plan.clone()))
@@ -188,6 +267,8 @@ impl ConductorRepository for PostgresRepository {
         .bind(item.scheduled_for)
         .bind(item.started_at)
         .bind(item.finished_at)
+        .bind(item.last_execution_id)
+        .bind(Json(item.last_policy.clone()))
         .bind(item.created_at)
         .bind(item.updated_at)
         .execute(&self.pool)
@@ -220,14 +301,89 @@ impl ConductorRepository for PostgresRepository {
     }
 
     async fn find_work_item_by_dedupe_key(&self, dedupe_key: &str) -> Result<Option<WorkItem>> {
-        if dedupe_key.trim().is_empty() {
+        let trimmed = dedupe_key.trim();
+        if trimmed.is_empty() {
             return Ok(None);
         }
         let row = sqlx::query("SELECT * FROM work_items WHERE dedupe_key = $1")
-            .bind(dedupe_key.trim())
+            .bind(trimmed)
             .fetch_optional(&self.pool)
             .await?;
         row.map(map_work_item).transpose()
+    }
+
+    async fn upsert_work_execution(&self, execution: &WorkExecution) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO work_executions (
+                id, work_item_id, target_service, status, refiner_job_id, policy,
+                request_payload, latest_payload, verification, error, started_at,
+                updated_at, finished_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6,
+                $7, $8, $9, $10, $11,
+                $12, $13
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                work_item_id = EXCLUDED.work_item_id,
+                target_service = EXCLUDED.target_service,
+                status = EXCLUDED.status,
+                refiner_job_id = EXCLUDED.refiner_job_id,
+                policy = EXCLUDED.policy,
+                request_payload = EXCLUDED.request_payload,
+                latest_payload = EXCLUDED.latest_payload,
+                verification = EXCLUDED.verification,
+                error = EXCLUDED.error,
+                started_at = EXCLUDED.started_at,
+                updated_at = EXCLUDED.updated_at,
+                finished_at = EXCLUDED.finished_at
+            "#,
+        )
+        .bind(execution.id)
+        .bind(execution.work_item_id)
+        .bind(&execution.target_service)
+        .bind(execution.status.as_str())
+        .bind(&execution.refiner_job_id)
+        .bind(Json(execution.policy.clone()))
+        .bind(Json(execution.request_payload.clone()))
+        .bind(Json(execution.latest_payload.clone()))
+        .bind(Json(execution.verification.clone()))
+        .bind(&execution.error)
+        .bind(execution.started_at)
+        .bind(execution.updated_at)
+        .bind(execution.finished_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_work_executions(&self, limit: usize) -> Result<Vec<WorkExecution>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query("SELECT * FROM work_executions ORDER BY updated_at DESC LIMIT $1")
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(map_work_execution).collect()
+    }
+
+    async fn list_work_executions_for_item(
+        &self,
+        work_item_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<WorkExecution>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT * FROM work_executions WHERE work_item_id = $1 ORDER BY updated_at DESC LIMIT $2",
+        )
+        .bind(work_item_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(map_work_execution).collect()
     }
 
     async fn insert_improvement_cycle(&self, cycle: &ImprovementCycle) -> Result<()> {
@@ -253,6 +409,9 @@ impl ConductorRepository for PostgresRepository {
     }
 
     async fn list_improvement_cycles(&self, limit: usize) -> Result<Vec<ImprovementCycle>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let rows =
             sqlx::query("SELECT * FROM improvement_cycles ORDER BY finished_at DESC LIMIT $1")
                 .bind(limit as i64)
@@ -273,6 +432,8 @@ fn map_work_item(row: PgRow) -> Result<WorkItem> {
         priority: row.try_get("priority")?,
         progress_pct: row.try_get("progress_pct")?,
         admin_override: row.try_get("admin_override")?,
+        execution_approved: row.try_get("execution_approved")?,
+        verification_required: row.try_get("verification_required")?,
         source: row.try_get("source")?,
         tags: row.try_get::<Json<Vec<String>>, _>("tags")?.0,
         plan: row.try_get::<Json<serde_json::Value>, _>("plan")?.0,
@@ -280,6 +441,8 @@ fn map_work_item(row: PgRow) -> Result<WorkItem> {
         scheduled_for: row.try_get("scheduled_for")?,
         started_at: row.try_get("started_at")?,
         finished_at: row.try_get("finished_at")?,
+        last_execution_id: row.try_get("last_execution_id")?,
+        last_policy: row.try_get::<Json<serde_json::Value>, _>("last_policy")?.0,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -298,6 +461,8 @@ fn map_service_snapshot(row: PgRow) -> Result<ServiceSnapshot> {
         internal_url: row.try_get("internal_url")?,
         public_url: row.try_get("public_url")?,
         repo_path: row.try_get("repo_path")?,
+        repo_url: row.try_get("repo_url")?,
+        repo_branch: row.try_get("repo_branch")?,
         health: ServiceHealth::from_db(row.try_get::<String, _>("health")?.as_str()),
         capabilities: row.try_get::<Json<Vec<String>>, _>("capabilities")?.0,
         dependencies: row.try_get::<Json<Vec<String>>, _>("dependencies")?.0,
@@ -317,6 +482,39 @@ fn map_discovery_run(row: PgRow) -> Result<DiscoveryRun> {
         issues: row.try_get::<Json<Vec<String>>, _>("issues")?.0,
         topology: row.try_get::<Json<serde_json::Value>, _>("topology")?.0,
         started_at: row.try_get("started_at")?,
+        finished_at: row.try_get("finished_at")?,
+    })
+}
+
+fn map_service_metric_sample(row: PgRow) -> Result<ServiceMetricSample> {
+    Ok(ServiceMetricSample {
+        id: row.try_get("id")?,
+        discovery_run_id: row.try_get("discovery_run_id")?,
+        service_key: row.try_get("service_key")?,
+        metric_source: row.try_get("metric_source")?,
+        metrics: row.try_get::<Json<serde_json::Value>, _>("metrics")?.0,
+        sampled_at: row.try_get("sampled_at")?,
+    })
+}
+
+fn map_work_execution(row: PgRow) -> Result<WorkExecution> {
+    Ok(WorkExecution {
+        id: row.try_get("id")?,
+        work_item_id: row.try_get("work_item_id")?,
+        target_service: row.try_get("target_service")?,
+        status: ExecutionStatus::from_db(row.try_get::<String, _>("status")?.as_str()),
+        refiner_job_id: row.try_get("refiner_job_id")?,
+        policy: row.try_get::<Json<serde_json::Value>, _>("policy")?.0,
+        request_payload: row
+            .try_get::<Json<serde_json::Value>, _>("request_payload")?
+            .0,
+        latest_payload: row
+            .try_get::<Json<serde_json::Value>, _>("latest_payload")?
+            .0,
+        verification: row.try_get::<Json<serde_json::Value>, _>("verification")?.0,
+        error: row.try_get("error")?,
+        started_at: row.try_get("started_at")?,
+        updated_at: row.try_get("updated_at")?,
         finished_at: row.try_get("finished_at")?,
     })
 }

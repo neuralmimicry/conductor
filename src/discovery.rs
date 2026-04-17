@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use anyhow::{Result, anyhow};
@@ -44,6 +45,12 @@ struct MutableService {
     vars: Map<String, Value>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct RepoMetadata {
+    url: Option<String>,
+    branch: Option<String>,
+}
+
 impl MutableService {
     fn new(
         service_key: impl Into<String>,
@@ -82,9 +89,9 @@ impl MutableService {
 
     fn finalize(mut self, config: &ConductorConfig) -> ServiceSnapshot {
         let now = now_utc();
-        self.repo_path = repo_hint(config, &self.service_key)
-            .filter(|path| path.exists())
-            .map(|path| path.display().to_string());
+        let repo_path = repo_hint(config, &self.service_key).filter(|path| path.exists());
+        let repo_metadata = repo_path.as_deref().map(repo_metadata).unwrap_or_default();
+        self.repo_path = repo_path.map(|path| path.display().to_string());
 
         let namespace = pick_string(
             &self.vars,
@@ -188,6 +195,8 @@ impl MutableService {
             internal_url,
             public_url,
             repo_path: self.repo_path,
+            repo_url: repo_metadata.url,
+            repo_branch: repo_metadata.branch,
             health: ServiceHealth::Unknown,
             capabilities: self.capabilities.into_iter().collect(),
             dependencies: self.dependencies.into_iter().collect(),
@@ -844,6 +853,16 @@ fn infer_capabilities(
             .into_iter()
             .map(ToString::to_string),
         ),
+        "conductor" => capabilities.extend(
+            [
+                "improvement_planning",
+                "workflow_governance",
+                "execution_control",
+                "dashboard",
+            ]
+            .into_iter()
+            .map(ToString::to_string),
+        ),
         "prometheus" | "grafana" => {
             capabilities.insert("observability".to_string());
         }
@@ -873,12 +892,39 @@ fn flatten_value(value: &Value, output: &mut Vec<String>) {
 
 fn repo_hint(config: &ConductorConfig, service_key: &str) -> Option<PathBuf> {
     match service_key {
+        "conductor" => Some(config.discovery.repo_hints.conductor_repo.clone()),
         "gail" => Some(config.discovery.repo_hints.gail_repo.clone()),
         "tracey" => Some(config.discovery.repo_hints.tracey_repo.clone()),
         "continuum" => Some(config.discovery.repo_hints.continuum_repo.clone()),
         "refiner" => Some(config.discovery.repo_hints.refiner_repo.clone()),
         "aarnn" => Some(config.discovery.repo_hints.aarnn_repo.clone()),
         _ => None,
+    }
+}
+
+fn repo_metadata(repo_path: &Path) -> RepoMetadata {
+    RepoMetadata {
+        url: git_output(repo_path, ["config", "--get", "remote.origin.url"]),
+        branch: git_output(repo_path, ["rev-parse", "--abbrev-ref", "HEAD"]),
+    }
+}
+
+fn git_output<const N: usize>(repo_path: &Path, args: [&str; N]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "HEAD" {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 

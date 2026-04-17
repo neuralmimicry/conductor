@@ -21,6 +21,7 @@ discovery:
   probe_services: true
   service_timeout_seconds: 5
   repo_hints:
+    conductor_repo: "/home/pbisaacs/Developer/neuralmimicry/conductor"
     gail_repo: "/home/pbisaacs/Developer/neuralmimicry/gail"
     tracey_repo: "/home/pbisaacs/Developer/neuralmimicry/tracey"
     continuum_repo: "/home/pbisaacs/Developer/neuralmimicry/nmc"
@@ -47,6 +48,8 @@ integrations:
     enabled: true
     base_url: "${REFINER_BASE_URL}"
     bearer_token: "${REFINER_BEARER_TOKEN}"
+    username: "${REFINER_USERNAME}"
+    password: "${REFINER_PASSWORD}"
     timeout_seconds: 10
   aarnn:
     enabled: true
@@ -59,3 +62,38 @@ planning:
   auto_queue: true
   gail_workflow: "conductor_improvement_planner"
   minimum_priority: 40
+
+execution:
+  enabled: true
+  refresh_interval_seconds: 120
+  poll_interval_seconds: 5
+  job_timeout_seconds: 900
+  max_concurrent_executions: 1
+  use_local_project_root: true
+  refiner_workflow: "project_solver"
+  token_scope: "personal"
+  llm_provider: "${CONDUCTOR_LLM_PROVIDER}"
+  llm_model: "${CONDUCTOR_LLM_MODEL}"
+  coding_agent: "${CONDUCTOR_CODING_AGENT}"
+
+policy:
+  enabled: true
+  require_admin_approval: true
+  require_verification: true
+  require_refiner_strict_mode: true
+  allow_external_repo_execution: true
+  protected_services:
+    - "gail"
+    - "refiner"
+    - "aarnn"
+  protected_repo_roots:
+    - "/home/pbisaacs/Developer/neuralmimicry/gail"
+    - "/home/pbisaacs/Developer/neuralmimicry/tracey"
+    - "/home/pbisaacs/Developer/neuralmimicry/nmc"
+    - "/home/pbisaacs/Developer/neuralmimicry/rag_demo"
+    - "/home/pbisaacs/Developer/neuralmimicry/aarnn_rust"
+  blocked_action_keywords:
+    - "reset --hard"
+    - "rm -rf"
+    - "wipe"
+    - "destroy"

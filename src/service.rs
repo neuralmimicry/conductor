@@ -9,10 +9,12 @@ use crate::{
     discovery::discover_and_probe,
     error::ApiError,
     models::{
-        DashboardSummary, DiscoveryRun, ImprovementCycle, WorkItem, now_utc, topology_from_services,
+        DashboardSummary, DiscoveryRun, ImprovementCycle, WorkItem, WorkStatus, now_utc,
+        topology_from_services,
     },
     planner::run_planning_cycle,
     repository::ConductorRepository,
+    trends::collect_metric_samples,
 };
 
 #[derive(Clone)]
@@ -65,8 +67,14 @@ impl ConductorService {
 
     pub async fn run_discovery_cycle(&self) -> Result<DiscoveryRun> {
         let (services, run) = discover_and_probe(&self.config, &self.http).await?;
+        let metric_samples = collect_metric_samples(run.id, &services);
         self.repository.replace_service_snapshots(&services).await?;
         self.repository.insert_discovery_run(&run).await?;
+        if !metric_samples.is_empty() {
+            self.repository
+                .insert_service_metric_samples(&metric_samples)
+                .await?;
+        }
         Ok(run)
     }
 
@@ -98,6 +106,7 @@ impl ConductorService {
             .into_iter()
             .next();
         let cycles_total = self.repository.list_improvement_cycles(200).await?.len();
+        let executions = self.repository.list_work_executions(200).await?;
 
         let mut work_by_status = BTreeMap::new();
         for item in &work_items {
@@ -130,6 +139,21 @@ impl ConductorService {
             work_items_total: work_items.len(),
             work_by_status,
             cycles_total,
+            executions_total: executions.len(),
+            executions_running: executions
+                .iter()
+                .filter(|execution| !execution.status.is_terminal())
+                .count(),
+            approvals_waiting: work_items
+                .iter()
+                .filter(|item| {
+                    !item.execution_approved
+                        && matches!(
+                            item.status,
+                            WorkStatus::Planned | WorkStatus::Scheduled | WorkStatus::OnHold
+                        )
+                })
+                .count(),
             latest_discovery,
             latest_cycle,
         })

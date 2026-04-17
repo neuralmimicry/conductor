@@ -6,7 +6,10 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{
-    models::{DiscoveryRun, ImprovementCycle, ServiceSnapshot, WorkItem, WorkItemPatch},
+    models::{
+        DiscoveryRun, ImprovementCycle, ServiceMetricSample, ServiceSnapshot, WorkExecution,
+        WorkItem, WorkItemPatch,
+    },
     repository::ConductorRepository,
 };
 
@@ -14,7 +17,9 @@ use crate::{
 pub struct MemoryRepository {
     services: RwLock<Vec<ServiceSnapshot>>,
     discoveries: RwLock<Vec<DiscoveryRun>>,
+    metric_samples: RwLock<Vec<ServiceMetricSample>>,
     work_items: RwLock<HashMap<Uuid, WorkItem>>,
+    executions: RwLock<HashMap<Uuid, WorkExecution>>,
     cycles: RwLock<Vec<ImprovementCycle>>,
 }
 
@@ -47,6 +52,32 @@ impl ConductorRepository for MemoryRepository {
         runs.sort_by(|left, right| right.finished_at.cmp(&left.finished_at));
         runs.truncate(limit);
         Ok(runs)
+    }
+
+    async fn insert_service_metric_samples(&self, samples: &[ServiceMetricSample]) -> Result<()> {
+        let mut guard = self.metric_samples.write().await;
+        guard.extend(samples.iter().cloned());
+        guard.sort_by(|left, right| right.sampled_at.cmp(&left.sampled_at));
+        Ok(())
+    }
+
+    async fn list_service_metric_samples(
+        &self,
+        service_key: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ServiceMetricSample>> {
+        let trimmed = service_key.map(str::trim).filter(|value| !value.is_empty());
+        let mut samples: Vec<_> = self
+            .metric_samples
+            .read()
+            .await
+            .iter()
+            .filter(|sample| trimmed.is_none_or(|expected| sample.service_key == expected))
+            .cloned()
+            .collect();
+        samples.sort_by(|left, right| right.sampled_at.cmp(&left.sampled_at));
+        samples.truncate(limit);
+        Ok(samples)
     }
 
     async fn upsert_work_item(&self, item: &WorkItem) -> Result<()> {
@@ -88,6 +119,39 @@ impl ConductorRepository for MemoryRepository {
             .values()
             .find(|item| item.dedupe_key.as_deref() == Some(trimmed))
             .cloned())
+    }
+
+    async fn upsert_work_execution(&self, execution: &WorkExecution) -> Result<()> {
+        self.executions
+            .write()
+            .await
+            .insert(execution.id, execution.clone());
+        Ok(())
+    }
+
+    async fn list_work_executions(&self, limit: usize) -> Result<Vec<WorkExecution>> {
+        let mut items: Vec<_> = self.executions.read().await.values().cloned().collect();
+        items.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        items.truncate(limit);
+        Ok(items)
+    }
+
+    async fn list_work_executions_for_item(
+        &self,
+        work_item_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<WorkExecution>> {
+        let mut items: Vec<_> = self
+            .executions
+            .read()
+            .await
+            .values()
+            .filter(|execution| execution.work_item_id == work_item_id)
+            .cloned()
+            .collect();
+        items.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        items.truncate(limit);
+        Ok(items)
     }
 
     async fn insert_improvement_cycle(&self, cycle: &ImprovementCycle) -> Result<()> {

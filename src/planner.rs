@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -6,10 +6,11 @@ use serde_json::{Value, json};
 use crate::{
     integrations::gail_plan_summary,
     models::{
-        ImprovementCycle, NewWorkItem, RunStatus, ServiceHealth, ServiceSnapshot, WorkItem,
-        WorkStatus, now_utc,
+        ImprovementCycle, NewWorkItem, RunStatus, ServiceHealth, ServiceSnapshot,
+        ServiceTrendSummary, WorkItem, WorkStatus, now_utc,
     },
     repository::ConductorRepository,
+    trends::{pressure_score, summarize_trends},
 };
 
 #[derive(Clone, Debug)]
@@ -30,7 +31,12 @@ pub async fn run_planning_cycle(
 ) -> Result<ImprovementCycle> {
     let started_at = now_utc();
     let services = repository.list_service_snapshots().await?;
-    let recommendations = derive_recommendations(&services, config.planning.minimum_priority);
+    let metric_samples = repository
+        .list_service_metric_samples(None, services.len().saturating_mul(24).max(64))
+        .await?;
+    let trends = summarize_trends(&metric_samples);
+    let recommendations =
+        derive_recommendations(&services, &trends, config.planning.minimum_priority);
 
     if config.planning.auto_queue {
         for recommendation in &recommendations {
@@ -45,6 +51,13 @@ pub async fn run_planning_cycle(
             "dependencies": service.dependencies,
             "capabilities": service.capabilities,
             "probe": service.probe,
+        })).collect::<Vec<_>>(),
+        "trends": trends.iter().map(|trend| json!({
+            "service_key": trend.service_key,
+            "direction": trend.direction,
+            "sample_count": trend.sample_count,
+            "headline": trend.headline,
+            "metrics": trend.metrics,
         })).collect::<Vec<_>>(),
         "recommendation_count": recommendations.len(),
     });
@@ -94,9 +107,14 @@ pub async fn run_planning_cycle(
 
 fn derive_recommendations(
     services: &[ServiceSnapshot],
+    trends: &[ServiceTrendSummary],
     minimum_priority: i32,
 ) -> Vec<ImprovementRecommendation> {
     let mut recommendations = Vec::new();
+    let trends_by_service = trends
+        .iter()
+        .map(|trend| (trend.service_key.as_str(), trend))
+        .collect::<BTreeMap<_, _>>();
 
     for service in services {
         if matches!(
@@ -209,6 +227,10 @@ fn derive_recommendations(
                 plan: json!({"action": "verify_persistent_storage", "service": service.service_key}),
             });
         }
+
+        if let Some(trend) = trends_by_service.get(service.service_key.as_str()) {
+            push_trend_recommendations(service, trend, &mut recommendations);
+        }
     }
 
     recommendations.retain(|item| item.priority >= minimum_priority);
@@ -219,6 +241,81 @@ fn derive_recommendations(
             .then_with(|| left.dedupe_key.cmp(&right.dedupe_key))
     });
     recommendations
+}
+
+fn push_trend_recommendations(
+    service: &ServiceSnapshot,
+    trend: &ServiceTrendSummary,
+    recommendations: &mut Vec<ImprovementRecommendation>,
+) {
+    if trend.direction != "worsening" {
+        return;
+    }
+
+    let sustained = trend.sample_count >= 3;
+    let qualifier = if sustained { "sustained" } else { "emerging" };
+    let top_metrics = trend
+        .metrics
+        .iter()
+        .take(3)
+        .map(|metric| {
+            format!(
+                "{}={:.2} ({})",
+                metric.metric_name, metric.latest, metric.direction
+            )
+        })
+        .collect::<Vec<_>>();
+    let metrics_summary = if top_metrics.is_empty() {
+        trend.headline.clone()
+    } else {
+        top_metrics.join(", ")
+    };
+
+    match service.service_key.as_str() {
+        "tracey" => recommendations.push(ImprovementRecommendation {
+            dedupe_key: "tracey:worsening_trend".to_string(),
+            title: "Stabilize Tracey pressure trend".to_string(),
+            summary: format!(
+                "Tracey shows a {} worsening telemetry trend across {} samples. Focus on the highest-pressure signals before the adaptive loop starts making poorer placement decisions. Current headline: {}",
+                qualifier, trend.sample_count, metrics_summary
+            ),
+            target_service: Some(service.service_key.clone()),
+            priority: if sustained { 88 } else { 81 },
+            tags: vec![
+                "performance".to_string(),
+                "telemetry".to_string(),
+                "trend".to_string(),
+            ],
+            plan: json!({
+                "action": "stabilize_tracey_trend",
+                "headline": trend.headline,
+                "metrics": trend.metrics,
+                "sample_count": trend.sample_count,
+            }),
+        }),
+        "continuum" => recommendations.push(ImprovementRecommendation {
+            dedupe_key: "continuum:worsening_trend".to_string(),
+            title: "Correct Continuum adaptive drift".to_string(),
+            summary: format!(
+                "Continuum shows a {} worsening control-plane trend across {} samples. Tighten recruitment, placement, or backlog handling before orchestration latency compounds. Current headline: {}",
+                qualifier, trend.sample_count, metrics_summary
+            ),
+            target_service: Some(service.service_key.clone()),
+            priority: if sustained { 84 } else { 77 },
+            tags: vec![
+                "control_plane".to_string(),
+                "adaptive_loop".to_string(),
+                "trend".to_string(),
+            ],
+            plan: json!({
+                "action": "correct_continuum_trend",
+                "headline": trend.headline,
+                "metrics": trend.metrics,
+                "sample_count": trend.sample_count,
+            }),
+        }),
+        _ => {}
+    }
 }
 
 async fn upsert_recommendation(
@@ -255,6 +352,8 @@ async fn upsert_recommendation(
         priority: Some(recommendation.priority),
         progress_pct: Some(0),
         admin_override: false,
+        execution_approved: false,
+        verification_required: Some(true),
         tags: recommendation.tags.clone(),
         plan: recommendation.plan.clone(),
         source: Some("planner".to_string()),
@@ -293,45 +392,6 @@ fn extract_i64(value: &Value, key: &str) -> Option<i64> {
     })
 }
 
-fn pressure_score(value: &Value) -> f64 {
-    match value {
-        Value::Object(map) => map
-            .iter()
-            .map(|(key, value)| {
-                let base = pressure_score(value);
-                if key.contains("cpu")
-                    || key.contains("memory")
-                    || key.contains("pressure")
-                    || key.contains("load")
-                    || key.contains("latency")
-                {
-                    base.max(extract_number(value))
-                } else {
-                    base
-                }
-            })
-            .fold(0.0, f64::max),
-        Value::Array(items) => items.iter().map(pressure_score).fold(0.0, f64::max),
-        _ => extract_number(value),
-    }
-}
-
-fn extract_number(value: &Value) -> f64 {
-    match value {
-        Value::Number(number) => number.as_f64().map(normalize_signal).unwrap_or(0.0),
-        Value::String(text) => text.parse::<f64>().map(normalize_signal).unwrap_or(0.0),
-        _ => 0.0,
-    }
-}
-
-fn normalize_signal(value: f64) -> f64 {
-    if value > 1.0 {
-        (value / 100.0).clamp(0.0, 1.0)
-    } else {
-        value.clamp(0.0, 1.0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +411,8 @@ mod tests {
             internal_url: Some("http://gail.gail.svc.cluster.local:8080".to_string()),
             public_url: Some("https://gail.neuralmimicry.ai".to_string()),
             repo_path: Some("/tmp/gail".to_string()),
+            repo_url: None,
+            repo_branch: None,
             health: ServiceHealth::Degraded,
             capabilities: vec!["ai_gateway".to_string()],
             dependencies: vec![],
@@ -361,11 +423,55 @@ mod tests {
             updated_at: now_utc(),
         };
 
-        let recommendations = derive_recommendations(&[service], 0);
+        let recommendations = derive_recommendations(&[service], &[], 0);
         assert!(
             recommendations
                 .iter()
                 .any(|item| item.dedupe_key == "stabilize:gail")
+        );
+    }
+
+    #[test]
+    fn planner_flags_worsening_tracey_trend() {
+        let service = ServiceSnapshot {
+            service_key: "tracey".to_string(),
+            display_name: "Tracey".to_string(),
+            kind: "host_agent".to_string(),
+            role_name: "tracey_host_agent".to_string(),
+            playbooks: vec!["tracey_host_agent.yml".to_string()],
+            hosts: vec!["qc01".to_string()],
+            namespace: None,
+            service_name: None,
+            internal_url: None,
+            public_url: None,
+            repo_path: Some("/tmp/tracey".to_string()),
+            repo_url: None,
+            repo_branch: None,
+            health: ServiceHealth::Healthy,
+            capabilities: vec!["resource_insights".to_string()],
+            dependencies: vec![],
+            storage_paths: vec![],
+            raw_defaults: json!({}),
+            probe: json!({"metrics": {"status": {"pressure_score": 0.6}}}),
+            discovered_at: now_utc(),
+            updated_at: now_utc(),
+        };
+        let trend = ServiceTrendSummary {
+            service_key: "tracey".to_string(),
+            sample_count: 4,
+            window_start: Some(now_utc()),
+            window_end: Some(now_utc()),
+            direction: "worsening".to_string(),
+            headline: "tracey trend is worsening via pressure_score".to_string(),
+            metrics: vec![],
+            raw_latest: json!({"pressure_score": 0.8}),
+        };
+
+        let recommendations = derive_recommendations(&[service], &[trend], 0);
+        assert!(
+            recommendations
+                .iter()
+                .any(|item| item.dedupe_key == "tracey:worsening_trend")
         );
     }
 }

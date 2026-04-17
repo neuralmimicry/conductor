@@ -17,6 +17,8 @@ pub struct ConductorConfig {
     pub discovery: DiscoveryConfig,
     pub integrations: IntegrationsConfig,
     pub planning: PlanningConfig,
+    pub execution: ExecutionConfig,
+    pub policy: PolicyConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -61,6 +63,7 @@ pub struct DiscoveryConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RepoHints {
+    pub conductor_repo: PathBuf,
     pub gail_repo: PathBuf,
     pub tracey_repo: PathBuf,
     pub continuum_repo: PathBuf,
@@ -84,6 +87,8 @@ pub struct ExternalServiceConfig {
     pub enabled: bool,
     pub base_url: Option<String>,
     pub bearer_token: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
     pub timeout_seconds: u64,
 }
 
@@ -96,6 +101,35 @@ pub struct PlanningConfig {
     pub minimum_priority: i32,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExecutionConfig {
+    pub enabled: bool,
+    pub refresh_interval_seconds: u64,
+    pub poll_interval_seconds: u64,
+    pub job_timeout_seconds: u64,
+    pub max_concurrent_executions: usize,
+    pub use_local_project_root: bool,
+    pub refiner_workflow: String,
+    pub token_scope: String,
+    pub llm_provider: Option<String>,
+    pub llm_model: Option<String>,
+    pub coding_agent: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicyConfig {
+    pub enabled: bool,
+    pub require_admin_approval: bool,
+    pub require_verification: bool,
+    pub require_refiner_strict_mode: bool,
+    pub allow_external_repo_execution: bool,
+    pub protected_services: Vec<String>,
+    pub protected_repo_roots: Vec<PathBuf>,
+    pub blocked_action_keywords: Vec<String>,
+}
+
 impl Default for ConductorConfig {
     fn default() -> Self {
         Self {
@@ -106,6 +140,8 @@ impl Default for ConductorConfig {
             discovery: DiscoveryConfig::default(),
             integrations: IntegrationsConfig::default(),
             planning: PlanningConfig::default(),
+            execution: ExecutionConfig::default(),
+            policy: PolicyConfig::default(),
         }
     }
 }
@@ -162,6 +198,7 @@ impl Default for DiscoveryConfig {
 impl Default for RepoHints {
     fn default() -> Self {
         Self {
+            conductor_repo: PathBuf::from("/home/pbisaacs/Developer/neuralmimicry/conductor"),
             gail_repo: PathBuf::from("/home/pbisaacs/Developer/neuralmimicry/gail"),
             tracey_repo: PathBuf::from("/home/pbisaacs/Developer/neuralmimicry/tracey"),
             continuum_repo: PathBuf::from("/home/pbisaacs/Developer/neuralmimicry/nmc"),
@@ -189,6 +226,8 @@ impl Default for ExternalServiceConfig {
             enabled: true,
             base_url: None,
             bearer_token: None,
+            username: None,
+            password: None,
             timeout_seconds: 5,
         }
     }
@@ -201,6 +240,48 @@ impl Default for PlanningConfig {
             auto_queue: true,
             gail_workflow: "conductor_improvement_planner".to_string(),
             minimum_priority: 40,
+        }
+    }
+}
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            refresh_interval_seconds: 120,
+            poll_interval_seconds: 5,
+            job_timeout_seconds: 900,
+            max_concurrent_executions: 1,
+            use_local_project_root: true,
+            refiner_workflow: "project_solver".to_string(),
+            token_scope: "personal".to_string(),
+            llm_provider: None,
+            llm_model: None,
+            coding_agent: Some("project_solver".to_string()),
+        }
+    }
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            require_admin_approval: true,
+            require_verification: true,
+            require_refiner_strict_mode: true,
+            allow_external_repo_execution: true,
+            protected_services: vec![
+                "gail".to_string(),
+                "refiner".to_string(),
+                "aarnn".to_string(),
+            ],
+            protected_repo_roots: Vec::new(),
+            blocked_action_keywords: vec![
+                "reset --hard".to_string(),
+                "rm -rf".to_string(),
+                "wipe".to_string(),
+                "destroy".to_string(),
+            ],
         }
     }
 }
@@ -231,8 +312,20 @@ impl ConductorConfig {
         if self.planning.refresh_interval_seconds == 0 {
             self.planning.refresh_interval_seconds = 240;
         }
+        if self.execution.refresh_interval_seconds == 0 {
+            self.execution.refresh_interval_seconds = 120;
+        }
+        if self.execution.poll_interval_seconds == 0 {
+            self.execution.poll_interval_seconds = 5;
+        }
+        if self.execution.job_timeout_seconds == 0 {
+            self.execution.job_timeout_seconds = 900;
+        }
         if self.discovery.service_timeout_seconds == 0 {
             self.discovery.service_timeout_seconds = 5;
+        }
+        if self.execution.max_concurrent_executions == 0 {
+            self.execution.max_concurrent_executions = 1;
         }
         if self.storage.root_dir.as_os_str().is_empty() {
             self.storage.root_dir = PathBuf::from("data");
@@ -240,11 +333,33 @@ impl ConductorConfig {
         if self.planning.gail_workflow.trim().is_empty() {
             self.planning.gail_workflow = "conductor_improvement_planner".to_string();
         }
+        if self.execution.refiner_workflow.trim().is_empty() {
+            self.execution.refiner_workflow = "project_solver".to_string();
+        }
+        if self.execution.token_scope.trim().is_empty() {
+            self.execution.token_scope = "personal".to_string();
+        }
+        normalize_optional_string(&mut self.execution.llm_provider);
+        normalize_optional_string(&mut self.execution.llm_model);
+        normalize_optional_string(&mut self.execution.coding_agent);
         normalize_external_service(&mut self.integrations.gail);
         normalize_external_service(&mut self.integrations.tracey);
         normalize_external_service(&mut self.integrations.continuum);
         normalize_external_service(&mut self.integrations.refiner);
         normalize_external_service(&mut self.integrations.aarnn);
+        normalize_unique_strings(&mut self.policy.protected_services);
+        normalize_unique_strings(&mut self.policy.blocked_action_keywords);
+        normalize_paths(&mut self.policy.protected_repo_roots);
+        if self.policy.protected_repo_roots.is_empty() {
+            self.policy.protected_repo_roots = vec![
+                self.discovery.repo_hints.gail_repo.clone(),
+                self.discovery.repo_hints.tracey_repo.clone(),
+                self.discovery.repo_hints.continuum_repo.clone(),
+                self.discovery.repo_hints.refiner_repo.clone(),
+                self.discovery.repo_hints.aarnn_repo.clone(),
+            ];
+            normalize_paths(&mut self.policy.protected_repo_roots);
+        }
         Ok(())
     }
 }
@@ -262,6 +377,8 @@ fn interpolate_env(input: &str) -> String {
 fn normalize_external_service(config: &mut ExternalServiceConfig) {
     normalize_optional_string(&mut config.base_url);
     normalize_optional_string(&mut config.bearer_token);
+    normalize_optional_string(&mut config.username);
+    normalize_optional_string(&mut config.password);
     if let Some(base_url) = &mut config.base_url {
         *base_url = base_url.trim_end_matches('/').to_string();
     }
@@ -275,4 +392,23 @@ fn normalize_optional_string(value: &mut Option<String>) {
         .take()
         .map(|item| item.trim().to_string())
         .filter(|item| !item.is_empty());
+}
+
+fn normalize_unique_strings(values: &mut Vec<String>) {
+    let mut seen = std::collections::BTreeSet::new();
+    *values = values
+        .drain(..)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .filter(|value| seen.insert(value.clone()))
+        .collect();
+}
+
+fn normalize_paths(values: &mut Vec<PathBuf>) {
+    let mut seen = std::collections::BTreeSet::new();
+    *values = values
+        .drain(..)
+        .filter(|value| !value.as_os_str().is_empty())
+        .filter(|value| seen.insert(value.display().to_string()))
+        .collect();
 }
