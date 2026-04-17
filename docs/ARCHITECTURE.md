@@ -17,7 +17,12 @@ The main loops are:
    - Upserts work items unless `planning.auto_queue` is disabled.
 3. Admin loop
    - Lets operators change status, priority, progress, schedule, and admin override state.
-   - Supports manual discovery and planning triggers.
+   - Supports manual discovery, planning, execution-cycle, and per-item execution triggers.
+4. Execution loop
+   - Selects approved and dependency-satisfied scheduled work items.
+   - Evaluates policy gates.
+   - Submits approved work into Refiner's planning and job APIs.
+   - Polls execution status and stores verification results.
 
 ## Core Modules
 
@@ -30,22 +35,27 @@ The main loops are:
   - Service-specific probes for Gail, Tracey, Continuum, Refiner, and AARNN.
   - Gail advisory integration for planning cycles.
 - `src/planner.rs`
-  - Converts topology and probe signals into prioritized work items.
+  - Converts topology and probe signals into prioritized work items and dependency edges.
   - Preserves admin overrides during planner refreshes.
+- `src/executor.rs`
+  - Converts approved work items into Refiner execution attempts.
+  - Persists execution policy, payloads, status, and verification outcomes.
 - `src/service.rs`
   - Orchestration layer for repository access, auth behavior, summary generation, and background loops.
 - `src/app.rs`
-  - Axum routes for dashboard and admin API.
+  - Axum routes for dashboard, task graph, and execution/admin API.
 - `src/storage/postgres.rs`
   - Postgres-backed persistence and migration execution.
 
 ## Persistence
 
-Conductor stores four primary entities:
+Conductor stores six primary entities:
 
 - `service_snapshots`
 - `discovery_runs`
+- `service_metric_samples`
 - `work_items`
+- `work_executions`
 - `improvement_cycles`
 
 This design gives a stable audit trail without conflating live topology with queued work.
@@ -66,7 +76,7 @@ Represents the broader control plane. Conductor inspects cluster and adaptive-lo
 
 ### Refiner
 
-Treated as the code-generation and workflow execution target. Current Conductor builds the queue and identifies integration work; the next iteration should convert approved work items into Refiner jobs.
+Treated as the code-generation and workflow execution target. Conductor now uses Refiner as the governed execution surface for approved work items while keeping repository mutation inside Refiner's workflow boundary.
 
 ### AARNN
 
@@ -78,9 +88,9 @@ Treated as both a runtime surface and a future self-improvement substrate. Curre
 - Mutating APIs and manual loop triggers require the admin bearer token when configured.
 - Upstream bearer tokens are per-integration and remain out of source control.
 
-## Planned Next Iteration
+## Next Iterations
 
-- Convert approved work items into Refiner job submissions with verification checkpoints.
-- Persist richer probe metrics for trend analysis.
-- Add execution workers that can safely stage changes in external repos.
-- Introduce explicit policy gates for self-improvement workflows.
+- Extend the task graph beyond `depends_on` into richer dependency/board views.
+- Persist more Refiner control-plane state in Postgres while keeping artifacts on NFS.
+- Add evented execution updates and richer dashboard visibility.
+- Add streaming Gail/Refiner execution surfaces where it materially improves operator feedback.

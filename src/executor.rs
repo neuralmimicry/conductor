@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use reqwest::{Client, StatusCode};
@@ -8,15 +8,46 @@ use uuid::Uuid;
 use crate::{
     config::ConductorConfig,
     models::{
-        ExecutionStatus, PolicyVerdict, ServiceSnapshot, WorkExecution, WorkItem, WorkStatus,
+        ConductorEvent, ExecutionStatus, PolicyVerdict, ServiceSnapshot, WorkExecution, WorkItem,
+        WorkStatus,
     },
     policy::{evaluate_work_item, policy_evaluation_to_value},
     repository::ConductorRepository,
 };
 
+pub type ExecutionEventCallback = Arc<dyn Fn(ConductorEvent) + Send + Sync>;
+
+fn emit_event(callback: Option<&ExecutionEventCallback>, event: ConductorEvent) {
+    if let Some(publish) = callback {
+        publish(event);
+    }
+}
+
+fn emit_execution_event(
+    callback: Option<&ExecutionEventCallback>,
+    event_type: &str,
+    message: impl Into<String>,
+    item: Option<&WorkItem>,
+    execution: Option<&WorkExecution>,
+    status: Option<&str>,
+    payload: Value,
+) {
+    let mut event = ConductorEvent::new(event_type, message, payload);
+    event.status = status.map(ToString::to_string);
+    if let Some(item) = item {
+        event.work_item_id = Some(item.id);
+    }
+    if let Some(execution) = execution {
+        event.execution_id = Some(execution.id);
+        event.refiner_job_id = execution.refiner_job_id.clone();
+    }
+    emit_event(callback, event);
+}
+
 pub async fn run_execution_cycle(
     repository: &dyn ConductorRepository,
     config: &ConductorConfig,
+    event_callback: Option<&ExecutionEventCallback>,
 ) -> Result<Vec<WorkExecution>> {
     if !config.execution.enabled {
         return Ok(Vec::new());
@@ -33,15 +64,17 @@ pub async fn run_execution_cycle(
     }
 
     let available_slots = config.execution.max_concurrent_executions - active;
+    let work_items = repository.list_work_items().await?;
     let mut executed = Vec::new();
-    for item in repository
-        .list_work_items()
-        .await?
+    for item in work_items
+        .iter()
         .into_iter()
         .filter(|item| item.execution_approved && matches!(item.status, WorkStatus::Scheduled))
         .take(available_slots)
     {
-        executed.push(execute_specific_work_item(repository, config, item.id, false).await?);
+        executed.push(
+            execute_specific_work_item(repository, config, item.id, false, event_callback).await?,
+        );
     }
     Ok(executed)
 }
@@ -51,6 +84,7 @@ pub async fn execute_specific_work_item(
     config: &ConductorConfig,
     work_item_id: Uuid,
     force_schedule: bool,
+    event_callback: Option<&ExecutionEventCallback>,
 ) -> Result<WorkExecution> {
     let mut item = repository
         .get_work_item(work_item_id)
@@ -64,6 +98,46 @@ pub async fn execute_specific_work_item(
     }
     if force_schedule && !matches!(item.status, WorkStatus::Scheduled) {
         item.status = WorkStatus::Scheduled;
+    }
+
+    let work_items = repository.list_work_items().await?;
+    let dependency_blockers = dependency_blockers(&item, &work_items);
+    if !dependency_blockers.is_empty() {
+        let message = format!(
+            "execution blocked by dependency graph: {}",
+            dependency_blockers.join("; ")
+        );
+        let policy = json!({
+            "verdict": "blocked",
+            "risk_level": "dependency_graph",
+            "reasons": dependency_blockers,
+        });
+        let mut execution = WorkExecution::new(item.id, item.target_service.clone());
+        execution.policy = policy.clone();
+        execution.error = Some(message.clone());
+        execution.mark_status(ExecutionStatus::Blocked);
+        item.status = WorkStatus::OnHold;
+        item.touch_execution(execution.id, policy.clone());
+        item.notes.push(format!(
+            "{} {}",
+            crate::models::now_utc().to_rfc3339(),
+            message
+        ));
+        emit_execution_event(
+            event_callback,
+            "execution.blocked",
+            message.clone(),
+            Some(&item),
+            Some(&execution),
+            Some("blocked"),
+            json!({
+                "reasons": dependency_blockers,
+                "policy": policy,
+            }),
+        );
+        repository.upsert_work_execution(&execution).await?;
+        repository.upsert_work_item(&item).await?;
+        return Ok(execution);
     }
 
     let services = repository.list_service_snapshots().await?;
@@ -93,6 +167,18 @@ pub async fn execute_specific_work_item(
                 message
             ));
         }
+        emit_execution_event(
+            event_callback,
+            "execution.blocked",
+            message.clone(),
+            Some(&item),
+            Some(&execution),
+            Some("blocked"),
+            json!({
+                "policy": execution.policy.clone(),
+                "reasons": policy.reasons,
+            }),
+        );
         repository.upsert_work_execution(&execution).await?;
         repository.upsert_work_item(&item).await?;
         return Ok(execution);
@@ -104,6 +190,18 @@ pub async fn execute_specific_work_item(
         "{} execution started through Refiner",
         crate::models::now_utc().to_rfc3339()
     ));
+    emit_execution_event(
+        event_callback,
+        "execution.started",
+        format!("execution started for {}", item.title),
+        Some(&item),
+        Some(&execution),
+        Some(item.status.as_str()),
+        json!({
+            "target_service": item.target_service.clone(),
+            "progress_pct": item.progress_pct,
+        }),
+    );
     repository.upsert_work_item(&item).await?;
     repository.upsert_work_execution(&execution).await?;
 
@@ -127,6 +225,20 @@ pub async fn execute_specific_work_item(
     )
     .await
     .context("failed to create Refiner execution plan")?;
+    emit_execution_event(
+        event_callback,
+        "execution.planning_submitted",
+        format!("planning response received for {}", item.title),
+        Some(&item),
+        Some(&execution),
+        Some(execution.status.as_str()),
+        json!({
+            "plan_keys": plan_response
+                .as_object()
+                .map(|entries| entries.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default(),
+        }),
+    );
     let job_payload = build_job_payload(config, &item, target_service, &plan_response)?;
     execution.request_payload = job_payload.clone();
     execution.latest_payload = json!({"plan_response": plan_response});
@@ -172,6 +284,18 @@ pub async fn execute_specific_work_item(
         "estimate_response": execution.latest_payload.get("estimate_response").cloned().unwrap_or_else(|| json!({})),
         "submit_response": submit_response,
     });
+    emit_execution_event(
+        event_callback,
+        "execution.job_submitted",
+        format!("Refiner job {} submitted", refiner_job_id),
+        Some(&item),
+        Some(&execution),
+        Some(execution.status.as_str()),
+        json!({
+            "refiner_job_id": refiner_job_id.clone(),
+            "target_service": item.target_service.clone(),
+        }),
+    );
     repository.upsert_work_execution(&execution).await?;
 
     item.progress_pct = 35;
@@ -190,6 +314,7 @@ pub async fn execute_specific_work_item(
         &mut item,
         &mut execution,
         repository,
+        event_callback,
     )
     .await?;
 
@@ -212,6 +337,15 @@ pub async fn execute_specific_work_item(
             crate::models::now_utc().to_rfc3339(),
             refiner_job_id
         ));
+        emit_execution_event(
+            event_callback,
+            "execution.verification",
+            format!("Refiner job {} passed verification", refiner_job_id),
+            Some(&item),
+            Some(&execution),
+            Some("success"),
+            verification.clone(),
+        );
     } else {
         let failure_reason = verification
             .get("reasons")
@@ -234,12 +368,50 @@ pub async fn execute_specific_work_item(
             refiner_job_id,
             failure_reason
         ));
+        emit_execution_event(
+            event_callback,
+            "execution.verification",
+            format!("Refiner job {} failed verification", refiner_job_id),
+            Some(&item),
+            Some(&execution),
+            Some("failure"),
+            verification.clone(),
+        );
     }
 
     item.touch_execution(execution.id, execution.policy.clone());
     repository.upsert_work_execution(&execution).await?;
     repository.upsert_work_item(&item).await?;
     Ok(execution)
+}
+
+fn dependency_blockers(item: &WorkItem, work_items: &[WorkItem]) -> Vec<String> {
+    let mut blockers = Vec::new();
+    for reference in &item.depends_on {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            continue;
+        }
+        if item.matches_reference(reference) {
+            blockers.push(format!("{reference} (self_dependency)"));
+            continue;
+        }
+        let Some(dependency) = work_items
+            .iter()
+            .find(|candidate| candidate.matches_reference(reference))
+        else {
+            blockers.push(format!("{reference} (missing)"));
+            continue;
+        };
+        if !matches!(dependency.status, WorkStatus::Success) {
+            let label = dependency
+                .dedupe_key
+                .clone()
+                .unwrap_or_else(|| dependency.id.to_string());
+            blockers.push(format!("{label} ({})", dependency.status.as_str()));
+        }
+    }
+    blockers
 }
 
 fn refiner_base_url(config: &ConductorConfig, services: &[ServiceSnapshot]) -> Result<String> {
@@ -439,10 +611,12 @@ async fn poll_refiner_job(
     item: &mut WorkItem,
     execution: &mut WorkExecution,
     repository: &dyn ConductorRepository,
+    event_callback: Option<&ExecutionEventCallback>,
 ) -> Result<Value> {
     let deadline = tokio::time::Instant::now()
         + Duration::from_secs(config.execution.job_timeout_seconds.max(30));
     let poll_interval = Duration::from_secs(config.execution.poll_interval_seconds.max(1));
+    let mut last_status = String::new();
 
     loop {
         let detail = get_refiner_json(
@@ -478,6 +652,22 @@ async fn poll_refiner_job(
             "failed" => ExecutionStatus::Failure,
             _ => execution.status,
         });
+        if status != last_status {
+            last_status = status.clone();
+            emit_execution_event(
+                event_callback,
+                "execution.refiner_status",
+                format!("Refiner job {} transitioned to {}", job_id, status),
+                Some(item),
+                Some(execution),
+                Some(status.as_str()),
+                json!({
+                    "refiner_job_id": job_id,
+                    "status": status,
+                    "progress_pct": progress,
+                }),
+            );
+        }
         repository.upsert_work_execution(execution).await?;
         repository.upsert_work_item(item).await?;
 
@@ -625,7 +815,9 @@ mod tests {
     use crate::{
         config::ConductorConfig,
         models::{NewWorkItem, ServiceHealth},
+        storage::memory::MemoryRepository,
     };
+    use std::sync::Arc;
 
     fn sample_service() -> ServiceSnapshot {
         ServiceSnapshot {
@@ -669,6 +861,7 @@ mod tests {
             verification_required: Some(true),
             tags: vec![],
             plan: json!({"action": "stabilize_service"}),
+            depends_on: vec![],
             source: None,
             scheduled_for: None,
         });
@@ -701,5 +894,133 @@ mod tests {
             ]
         }));
         assert_eq!(report.get("passed").and_then(Value::as_bool), Some(false));
+    }
+
+    #[tokio::test]
+    async fn execution_cycle_skips_items_with_unsatisfied_dependencies() {
+        let config = ConductorConfig::default();
+        let repository = Arc::new(MemoryRepository::new());
+
+        let dependency = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("stabilize:dependency".to_string()),
+            title: "Stabilize Dependency".to_string(),
+            summary: "Resolve dependency first".to_string(),
+            target_service: Some("conductor".to_string()),
+            status: Some(WorkStatus::Planned),
+            priority: Some(90),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "stabilize_service"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        let blocked = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("followup:dependency".to_string()),
+            title: "Follow-up".to_string(),
+            summary: "Run after stabilization".to_string(),
+            target_service: Some("conductor".to_string()),
+            status: Some(WorkStatus::Scheduled),
+            priority: Some(80),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "follow_up"}),
+            depends_on: vec!["stabilize:dependency".to_string()],
+            source: None,
+            scheduled_for: None,
+        });
+
+        repository
+            .upsert_work_item(&dependency)
+            .await
+            .expect("dependency");
+        repository
+            .upsert_work_item(&blocked)
+            .await
+            .expect("blocked item");
+
+        let executed = run_execution_cycle(repository.as_ref(), &config, None)
+            .await
+            .expect("execution cycle");
+
+        assert_eq!(executed.len(), 1);
+        assert_eq!(executed[0].status, ExecutionStatus::Blocked);
+    }
+
+    #[tokio::test]
+    async fn execute_specific_work_item_blocks_when_dependencies_are_not_satisfied() {
+        let config = ConductorConfig::default();
+        let repository = Arc::new(MemoryRepository::new());
+
+        let dependency = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("stabilize:dependency".to_string()),
+            title: "Stabilize Dependency".to_string(),
+            summary: "Resolve dependency first".to_string(),
+            target_service: Some("conductor".to_string()),
+            status: Some(WorkStatus::Planned),
+            priority: Some(90),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "stabilize_service"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        let blocked = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("followup:dependency".to_string()),
+            title: "Follow-up".to_string(),
+            summary: "Run after stabilization".to_string(),
+            target_service: Some("conductor".to_string()),
+            status: Some(WorkStatus::Scheduled),
+            priority: Some(80),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "follow_up"}),
+            depends_on: vec!["stabilize:dependency".to_string()],
+            source: None,
+            scheduled_for: None,
+        });
+
+        repository
+            .upsert_work_item(&dependency)
+            .await
+            .expect("dependency");
+        repository
+            .upsert_work_item(&blocked)
+            .await
+            .expect("blocked item");
+
+        let execution =
+            execute_specific_work_item(repository.as_ref(), &config, blocked.id, false, None)
+                .await
+                .expect("execution");
+        assert_eq!(execution.status, ExecutionStatus::Blocked);
+        assert!(
+            execution
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("dependency graph")
+        );
+
+        let refreshed = repository
+            .get_work_item(blocked.id)
+            .await
+            .expect("refreshed item")
+            .expect("stored item");
+        assert_eq!(refreshed.status, WorkStatus::OnHold);
+        assert_eq!(refreshed.last_execution_id, Some(execution.id));
     }
 }

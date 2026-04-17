@@ -219,6 +219,7 @@ mod tests {
             verification_required: Some(true),
             tags: vec![],
             plan: json!({"action": "improve"}),
+            depends_on: vec![],
             source: None,
             scheduled_for: None,
         });
@@ -266,6 +267,7 @@ mod tests {
             verification_required: Some(true),
             tags: vec![],
             plan: json!({"action": "rm -rf"}),
+            depends_on: vec![],
             source: None,
             scheduled_for: None,
         });

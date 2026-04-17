@@ -1,23 +1,40 @@
+use std::{convert::Infallible, time::Duration};
+
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::HeaderMap,
-    response::{IntoResponse, Redirect},
-    routing::{get, patch, post},
+    response::{
+        IntoResponse, Redirect,
+        sse::{Event, KeepAlive, Sse},
+    },
+    routing::{get, post},
 };
+use futures::stream;
 use serde::Deserialize;
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
     dashboard::render_dashboard,
     error::{ApiError, ApiResult},
-    models::{NewWorkItem, WorkItem, WorkItemPatch},
+    models::{NewWorkItem, WorkExecution, WorkItem, WorkItemPatch},
     service::ConductorService,
 };
 
 #[derive(Debug, Default, Deserialize)]
 pub struct LimitQuery {
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ExecuteWorkItemRequest {
+    pub force_schedule: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct EventStreamQuery {
+    pub token: Option<String>,
 }
 
 pub fn build_router(service: ConductorService) -> Router {
@@ -28,11 +45,22 @@ pub fn build_router(service: ConductorService) -> Router {
         .route("/api/v1/summary", get(summary))
         .route("/api/v1/services", get(services))
         .route("/api/v1/topology", get(topology))
+        .route("/api/v1/executions", get(list_executions))
+        .route("/api/v1/executions/stream", get(stream_executions))
+        .route("/api/v1/execution/run", post(trigger_execution_cycle))
         .route(
             "/api/v1/work-items",
             get(list_work_items).post(create_work_item),
         )
-        .route("/api/v1/work-items/{id}", patch(update_work_item))
+        .route(
+            "/api/v1/work-items/{id}",
+            get(get_work_item).patch(update_work_item),
+        )
+        .route(
+            "/api/v1/work-items/{id}/executions",
+            get(list_work_item_executions),
+        )
+        .route("/api/v1/work-items/{id}/execute", post(execute_work_item))
         .route("/api/v1/cycles", get(list_cycles))
         .route("/api/v1/discovery/runs", get(list_discovery_runs))
         .route("/api/v1/discovery/run", post(trigger_discovery))
@@ -91,6 +119,19 @@ async fn list_work_items(
     ))
 }
 
+async fn get_work_item(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<WorkItem>> {
+    service.authorize_read(&headers)?;
+    let item = service
+        .work_item(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("work item {} not found", id)))?;
+    Ok(Json(item))
+}
+
 async fn create_work_item(
     State(service): State<ConductorService>,
     headers: HeaderMap,
@@ -118,6 +159,98 @@ async fn update_work_item(
         .await?
         .ok_or_else(|| ApiError::not_found(format!("work item {} not found", id)))?;
     Ok(Json(item))
+}
+
+async fn list_executions(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+    Query(query): Query<LimitQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    service.authorize_read(&headers)?;
+    let executions = service.executions(query.limit.unwrap_or(50)).await?;
+    Ok(Json(serde_json::json!({"executions": executions})))
+}
+
+async fn stream_executions(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+    Query(query): Query<EventStreamQuery>,
+) -> ApiResult<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>> {
+    service.authorize_read_with_token(&headers, query.token.as_deref())?;
+    let receiver = service.subscribe_events();
+    let stream = stream::unfold(receiver, |mut receiver| async move {
+        match receiver.recv().await {
+            Ok(event) => {
+                let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+                Some((Ok::<Event, Infallible>(Event::default().data(payload)), receiver))
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                let payload = json!({
+                    "event_type": "execution.stream.lagged",
+                    "message": format!("execution stream skipped {} event(s)", skipped),
+                    "skipped": skipped,
+                });
+                Some((
+                    Ok::<Event, Infallible>(Event::default().data(payload.to_string())),
+                    receiver,
+                ))
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+        }
+    });
+    Ok(
+        Sse::new(stream)
+            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("keep-alive")),
+    )
+}
+
+async fn list_work_item_executions(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Query(query): Query<LimitQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    service.authorize_read(&headers)?;
+    service
+        .work_item(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("work item {} not found", id)))?;
+    let executions = service
+        .work_item_executions(id, query.limit.unwrap_or(20))
+        .await?;
+    Ok(Json(serde_json::json!({"executions": executions})))
+}
+
+async fn trigger_execution_cycle(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    service.authorize_admin(&headers)?;
+    let executions = service.run_execution_cycle().await?;
+    Ok(Json(serde_json::json!({"executions": executions})))
+}
+
+async fn execute_work_item(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<ExecuteWorkItemRequest>,
+) -> ApiResult<Json<WorkExecution>> {
+    service.authorize_admin(&headers)?;
+    let execution = service
+        .execute_work_item(id, request.force_schedule.unwrap_or(false))
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("not found") {
+                ApiError::not_found(message)
+            } else if message.contains("not approved") {
+                ApiError::bad_request(message)
+            } else {
+                ApiError::internal(message)
+            }
+        })?;
+    Ok(Json(execution))
 }
 
 async fn list_cycles(
@@ -171,10 +304,12 @@ mod tests {
     };
     use tower::util::ServiceExt;
 
+    use crate::models::{NewWorkItem, WorkExecution, WorkItem};
     use crate::{
         config::ConductorConfig, integrations::build_http_client, service::ConductorService,
         storage::memory::MemoryRepository,
     };
+    use serde_json::json;
 
     fn test_service() -> ConductorService {
         let mut config = ConductorConfig::default();
@@ -221,6 +356,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execution_stream_requires_auth_when_token_is_configured() {
+        let app = build_router(test_service());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/executions/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn execution_stream_accepts_query_token_and_returns_sse() {
+        let app = build_router(test_service());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/executions/stream?token=secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"))
+        );
+    }
+
+    #[tokio::test]
+    async fn service_broadcasts_published_events() {
+        let service = test_service();
+        let mut receiver = service.subscribe_events();
+        service.publish_event(crate::models::ConductorEvent::new(
+            "execution.test",
+            "hello",
+            json!({"ok": true}),
+        ));
+
+        let event = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("timeout")
+            .expect("event");
+        assert_eq!(event.event_type, "execution.test");
+        assert_eq!(event.message, "hello");
+    }
+
+    #[tokio::test]
     async fn work_item_can_be_created_with_token() {
         let app = build_router(test_service());
         let response = app
@@ -246,5 +436,80 @@ mod tests {
             payload.get("title").and_then(serde_json::Value::as_str),
             Some("Probe")
         );
+    }
+
+    #[tokio::test]
+    async fn work_item_execution_history_endpoint_returns_records() {
+        let service = test_service();
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("probe:history".to_string()),
+            title: "Probe".to_string(),
+            summary: "Record execution history".to_string(),
+            target_service: Some("refiner".to_string()),
+            status: None,
+            priority: None,
+            progress_pct: None,
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec!["automation".to_string()],
+            plan: json!({"action": "probe"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        service
+            .repository
+            .upsert_work_item(&item)
+            .await
+            .expect("work item");
+        let execution = WorkExecution::new(item.id, item.target_service.clone());
+        service
+            .repository
+            .upsert_work_execution(&execution)
+            .await
+            .expect("execution");
+
+        let app = build_router(service);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/work-items/{}/executions", item.id))
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            payload["executions"]
+                .as_array()
+                .expect("execution list")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_work_item_route_returns_not_found_for_missing_item() {
+        let app = build_router(test_service());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/work-items/{}/execute", Uuid::new_v4()))
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

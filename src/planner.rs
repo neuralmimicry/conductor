@@ -22,6 +22,7 @@ pub struct ImprovementRecommendation {
     pub priority: i32,
     pub tags: Vec<String>,
     pub plan: Value,
+    pub depends_on: Vec<String>,
 }
 
 pub async fn run_planning_cycle(
@@ -133,6 +134,7 @@ fn derive_recommendations(
                 priority: 90,
                 tags: vec!["reliability".to_string(), "health".to_string()],
                 plan: json!({"action": "stabilize_service", "service": service.service_key}),
+                depends_on: Vec::new(),
             });
         }
 
@@ -147,6 +149,7 @@ fn derive_recommendations(
                 priority: 80,
                 tags: vec!["governance".to_string(), "source_of_truth".to_string()],
                 plan: json!({"action": "verify_repo_hint", "service": "gail"}),
+                depends_on: Vec::new(),
             });
         }
 
@@ -165,6 +168,7 @@ fn derive_recommendations(
                     priority: 78,
                     tags: vec!["scalability".to_string(), "aarnn".to_string()],
                     plan: json!({"action": "externalize_aarnn_sessions"}),
+                    depends_on: Vec::new(),
                 });
             }
         }
@@ -178,6 +182,7 @@ fn derive_recommendations(
                 priority: 72,
                 tags: vec!["automation".to_string(), "code_generation".to_string()],
                 plan: json!({"action": "integrate_refiner_jobs", "paths": ["/api/jobs", "/api/playground/plan"]}),
+                depends_on: Vec::new(),
             });
         }
 
@@ -192,6 +197,7 @@ fn derive_recommendations(
                     priority: 85,
                     tags: vec!["performance".to_string(), "resource_utilisation".to_string()],
                     plan: json!({"action": "investigate_resource_hotspot", "pressure_score": pressure}),
+                    depends_on: Vec::new(),
                 });
             }
         }
@@ -209,6 +215,7 @@ fn derive_recommendations(
                 priority: 70,
                 tags: vec!["control_plane".to_string(), "autoscaling".to_string()],
                 plan: json!({"action": "verify_continuum_adaptive_loop"}),
+                depends_on: Vec::new(),
             });
         }
 
@@ -225,11 +232,28 @@ fn derive_recommendations(
                 priority: 68,
                 tags: vec!["storage".to_string(), "durability".to_string()],
                 plan: json!({"action": "verify_persistent_storage", "service": service.service_key}),
+                depends_on: Vec::new(),
             });
         }
 
         if let Some(trend) = trends_by_service.get(service.service_key.as_str()) {
             push_trend_recommendations(service, trend, &mut recommendations);
+        }
+    }
+
+    let stabilization_keys = recommendations
+        .iter()
+        .filter(|recommendation| recommendation.dedupe_key.starts_with("stabilize:"))
+        .map(|recommendation| recommendation.dedupe_key.clone())
+        .collect::<BTreeSet<_>>();
+    for recommendation in &mut recommendations {
+        let Some(service) = recommendation.target_service.as_deref() else {
+            continue;
+        };
+        let stabilize_key = format!("stabilize:{}", service);
+        if recommendation.dedupe_key != stabilize_key && stabilization_keys.contains(&stabilize_key)
+        {
+            recommendation.depends_on = vec![stabilize_key];
         }
     }
 
@@ -292,6 +316,7 @@ fn push_trend_recommendations(
                 "metrics": trend.metrics,
                 "sample_count": trend.sample_count,
             }),
+            depends_on: Vec::new(),
         }),
         "continuum" => recommendations.push(ImprovementRecommendation {
             dedupe_key: "continuum:worsening_trend".to_string(),
@@ -313,6 +338,7 @@ fn push_trend_recommendations(
                 "metrics": trend.metrics,
                 "sample_count": trend.sample_count,
             }),
+            depends_on: Vec::new(),
         }),
         _ => {}
     }
@@ -333,8 +359,13 @@ async fn upsert_recommendation(
             .patch_work_item(
                 existing.id,
                 crate::models::WorkItemPatch {
+                    title: Some(recommendation.title.clone()),
                     summary: Some(recommendation.summary.clone()),
+                    target_service: recommendation.target_service.clone(),
                     priority: Some(recommendation.priority),
+                    tags: Some(recommendation.tags.clone()),
+                    plan: Some(recommendation.plan.clone()),
+                    depends_on: Some(recommendation.depends_on.clone()),
                     note: Some("planner refreshed recommendation".to_string()),
                     ..Default::default()
                 },
@@ -356,6 +387,7 @@ async fn upsert_recommendation(
         verification_required: Some(true),
         tags: recommendation.tags.clone(),
         plan: recommendation.plan.clone(),
+        depends_on: recommendation.depends_on.clone(),
         source: Some("planner".to_string()),
         scheduled_for: None,
     });
@@ -371,6 +403,7 @@ fn recommendation_to_value(recommendation: &ImprovementRecommendation) -> Value 
         "priority": recommendation.priority,
         "tags": recommendation.tags,
         "plan": recommendation.plan,
+        "depends_on": recommendation.depends_on,
     })
 }
 
@@ -428,6 +461,43 @@ mod tests {
             recommendations
                 .iter()
                 .any(|item| item.dedupe_key == "stabilize:gail")
+        );
+    }
+
+    #[test]
+    fn planner_adds_dependency_edges_for_follow_up_work_on_degraded_services() {
+        let service = ServiceSnapshot {
+            service_key: "gail".to_string(),
+            display_name: "Gail".to_string(),
+            kind: "tenant_service".to_string(),
+            role_name: "continuum_tenant_gail".to_string(),
+            playbooks: vec!["continuum_tenant_gail_site.yml".to_string()],
+            hosts: vec!["rk1".to_string()],
+            namespace: Some("gail".to_string()),
+            service_name: Some("gail".to_string()),
+            internal_url: Some("http://gail.gail.svc.cluster.local:8080".to_string()),
+            public_url: Some("https://gail.neuralmimicry.ai".to_string()),
+            repo_path: None,
+            repo_url: None,
+            repo_branch: None,
+            health: ServiceHealth::Degraded,
+            capabilities: vec!["ai_gateway".to_string()],
+            dependencies: vec![],
+            storage_paths: vec![],
+            raw_defaults: json!({}),
+            probe: json!({"error": "timeout"}),
+            discovered_at: now_utc(),
+            updated_at: now_utc(),
+        };
+
+        let recommendations = derive_recommendations(&[service], &[], 0);
+        let repo_visibility = recommendations
+            .iter()
+            .find(|item| item.dedupe_key == "gail:repo_visibility")
+            .expect("repo visibility follow-up");
+        assert_eq!(
+            repo_visibility.depends_on,
+            vec!["stabilize:gail".to_string()]
         );
     }
 

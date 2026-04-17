@@ -218,13 +218,13 @@ impl ConductorRepository for PostgresRepository {
             INSERT INTO work_items (
                 id, dedupe_key, title, summary, target_service, status, priority,
                 progress_pct, admin_override, execution_approved, verification_required,
-                source, tags, plan, notes, scheduled_for, started_at, finished_at,
-                last_execution_id, last_policy, created_at, updated_at
+                source, tags, plan, depends_on, notes, scheduled_for, started_at,
+                finished_at, last_execution_id, last_policy, created_at, updated_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7,
                 $8, $9, $10, $11,
                 $12, $13, $14, $15, $16, $17, $18,
-                $19, $20, $21, $22
+                $19, $20, $21, $22, $23
             )
             ON CONFLICT (id) DO UPDATE SET
                 dedupe_key = EXCLUDED.dedupe_key,
@@ -240,6 +240,7 @@ impl ConductorRepository for PostgresRepository {
                 source = EXCLUDED.source,
                 tags = EXCLUDED.tags,
                 plan = EXCLUDED.plan,
+                depends_on = EXCLUDED.depends_on,
                 notes = EXCLUDED.notes,
                 scheduled_for = EXCLUDED.scheduled_for,
                 started_at = EXCLUDED.started_at,
@@ -263,6 +264,7 @@ impl ConductorRepository for PostgresRepository {
         .bind(&item.source)
         .bind(Json(item.tags.clone()))
         .bind(Json(item.plan.clone()))
+        .bind(Json(item.depends_on.clone()))
         .bind(Json(item.notes.clone()))
         .bind(item.scheduled_for)
         .bind(item.started_at)
@@ -437,6 +439,7 @@ fn map_work_item(row: PgRow) -> Result<WorkItem> {
         source: row.try_get("source")?,
         tags: row.try_get::<Json<Vec<String>>, _>("tags")?.0,
         plan: row.try_get::<Json<serde_json::Value>, _>("plan")?.0,
+        depends_on: row.try_get::<Json<Vec<String>>, _>("depends_on")?.0,
         notes: row.try_get::<Json<Vec<String>>, _>("notes")?.0,
         scheduled_for: row.try_get("scheduled_for")?,
         started_at: row.try_get("started_at")?,

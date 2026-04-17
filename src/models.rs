@@ -47,6 +47,10 @@ impl WorkStatus {
             _ => Self::Planned,
         }
     }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Success | Self::Failure | Self::Aborted)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -222,19 +226,26 @@ pub struct NewWorkItem {
     pub tags: Vec<String>,
     #[serde(default)]
     pub plan: Value,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
     pub source: Option<String>,
     pub scheduled_for: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct WorkItemPatch {
+    pub title: Option<String>,
     pub summary: Option<String>,
+    pub target_service: Option<String>,
     pub status: Option<WorkStatus>,
     pub priority: Option<i32>,
     pub progress_pct: Option<i32>,
     pub admin_override: Option<bool>,
     pub execution_approved: Option<bool>,
     pub verification_required: Option<bool>,
+    pub tags: Option<Vec<String>>,
+    pub plan: Option<Value>,
+    pub depends_on: Option<Vec<String>>,
     pub scheduled_for: Option<DateTime<Utc>>,
     #[serde(default)]
     pub clear_schedule: bool,
@@ -257,6 +268,7 @@ pub struct WorkItem {
     pub source: String,
     pub tags: Vec<String>,
     pub plan: Value,
+    pub depends_on: Vec<String>,
     pub notes: Vec<String>,
     pub scheduled_for: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
@@ -288,6 +300,7 @@ impl WorkItem {
             source: input.source.unwrap_or_else(|| "manual".to_string()),
             tags: unique_strings(input.tags),
             plan: input.plan,
+            depends_on: unique_strings(input.depends_on),
             notes: Vec::new(),
             scheduled_for: input.scheduled_for,
             started_at: None,
@@ -300,8 +313,14 @@ impl WorkItem {
     }
 
     pub fn apply_patch(&mut self, patch: WorkItemPatch) {
+        if let Some(title) = patch.title {
+            self.title = title;
+        }
         if let Some(summary) = patch.summary {
             self.summary = summary;
+        }
+        if let Some(target_service) = patch.target_service {
+            self.target_service = Some(target_service);
         }
         if let Some(status) = patch.status {
             self.status = status;
@@ -337,6 +356,15 @@ impl WorkItem {
         if let Some(verification_required) = patch.verification_required {
             self.verification_required = verification_required;
         }
+        if let Some(tags) = patch.tags {
+            self.tags = unique_strings(tags);
+        }
+        if let Some(plan) = patch.plan {
+            self.plan = plan;
+        }
+        if let Some(depends_on) = patch.depends_on {
+            self.depends_on = unique_strings(depends_on);
+        }
         if patch.clear_schedule {
             self.scheduled_for = None;
         } else if let Some(scheduled_for) = patch.scheduled_for {
@@ -357,6 +385,16 @@ impl WorkItem {
         self.last_execution_id = Some(execution_id);
         self.last_policy = policy;
         self.updated_at = now_utc();
+    }
+
+    pub fn matches_reference(&self, reference: &str) -> bool {
+        let reference = reference.trim();
+        !reference.is_empty()
+            && (self.id.to_string() == reference
+                || self
+                    .dedupe_key
+                    .as_deref()
+                    .is_some_and(|value| value == reference))
     }
 }
 
@@ -499,6 +537,35 @@ impl WorkExecution {
         self.updated_at = now_utc();
         if status.is_terminal() {
             self.finished_at = Some(self.updated_at);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConductorEvent {
+    pub id: Uuid,
+    pub event_type: String,
+    pub message: String,
+    pub status: Option<String>,
+    pub work_item_id: Option<Uuid>,
+    pub execution_id: Option<Uuid>,
+    pub refiner_job_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub payload: Value,
+}
+
+impl ConductorEvent {
+    pub fn new(event_type: impl Into<String>, message: impl Into<String>, payload: Value) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            event_type: event_type.into(),
+            message: message.into(),
+            status: None,
+            work_item_id: None,
+            execution_id: None,
+            refiner_job_id: None,
+            created_at: now_utc(),
+            payload,
         }
     }
 }

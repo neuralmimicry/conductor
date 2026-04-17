@@ -86,6 +86,7 @@
   <section class="hero">
     <div class="panel">
       <div class="status" id="auth-status">Token not loaded</div>
+      <div class="status" id="event-status" style="margin-top:10px;">Live feed offline</div>
       <h1 class="title">Conductor</h1>
       <p class="sub">Iterative control surface for Gail, Tracey, Continuum, Refiner, AARNN, and the Continuum tenant graph derived from Ansible. The dashboard tracks discovery, planning loops, work queues, and admin overrides.</p>
     </div>
@@ -110,11 +111,12 @@
           <button class="secondary" id="refresh">Refresh</button>
           <button id="run-discovery">Run Discovery</button>
           <button id="run-planning">Run Planning</button>
+          <button id="run-execution">Run Execution</button>
         </div>
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Work</th><th>Status</th><th>Priority</th><th>Progress</th><th>Schedule</th><th>Target</th><th>Admin</th></tr></thead>
+          <thead><tr><th>Work</th><th>Status</th><th>Priority</th><th>Progress</th><th>Schedule</th><th>Target</th><th>Execution</th><th>Admin</th></tr></thead>
           <tbody id="work-items"></tbody>
         </table>
       </div>
@@ -136,17 +138,25 @@
 </div>
 <script>
 const state = { token: localStorage.getItem('conductor_admin_token') || '' };
+let eventSource = null;
+let eventRetryTimer = null;
+let reloadTimer = null;
 const els = {
   token: document.getElementById('token'), saveToken: document.getElementById('save-token'), clearToken: document.getElementById('clear-token'),
   authStatus: document.getElementById('auth-status'), summaryCards: document.getElementById('summary-cards'), workItems: document.getElementById('work-items'),
-  services: document.getElementById('services'), cycles: document.getElementById('cycles'), refresh: document.getElementById('refresh'),
-  runDiscovery: document.getElementById('run-discovery'), runPlanning: document.getElementById('run-planning'),
+  eventStatus: document.getElementById('event-status'), services: document.getElementById('services'), cycles: document.getElementById('cycles'), refresh: document.getElementById('refresh'),
+  runDiscovery: document.getElementById('run-discovery'), runPlanning: document.getElementById('run-planning'), runExecution: document.getElementById('run-execution'),
 };
 els.token.value = state.token; updateAuthBadge();
 function updateAuthBadge(message) {
   if (message) { els.authStatus.textContent = message; els.authStatus.className = 'status warn'; return; }
   if (state.token) { els.authStatus.textContent = 'Admin token loaded'; els.authStatus.className = 'status ok'; }
   else { els.authStatus.textContent = 'No admin token loaded'; els.authStatus.className = 'status'; }
+}
+function updateEventBadge(message, tone = '') {
+  if (!els.eventStatus) return;
+  els.eventStatus.textContent = message;
+  els.eventStatus.className = `status ${tone}`.trim();
 }
 function headers(jsonBody = false) { const out = {}; if (state.token) out['Authorization'] = `Bearer ${state.token}`; if (jsonBody) out['Content-Type'] = 'application/json'; return out; }
 async function fetchJson(path, options = {}) {
@@ -155,9 +165,53 @@ async function fetchJson(path, options = {}) {
   if (!response.ok) throw new Error(payload.error || `Request failed: ${response.status}`);
   return payload;
 }
+function closeEventStream() {
+  if (eventRetryTimer) {
+    clearTimeout(eventRetryTimer);
+    eventRetryTimer = null;
+  }
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+}
+function eventStreamUrl() {
+  const params = new URLSearchParams();
+  if (state.token) params.set('token', state.token);
+  const query = params.toString();
+  return `/api/v1/executions/stream${query ? `?${query}` : ''}`;
+}
+function scheduleLoad(delay = 150) {
+  if (reloadTimer) clearTimeout(reloadTimer);
+  reloadTimer = setTimeout(() => { load(); }, delay);
+}
+function connectEventStream() {
+  if (eventSource || typeof EventSource === 'undefined') {
+    if (typeof EventSource === 'undefined') updateEventBadge('Live feed unsupported', 'warn');
+    return;
+  }
+  updateEventBadge('Connecting live feed...', 'warn');
+  eventSource = new EventSource(eventStreamUrl());
+  eventSource.onopen = () => updateEventBadge('Live feed connected', 'ok');
+  eventSource.onmessage = (event) => {
+    try {
+      const payload = JSON.parse(event.data || '{}');
+      const tone = payload.status === 'failure' || payload.status === 'blocked' ? 'bad' : (payload.status === 'success' ? 'ok' : 'warn');
+      updateEventBadge(payload.message || payload.event_type || 'Live feed update received', tone);
+    } catch (_error) {
+      updateEventBadge('Live feed update received', 'ok');
+    }
+    scheduleLoad(120);
+  };
+  eventSource.onerror = () => {
+    closeEventStream();
+    updateEventBadge('Live feed reconnecting...', 'warn');
+    eventRetryTimer = setTimeout(() => { connectEventStream(); }, 1500);
+  };
+}
 function toneForHealth(health) { if (health === 'healthy') return 'var(--ok)'; if (health === 'degraded') return 'var(--warn)'; if (health === 'unreachable' || health === 'missing') return 'var(--bad)'; return 'var(--muted)'; }
 function renderSummary(summary) {
-  const cards = [['Services', summary.services_total, `${summary.services_healthy} healthy`], ['Degraded', summary.services_degraded, `${summary.services_unreachable} unreachable`], ['Work Items', summary.work_items_total, 'planned to completed'], ['Cycles', summary.cycles_total, summary.latest_cycle ? summary.latest_cycle.summary : 'no cycles yet']];
+  const cards = [['Services', summary.services_total, `${summary.services_healthy} healthy`], ['Degraded', summary.services_degraded, `${summary.services_unreachable} unreachable`], ['Queue', summary.work_items_total, `${summary.approvals_waiting} approvals waiting · ${summary.executions_running} running`], ['Cycles', summary.cycles_total, summary.latest_cycle ? summary.latest_cycle.summary : 'no cycles yet']];
   els.summaryCards.innerHTML = cards.map(([label, metric, detail]) => `<article class="card"><div class="label">${label}</div><div class="metric">${metric}</div><div class="muted">${detail}</div></article>`).join('');
 }
 function renderServices(services) {
@@ -175,14 +229,15 @@ function toDateTimeLocal(value) {
 }
 function renderWorkItems(items) {
   const statuses = ['planned', 'scheduled', 'in_operation', 'success', 'failure', 'aborted', 'on_hold'];
-  els.workItems.innerHTML = items.map((item) => `<tr><td><strong>${item.title}</strong><br><div class="muted">${item.summary}</div><div>${(item.tags || []).map((tag) => `<span class="pill">${tag}</span>`).join('')}</div></td><td><select data-field="status" data-id="${item.id}">${statuses.map((status) => `<option value="${status}" ${status === item.status ? 'selected' : ''}>${status}</option>`).join('')}</select></td><td><input type="number" data-field="priority" data-id="${item.id}" value="${item.priority}" /></td><td><input type="number" data-field="progress_pct" data-id="${item.id}" min="0" max="100" value="${item.progress_pct}" /></td><td><input type="datetime-local" data-field="scheduled_for" data-id="${item.id}" value="${toDateTimeLocal(item.scheduled_for)}" /></td><td>${item.target_service || '<span class="muted">none</span>'}</td><td><div class="row-actions"><label><input type="checkbox" data-field="admin_override" data-id="${item.id}" ${item.admin_override ? 'checked' : ''} /> admin override</label><textarea data-field="note" data-id="${item.id}" placeholder="append note"></textarea><button class="secondary" data-action="save" data-id="${item.id}">Save</button></div></td></tr>`).join('');
+  els.workItems.innerHTML = items.map((item) => `<tr><td><strong>${item.title}</strong><br><div class="muted">${item.summary}</div><div>${(item.tags || []).map((tag) => `<span class="pill">${tag}</span>`).join('')}</div>${(item.depends_on || []).length ? `<div class="muted mono">depends_on: ${(item.depends_on || []).join(', ')}</div>` : ''}</td><td><select data-field="status" data-id="${item.id}">${statuses.map((status) => `<option value="${status}" ${status === item.status ? 'selected' : ''}>${status}</option>`).join('')}</select></td><td><input type="number" data-field="priority" data-id="${item.id}" value="${item.priority}" /></td><td><input type="number" data-field="progress_pct" data-id="${item.id}" min="0" max="100" value="${item.progress_pct}" /></td><td><input type="datetime-local" data-field="scheduled_for" data-id="${item.id}" value="${toDateTimeLocal(item.scheduled_for)}" /></td><td>${item.target_service || '<span class="muted">none</span>'}</td><td><div class="row-actions"><label><input type="checkbox" data-field="execution_approved" data-id="${item.id}" ${item.execution_approved ? 'checked' : ''} /> execution approved</label><label><input type="checkbox" data-field="verification_required" data-id="${item.id}" ${item.verification_required ? 'checked' : ''} /> verification required</label><input data-field="depends_on" data-id="${item.id}" value="${(item.depends_on || []).join(', ')}" placeholder="comma-separated dependency ids or dedupe keys" />${item.last_execution_id ? `<div class="muted mono">last execution: ${item.last_execution_id}</div>` : '<div class="muted">no execution yet</div>'}<button class="secondary" data-action="execute" data-id="${item.id}">Execute</button></div></td><td><div class="row-actions"><label><input type="checkbox" data-field="admin_override" data-id="${item.id}" ${item.admin_override ? 'checked' : ''} /> admin override</label><textarea data-field="note" data-id="${item.id}" placeholder="append note"></textarea><button class="secondary" data-action="save" data-id="${item.id}">Save</button></div></td></tr>`).join('');
   els.workItems.querySelectorAll('button[data-action="save"]').forEach((button) => {
     button.addEventListener('click', async () => {
       const id = button.dataset.id; const values = {};
       els.workItems.querySelectorAll(`[data-id="${id}"]`).forEach((el) => {
         const field = el.dataset.field; if (!field) return;
-        if (field === 'admin_override') values[field] = el.checked;
+        if (field === 'admin_override' || field === 'execution_approved' || field === 'verification_required') values[field] = el.checked;
         else if (field === 'priority' || field === 'progress_pct') values[field] = Number(el.value);
+        else if (field === 'depends_on') values[field] = el.value.split(',').map((item) => item.trim()).filter(Boolean);
         else if (field === 'scheduled_for') {
           if (el.value) values[field] = new Date(el.value).toISOString();
           else values.clear_schedule = true;
@@ -194,18 +249,33 @@ function renderWorkItems(items) {
       catch (error) { updateAuthBadge(error.message); }
     });
   });
+  els.workItems.querySelectorAll('button[data-action="execute"]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      try {
+        await fetchJson(`/api/v1/work-items/${button.dataset.id}/execute`, { method: 'POST', body: JSON.stringify({ force_schedule: true }) });
+        await load();
+      } catch (error) { updateAuthBadge(error.message); }
+    });
+  });
 }
 async function load() {
   try {
     const [summary, services, workItems, cycles] = await Promise.all([fetchJson('/api/v1/summary'), fetchJson('/api/v1/services'), fetchJson('/api/v1/work-items'), fetchJson('/api/v1/cycles?limit=10')]);
     renderSummary(summary); renderServices(services.services || services); renderWorkItems(workItems.work_items || workItems); renderCycles(cycles.cycles || cycles); updateAuthBadge();
-  } catch (error) { updateAuthBadge(error.message); }
+    connectEventStream();
+  } catch (error) {
+    closeEventStream();
+    updateEventBadge('Live feed offline', '');
+    updateAuthBadge(error.message);
+  }
 }
-els.saveToken.addEventListener('click', () => { state.token = els.token.value.trim(); localStorage.setItem('conductor_admin_token', state.token); load(); });
-els.clearToken.addEventListener('click', () => { state.token = ''; els.token.value = ''; localStorage.removeItem('conductor_admin_token'); load(); });
+els.saveToken.addEventListener('click', () => { state.token = els.token.value.trim(); localStorage.setItem('conductor_admin_token', state.token); closeEventStream(); load(); });
+els.clearToken.addEventListener('click', () => { state.token = ''; els.token.value = ''; localStorage.removeItem('conductor_admin_token'); closeEventStream(); load(); });
 els.refresh.addEventListener('click', load);
 els.runDiscovery.addEventListener('click', async () => { try { await fetchJson('/api/v1/discovery/run', { method: 'POST' }); await load(); } catch (error) { updateAuthBadge(error.message); } });
 els.runPlanning.addEventListener('click', async () => { try { await fetchJson('/api/v1/planning/run', { method: 'POST' }); await load(); } catch (error) { updateAuthBadge(error.message); } });
+els.runExecution.addEventListener('click', async () => { try { await fetchJson('/api/v1/execution/run', { method: 'POST' }); await load(); } catch (error) { updateAuthBadge(error.message); } });
+window.addEventListener('beforeunload', closeEventStream);
 load();
 </script>
 </body>

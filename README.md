@@ -7,14 +7,15 @@ Rust control-plane service for the NeuralMimicry stack. Conductor discovers the 
 - Parses `/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible/*.yml` and related `group_vars` / `host_vars` to infer the deployed topology.
 - Resolves repo hints for Gail, Tracey, Continuum (`nmc`), Refiner (`rag_demo`), and AARNN (`aarnn_rust`).
 - Probes live endpoints to classify health, capture surfaced capabilities, and persist snapshots.
-- Runs an improvement-planning loop that turns health, dependency, storage, and pressure signals into work items.
+- Runs an improvement-planning loop that turns health, dependency, storage, and pressure signals into graph-aware work items.
 - Uses Gail as an optional planning advisor and stores its response alongside each planning cycle.
-- Exposes a dashboard for queue visibility, progress updates, reprioritisation, scheduling, admin overrides, and manual discovery/planning runs.
-- Stores service snapshots, discovery runs, work items, and planning cycles in Postgres.
+- Exposes a dashboard for queue visibility, progress updates, approvals, reprioritisation, scheduling, admin overrides, and manual discovery/planning/execution runs.
+- Stores service snapshots, discovery runs, metric samples, work items, work executions, and planning cycles in Postgres.
 
 ## Current Boundaries
 
-- Conductor currently proposes and tracks improvement work; it does not yet execute end-to-end code mutation workflows against Refiner or directly patch external repositories.
+- Conductor now executes approved, scheduled, dependency-satisfied work items through Refiner's planning and job APIs.
+- Conductor still does not mutate repositories directly; Refiner remains the only code-change executor.
 - Gail is used as an advisory planner, not as the sole orchestration source of truth.
 - AARNN is treated as a self-improvement target and telemetry source; Conductor does not yet build or retrain AARNN topologies automatically.
 - Probe coverage is implemented for the confirmed endpoints in the local repositories and may need extending as upstream APIs evolve.
@@ -40,7 +41,12 @@ If `allow_dashboard_without_token` is `true`, read-only dashboard API calls rema
 - `GET /api/v1/services`
 - `GET /api/v1/topology`
 - `GET /api/v1/work-items`
+- `GET /api/v1/work-items/{id}`
 - `PATCH /api/v1/work-items/{id}`
+- `GET /api/v1/executions`
+- `GET /api/v1/work-items/{id}/executions`
+- `POST /api/v1/execution/run`
+- `POST /api/v1/work-items/{id}/execute`
 - `POST /api/v1/discovery/run`
 - `POST /api/v1/planning/run`
 
@@ -62,4 +68,5 @@ If `allow_dashboard_without_token` is `true`, read-only dashboard API calls rema
 ## Documentation
 
 - `docs/ARCHITECTURE.md`
+- `docs/TARGET_ARCHITECTURE.md`
 - `docs/OPERATIONS.md`
