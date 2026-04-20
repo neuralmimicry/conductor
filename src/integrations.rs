@@ -27,6 +27,7 @@ pub async fn probe_service(
         "continuum" => probe_continuum(client, config, service).await,
         "refiner" => probe_refiner(client, config, service).await,
         "aarnn" => probe_aarnn(client, config, service).await,
+        "ollama" => probe_ollama(client, config, service).await,
         _ => {
             probe_generic(
                 client,
@@ -48,6 +49,7 @@ fn resolve_external_config<'a>(
         "continuum" => &config.integrations.continuum,
         "refiner" => &config.integrations.refiner,
         "aarnn" => &config.integrations.aarnn,
+        "ollama" => &config.integrations.ollama,
         _ => &config.integrations.continuum,
     }
 }
@@ -294,6 +296,39 @@ async fn probe_aarnn(
     })
 }
 
+async fn probe_ollama(
+    client: &Client,
+    config: &ConductorConfig,
+    service: &ServiceSnapshot,
+) -> Result<ProbeResult> {
+    let external = resolve_external_config(config, service.service_key.as_str());
+    let base_url =
+        resolve_base_url(service, external).ok_or_else(|| anyhow!("no Ollama base URL available"))?;
+
+    let tags = get_json(
+        client,
+        &base_url,
+        "/api/tags",
+        external.bearer_token.as_deref(),
+    )
+        .await?;
+
+    let model_count = tags
+        .get("models")
+        .and_then(Value::as_array)
+        .map(|models| models.len())
+        .unwrap_or(0);
+
+    Ok(ProbeResult {
+        endpoint: Some(base_url),
+        summary: format!("Ollama availability confirmed via /api/tags ({} models visible)", model_count),
+        metrics: json!({
+            "availability": tags,
+            "model_count": model_count,
+        }),
+        health: ServiceHealth::Healthy,
+    })
+}
 async fn probe_generic(
     client: &Client,
     external: &ExternalServiceConfig,
@@ -301,29 +336,48 @@ async fn probe_generic(
 ) -> Result<ProbeResult> {
     let base_url =
         resolve_base_url(service, external).ok_or_else(|| anyhow!("no base URL available"))?;
-    let health = match get_json(
+
+    let (health, path_used) = match get_json(
         client,
         &base_url,
         "/healthz",
         external.bearer_token.as_deref(),
     )
-    .await
+        .await
     {
-        Ok(value) => value,
-        Err(_) => {
-            get_json(
-                client,
-                &base_url,
-                "/health",
-                external.bearer_token.as_deref(),
-            )
-            .await?
-        }
+        Ok(value) => (value, "/healthz"),
+        Err(_) => match get_json(
+            client,
+            &base_url,
+            "/health",
+            external.bearer_token.as_deref(),
+        )
+            .await
+        {
+            Ok(value) => (value, "/health"),
+            Err(_) => {
+                let value = get_json(
+                    client,
+                    &base_url,
+                    "/api/tags",
+                    external.bearer_token.as_deref(),
+                )
+                    .await?;
+                (value, "/api/tags")
+            }
+        },
     };
+
     Ok(ProbeResult {
         endpoint: Some(base_url),
-        summary: format!("{} generic health endpoint retrieved", service.display_name),
-        metrics: json!({"health": health}),
+        summary: format!(
+            "{} health surface retrieved via {}",
+            service.display_name, path_used
+        ),
+        metrics: json!({
+            "health": health,
+            "path_used": path_used,
+        }),
         health: ServiceHealth::Healthy,
     })
 }

@@ -79,6 +79,7 @@ pub struct IntegrationsConfig {
     pub continuum: ExternalServiceConfig,
     pub refiner: ExternalServiceConfig,
     pub aarnn: ExternalServiceConfig,
+    pub ollama: ExternalServiceConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -216,6 +217,7 @@ impl Default for IntegrationsConfig {
             continuum: ExternalServiceConfig::default(),
             refiner: ExternalServiceConfig::default(),
             aarnn: ExternalServiceConfig::default(),
+            ollama: ExternalServiceConfig::default(),
         }
     }
 }
@@ -274,6 +276,7 @@ impl Default for PolicyConfig {
                 "gail".to_string(),
                 "refiner".to_string(),
                 "aarnn".to_string(),
+                "ollama".to_string(),
             ],
             protected_repo_roots: Vec::new(),
             blocked_action_keywords: vec![
@@ -347,6 +350,7 @@ impl ConductorConfig {
         normalize_external_service(&mut self.integrations.continuum);
         normalize_external_service(&mut self.integrations.refiner);
         normalize_external_service(&mut self.integrations.aarnn);
+        normalize_external_service(&mut self.integrations.ollama);
         normalize_unique_strings(&mut self.policy.protected_services);
         normalize_unique_strings(&mut self.policy.blocked_action_keywords);
         normalize_paths(&mut self.policy.protected_repo_roots);
