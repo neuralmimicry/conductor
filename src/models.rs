@@ -129,6 +129,71 @@ impl RunStatus {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum FindingSeverity {
+    Info,
+    Low,
+    #[default]
+    Medium,
+    High,
+    Critical,
+}
+
+impl FindingSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Self {
+        match value.trim() {
+            "info" => Self::Info,
+            "low" => Self::Low,
+            "medium" => Self::Medium,
+            "high" => Self::High,
+            "critical" => Self::Critical,
+            _ => Self::Medium,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingStatus {
+    #[default]
+    Open,
+    Accepted,
+    Suppressed,
+    Resolved,
+}
+
+impl FindingStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Accepted => "accepted",
+            Self::Suppressed => "suppressed",
+            Self::Resolved => "resolved",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Self {
+        match value.trim() {
+            "open" => Self::Open,
+            "accepted" => Self::Accepted,
+            "suppressed" => Self::Suppressed,
+            "resolved" => Self::Resolved,
+            _ => Self::Open,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum ExecutionStatus {
     #[default]
     Pending,
@@ -271,6 +336,12 @@ pub struct WorkItem {
     pub depends_on: Vec<String>,
     pub notes: Vec<String>,
     pub scheduled_for: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_expires_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub claim_token: Option<Uuid>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub last_execution_id: Option<Uuid>,
@@ -303,6 +374,9 @@ impl WorkItem {
             depends_on: unique_strings(input.depends_on),
             notes: Vec::new(),
             scheduled_for: input.scheduled_for,
+            claimed_by: None,
+            claim_expires_at: None,
+            claim_token: None,
             started_at: None,
             finished_at: None,
             last_execution_id: None,
@@ -387,6 +461,13 @@ impl WorkItem {
         self.updated_at = now_utc();
     }
 
+    pub fn clear_claim(&mut self) {
+        self.claimed_by = None;
+        self.claim_expires_at = None;
+        self.claim_token = None;
+        self.updated_at = now_utc();
+    }
+
     pub fn matches_reference(&self, reference: &str) -> bool {
         let reference = reference.trim();
         !reference.is_empty()
@@ -405,6 +486,7 @@ pub struct ServiceSnapshot {
     pub kind: String,
     pub role_name: String,
     pub playbooks: Vec<String>,
+    pub host_targets: Vec<String>,
     pub hosts: Vec<String>,
     pub namespace: Option<String>,
     pub service_name: Option<String>,
@@ -424,10 +506,84 @@ pub struct ServiceSnapshot {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RepositorySnapshot {
+    pub repo_key: String,
+    pub name: String,
+    pub owner: Option<String>,
+    pub repo_url: Option<String>,
+    pub local_path: Option<String>,
+    pub default_branch: Option<String>,
+    pub current_branch: Option<String>,
+    pub language: Option<String>,
+    pub frameworks: Vec<String>,
+    pub build_systems: Vec<String>,
+    pub package_managers: Vec<String>,
+    pub runtime_type: Option<String>,
+    pub deployment_type: Option<String>,
+    pub purpose: Option<String>,
+    pub criticality: String,
+    pub visibility: Option<String>,
+    pub archived: bool,
+    pub linked_services: Vec<String>,
+    pub dependencies: Vec<String>,
+    pub capabilities: Vec<String>,
+    pub inventory_sources: Vec<String>,
+    pub metadata: Value,
+    pub discovered_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FindingRecord {
+    pub id: Uuid,
+    pub finding_key: String,
+    pub title: String,
+    pub summary: String,
+    pub category: String,
+    pub severity: FindingSeverity,
+    pub status: FindingStatus,
+    pub target_service: Option<String>,
+    pub target_repository: Option<String>,
+    pub source_run_id: Option<Uuid>,
+    pub confidence_score: f64,
+    pub tags: Vec<String>,
+    pub details: Value,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FindingEvidence {
+    pub id: Uuid,
+    pub finding_id: Uuid,
+    pub evidence_type: String,
+    pub source_kind: String,
+    pub source_ref: String,
+    pub summary: String,
+    pub payload: Value,
+    pub collected_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FindingProvenance {
+    pub id: Uuid,
+    pub finding_id: Uuid,
+    pub stage: String,
+    pub origin: String,
+    pub component: String,
+    pub detail: String,
+    pub confidence_score: Option<f64>,
+    pub payload: Value,
+    pub recorded_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiscoveryRun {
     pub id: Uuid,
     pub status: RunStatus,
     pub services_count: usize,
+    pub repositories_count: usize,
     pub issues: Vec<String>,
     pub topology: Value,
     pub started_at: DateTime<Utc>,
@@ -463,6 +619,9 @@ pub struct TopologyGraph {
 pub struct DashboardSummary {
     pub generated_at: DateTime<Utc>,
     pub services_total: usize,
+    pub repositories_total: usize,
+    pub findings_total: usize,
+    pub findings_by_severity: BTreeMap<String, usize>,
     pub services_healthy: usize,
     pub services_degraded: usize,
     pub services_unreachable: usize,

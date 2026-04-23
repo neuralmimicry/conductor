@@ -229,6 +229,7 @@ mod tests {
             kind: "tenant_service".to_string(),
             role_name: "continuum_tenant_gail".to_string(),
             playbooks: vec![],
+            host_targets: vec![],
             hosts: vec![],
             namespace: None,
             service_name: None,

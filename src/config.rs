@@ -54,10 +54,23 @@ pub struct DatabaseConfig {
 #[serde(default)]
 pub struct DiscoveryConfig {
     pub ansible_root: PathBuf,
+    pub local_repo_root: PathBuf,
     pub refresh_interval_seconds: u64,
     pub probe_services: bool,
     pub service_timeout_seconds: u64,
+    pub github: GitHubDiscoveryConfig,
     pub repo_hints: RepoHints,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GitHubDiscoveryConfig {
+    pub enabled: bool,
+    pub api_base_url: String,
+    pub owner: String,
+    pub token: Option<String>,
+    pub timeout_seconds: u64,
+    pub max_repositories: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -106,10 +119,14 @@ pub struct PlanningConfig {
 #[serde(default)]
 pub struct ExecutionConfig {
     pub enabled: bool,
+    pub dry_run: bool,
+    pub emergency_stop: bool,
     pub refresh_interval_seconds: u64,
     pub poll_interval_seconds: u64,
     pub job_timeout_seconds: u64,
+    pub claim_ttl_seconds: u64,
     pub max_concurrent_executions: usize,
+    pub instance_id: Option<String>,
     pub use_local_project_root: bool,
     pub refiner_workflow: String,
     pub token_scope: String,
@@ -161,7 +178,7 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             admin_token: None,
-            allow_dashboard_without_token: true,
+            allow_dashboard_without_token: false,
         }
     }
 }
@@ -188,10 +205,25 @@ impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
             ansible_root: PathBuf::from("/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible"),
+            local_repo_root: PathBuf::from("/home/pbisaacs/Developer/neuralmimicry"),
             refresh_interval_seconds: 180,
             probe_services: true,
             service_timeout_seconds: 5,
+            github: GitHubDiscoveryConfig::default(),
             repo_hints: RepoHints::default(),
+        }
+    }
+}
+
+impl Default for GitHubDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            api_base_url: "https://api.github.com".to_string(),
+            owner: "neuralmimicry".to_string(),
+            token: None,
+            timeout_seconds: 10,
+            max_repositories: 200,
         }
     }
 }
@@ -250,10 +282,14 @@ impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            dry_run: false,
+            emergency_stop: false,
             refresh_interval_seconds: 120,
             poll_interval_seconds: 5,
             job_timeout_seconds: 900,
+            claim_ttl_seconds: 1200,
             max_concurrent_executions: 1,
+            instance_id: None,
             use_local_project_root: true,
             refiner_workflow: "project_solver".to_string(),
             token_scope: "personal".to_string(),
@@ -312,6 +348,10 @@ impl ConductorConfig {
         if self.discovery.refresh_interval_seconds == 0 {
             self.discovery.refresh_interval_seconds = 180;
         }
+        if self.discovery.local_repo_root.as_os_str().is_empty() {
+            self.discovery.local_repo_root =
+                PathBuf::from("/home/pbisaacs/Developer/neuralmimicry");
+        }
         if self.planning.refresh_interval_seconds == 0 {
             self.planning.refresh_interval_seconds = 240;
         }
@@ -324,8 +364,31 @@ impl ConductorConfig {
         if self.execution.job_timeout_seconds == 0 {
             self.execution.job_timeout_seconds = 900;
         }
+        if self.execution.claim_ttl_seconds == 0 {
+            self.execution.claim_ttl_seconds =
+                self.execution.job_timeout_seconds.saturating_add(300);
+        }
+        self.execution.claim_ttl_seconds = self.execution.claim_ttl_seconds.max(60);
         if self.discovery.service_timeout_seconds == 0 {
             self.discovery.service_timeout_seconds = 5;
+        }
+        if self.discovery.github.api_base_url.trim().is_empty() {
+            self.discovery.github.api_base_url = "https://api.github.com".to_string();
+        } else {
+            self.discovery.github.api_base_url = self
+                .discovery
+                .github
+                .api_base_url
+                .trim_end_matches('/')
+                .to_string();
+        }
+        self.discovery.github.owner = self.discovery.github.owner.trim().to_string();
+        normalize_optional_string(&mut self.discovery.github.token);
+        if self.discovery.github.timeout_seconds == 0 {
+            self.discovery.github.timeout_seconds = 10;
+        }
+        if self.discovery.github.max_repositories == 0 {
+            self.discovery.github.max_repositories = 200;
         }
         if self.execution.max_concurrent_executions == 0 {
             self.execution.max_concurrent_executions = 1;
@@ -341,6 +404,12 @@ impl ConductorConfig {
         }
         if self.execution.token_scope.trim().is_empty() {
             self.execution.token_scope = "personal".to_string();
+        }
+        normalize_optional_string(&mut self.execution.instance_id);
+        if self.execution.instance_id.is_none() {
+            let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "local".to_string());
+            self.execution.instance_id =
+                Some(format!("conductor-{}-{}", host.trim(), std::process::id()));
         }
         normalize_optional_string(&mut self.execution.llm_provider);
         normalize_optional_string(&mut self.execution.llm_model);

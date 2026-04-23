@@ -43,8 +43,17 @@ pub fn build_router(service: ConductorService) -> Router {
         .route("/healthz", get(health))
         .route("/dashboard", get(dashboard))
         .route("/api/v1/summary", get(summary))
+        .route("/api/v1/findings", get(findings))
+        .route("/api/v1/findings/{id}", get(get_finding))
+        .route("/api/v1/findings/{id}/evidence", get(get_finding_evidence))
+        .route(
+            "/api/v1/findings/{id}/provenance",
+            get(get_finding_provenance),
+        )
+        .route("/api/v1/repositories", get(repositories))
         .route("/api/v1/services", get(services))
         .route("/api/v1/topology", get(topology))
+        .route("/api/v1/events", get(list_events))
         .route("/api/v1/executions", get(list_executions))
         .route("/api/v1/executions/stream", get(stream_executions))
         .route("/api/v1/execution/run", post(trigger_execution_cycle))
@@ -99,6 +108,69 @@ async fn services(
     Ok(Json(
         serde_json::json!({"services": service.services().await?}),
     ))
+}
+
+async fn repositories(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    service.authorize_read(&headers)?;
+    Ok(Json(
+        serde_json::json!({"repositories": service.repositories().await?}),
+    ))
+}
+
+async fn findings(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    service.authorize_read(&headers)?;
+    Ok(Json(
+        serde_json::json!({"findings": service.findings().await?}),
+    ))
+}
+
+async fn get_finding(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    service.authorize_read(&headers)?;
+    let finding = service
+        .finding(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("finding {} not found", id)))?;
+    Ok(Json(serde_json::json!({"finding": finding})))
+}
+
+async fn get_finding_evidence(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    service.authorize_read(&headers)?;
+    service
+        .finding(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("finding {} not found", id)))?;
+    Ok(Json(serde_json::json!({
+        "evidence": service.finding_evidence(id).await?
+    })))
+}
+
+async fn get_finding_provenance(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    service.authorize_read(&headers)?;
+    service
+        .finding(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("finding {} not found", id)))?;
+    Ok(Json(serde_json::json!({
+        "provenance": service.finding_provenance(id).await?
+    })))
 }
 
 async fn topology(
@@ -171,6 +243,16 @@ async fn list_executions(
     Ok(Json(serde_json::json!({"executions": executions})))
 }
 
+async fn list_events(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+    Query(query): Query<LimitQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    service.authorize_read(&headers)?;
+    let events = service.events(query.limit.unwrap_or(100)).await?;
+    Ok(Json(serde_json::json!({"events": events})))
+}
+
 async fn stream_executions(
     State(service): State<ConductorService>,
     headers: HeaderMap,
@@ -182,7 +264,10 @@ async fn stream_executions(
         match receiver.recv().await {
             Ok(event) => {
                 let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-                Some((Ok::<Event, Infallible>(Event::default().data(payload)), receiver))
+                Some((
+                    Ok::<Event, Infallible>(Event::default().data(payload)),
+                    receiver,
+                ))
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 let payload = json!({
@@ -198,10 +283,11 @@ async fn stream_executions(
             Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
         }
     });
-    Ok(
-        Sse::new(stream)
-            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("keep-alive")),
-    )
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
 }
 
 async fn list_work_item_executions(
@@ -304,7 +390,10 @@ mod tests {
     };
     use tower::util::ServiceExt;
 
-    use crate::models::{NewWorkItem, WorkExecution, WorkItem};
+    use crate::models::{
+        FindingRecord, FindingSeverity, FindingStatus, NewWorkItem, WorkExecution, WorkItem,
+        now_utc,
+    };
     use crate::{
         config::ConductorConfig, integrations::build_http_client, service::ConductorService,
         storage::memory::MemoryRepository,
@@ -393,6 +482,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repositories_require_auth_when_token_is_configured() {
+        let app = build_router(test_service());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/repositories")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn findings_require_auth_when_token_is_configured() {
+        let app = build_router(test_service());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/findings")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn findings_endpoint_returns_records_when_authorized() {
+        let service = test_service();
+        let finding = FindingRecord {
+            id: uuid::Uuid::new_v4(),
+            finding_key: "repository_test_baseline:gail".to_string(),
+            title: "Gail lacks tests".to_string(),
+            summary: "Test baseline missing".to_string(),
+            category: "testability".to_string(),
+            severity: FindingSeverity::Medium,
+            status: FindingStatus::Open,
+            target_service: Some("gail".to_string()),
+            target_repository: Some("gail".to_string()),
+            source_run_id: None,
+            confidence_score: 0.8,
+            tags: vec!["tests".to_string()],
+            details: json!({"rule": "repository_missing_tests_capability"}),
+            first_seen_at: now_utc(),
+            last_seen_at: now_utc(),
+            updated_at: now_utc(),
+        };
+        service
+            .repository
+            .replace_findings(&[finding.clone()], &[], &[])
+            .await
+            .expect("replace findings");
+
+        let app = build_router(service);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/findings")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            payload["findings"][0]["finding_key"].as_str(),
+            Some("repository_test_baseline:gail")
+        );
+    }
+
+    #[tokio::test]
     async fn service_broadcasts_published_events() {
         let service = test_service();
         let mut receiver = service.subscribe_events();
@@ -408,6 +576,34 @@ mod tests {
             .expect("event");
         assert_eq!(event.event_type, "execution.test");
         assert_eq!(event.message, "hello");
+
+        let persisted = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let events = service.events(10).await.expect("events");
+                if !events.is_empty() {
+                    break events;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("persisted events");
+        assert_eq!(persisted[0].event_type, "execution.test");
+    }
+
+    #[tokio::test]
+    async fn events_endpoint_requires_auth_when_token_is_configured() {
+        let app = build_router(test_service());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

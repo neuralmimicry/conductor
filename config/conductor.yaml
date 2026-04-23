@@ -5,7 +5,7 @@ server:
 
 security:
   admin_token: "${CONDUCTOR_ADMIN_TOKEN}"
-  allow_dashboard_without_token: true
+  allow_dashboard_without_token: false
 
 storage:
   root_dir: "data"
@@ -17,9 +17,17 @@ database:
 
 discovery:
   ansible_root: "/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible"
+  local_repo_root: "/home/pbisaacs/Developer/neuralmimicry"
   refresh_interval_seconds: 180
   probe_services: true
   service_timeout_seconds: 5
+  github:
+    enabled: true
+    api_base_url: "https://api.github.com"
+    owner: "neuralmimicry"
+    token: "${GITHUB_TOKEN}"
+    timeout_seconds: 10
+    max_repositories: 200
   repo_hints:
     conductor_repo: "/home/pbisaacs/Developer/neuralmimicry/conductor"
     gail_repo: "/home/pbisaacs/Developer/neuralmimicry/gail"
@@ -65,10 +73,14 @@ planning:
 
 execution:
   enabled: true
+  dry_run: false
+  emergency_stop: false
   refresh_interval_seconds: 120
   poll_interval_seconds: 5
   job_timeout_seconds: 900
+  claim_ttl_seconds: 1200
   max_concurrent_executions: 1
+  instance_id: "${CONDUCTOR_INSTANCE_ID}"
   use_local_project_root: true
   refiner_workflow: "project_solver"
   token_scope: "personal"

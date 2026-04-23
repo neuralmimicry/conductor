@@ -4,6 +4,7 @@ pub mod dashboard;
 pub mod discovery;
 pub mod error;
 pub mod executor;
+pub mod findings;
 pub mod integrations;
 pub mod models;
 pub mod planner;

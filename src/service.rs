@@ -13,8 +13,9 @@ use crate::{
     error::ApiError,
     executor::{ExecutionEventCallback, execute_specific_work_item, run_execution_cycle},
     models::{
-        ConductorEvent, DashboardSummary, DiscoveryRun, ImprovementCycle, WorkExecution,
-        WorkItem, WorkStatus, now_utc, topology_from_services,
+        ConductorEvent, DashboardSummary, DiscoveryRun, FindingEvidence, FindingProvenance,
+        FindingRecord, ImprovementCycle, RepositorySnapshot, WorkExecution, WorkItem, WorkStatus,
+        now_utc, topology_from_services,
     },
     planner::run_planning_cycle,
     repository::ConductorRepository,
@@ -45,7 +46,13 @@ impl ConductorService {
     }
 
     pub fn publish_event(&self, event: ConductorEvent) {
-        let _ = self.events.send(event);
+        let _ = self.events.send(event.clone());
+        let repository = self.repository.clone();
+        tokio::spawn(async move {
+            if let Err(error) = repository.insert_conductor_event(&event).await {
+                tracing::warn!(error = %error, "failed to persist conductor event");
+            }
+        });
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<ConductorEvent> {
@@ -54,8 +61,15 @@ impl ConductorService {
 
     fn event_callback(&self) -> ExecutionEventCallback {
         let sender = self.events.clone();
+        let repository = self.repository.clone();
         Arc::new(move |event: ConductorEvent| {
-            let _ = sender.send(event);
+            let _ = sender.send(event.clone());
+            let repository = repository.clone();
+            tokio::spawn(async move {
+                if let Err(error) = repository.insert_conductor_event(&event).await {
+                    tracing::warn!(error = %error, "failed to persist conductor event");
+                }
+            });
         })
     }
 
@@ -105,10 +119,15 @@ impl ConductorService {
     }
 
     pub async fn run_discovery_cycle(&self) -> Result<DiscoveryRun> {
-        let (services, run) = discover_and_probe(&self.config, &self.http).await?;
-        let metric_samples = collect_metric_samples(run.id, &services);
-        self.repository.replace_service_snapshots(&services).await?;
-        self.repository.insert_discovery_run(&run).await?;
+        let discovery = discover_and_probe(&self.config, &self.http).await?;
+        let metric_samples = collect_metric_samples(discovery.run.id, &discovery.services);
+        self.repository
+            .replace_service_snapshots(&discovery.services)
+            .await?;
+        self.repository
+            .replace_repository_snapshots(&discovery.repositories)
+            .await?;
+        self.repository.insert_discovery_run(&discovery.run).await?;
         if !metric_samples.is_empty() {
             self.repository
                 .insert_service_metric_samples(&metric_samples)
@@ -116,16 +135,21 @@ impl ConductorService {
         }
         let mut event = ConductorEvent::new(
             "discovery.completed",
-            format!("discovery cycle completed with {} services", services.len()),
+            format!(
+                "discovery cycle completed with {} services and {} repositories",
+                discovery.services.len(),
+                discovery.repositories.len()
+            ),
             json!({
-                "discovery_run_id": run.id.to_string(),
-                "services_count": services.len(),
-                "status": run.status.as_str(),
+                "discovery_run_id": discovery.run.id.to_string(),
+                "services_count": discovery.services.len(),
+                "repositories_count": discovery.repositories.len(),
+                "status": discovery.run.status.as_str(),
             }),
         );
-        event.status = Some(run.status.as_str().to_string());
+        event.status = Some(discovery.run.status.as_str().to_string());
         self.publish_event(event);
-        Ok(run)
+        Ok(discovery.run)
     }
 
     pub async fn run_planning_cycle(&self) -> Result<ImprovementCycle> {
@@ -148,6 +172,26 @@ impl ConductorService {
         self.repository.list_service_snapshots().await
     }
 
+    pub async fn repositories(&self) -> Result<Vec<RepositorySnapshot>> {
+        self.repository.list_repository_snapshots().await
+    }
+
+    pub async fn findings(&self) -> Result<Vec<FindingRecord>> {
+        self.repository.list_findings().await
+    }
+
+    pub async fn finding(&self, id: Uuid) -> Result<Option<FindingRecord>> {
+        self.repository.get_finding(id).await
+    }
+
+    pub async fn finding_evidence(&self, id: Uuid) -> Result<Vec<FindingEvidence>> {
+        self.repository.list_finding_evidence(id).await
+    }
+
+    pub async fn finding_provenance(&self, id: Uuid) -> Result<Vec<FindingProvenance>> {
+        self.repository.list_finding_provenance(id).await
+    }
+
     pub async fn work_items(&self) -> Result<Vec<WorkItem>> {
         self.repository.list_work_items().await
     }
@@ -158,6 +202,10 @@ impl ConductorService {
 
     pub async fn executions(&self, limit: usize) -> Result<Vec<WorkExecution>> {
         self.repository.list_work_executions(limit).await
+    }
+
+    pub async fn events(&self, limit: usize) -> Result<Vec<ConductorEvent>> {
+        self.repository.list_conductor_events(limit).await
     }
 
     pub async fn work_item_executions(
@@ -177,12 +225,16 @@ impl ConductorService {
             json!({}),
         ));
         let callback = self.event_callback();
-        let result = run_execution_cycle(self.repository.as_ref(), &self.config, Some(&callback)).await;
+        let result =
+            run_execution_cycle(self.repository.as_ref(), &self.config, Some(&callback)).await;
         match &result {
             Ok(executions) => {
                 let mut event = ConductorEvent::new(
                     "execution.cycle.completed",
-                    format!("execution cycle completed with {} execution(s)", executions.len()),
+                    format!(
+                        "execution cycle completed with {} execution(s)",
+                        executions.len()
+                    ),
                     json!({
                         "executions_started": executions.len(),
                     }),
@@ -229,6 +281,8 @@ impl ConductorService {
 
     pub async fn summary(&self) -> Result<DashboardSummary> {
         let services = self.repository.list_service_snapshots().await?;
+        let repositories = self.repository.list_repository_snapshots().await?;
+        let findings = self.repository.list_findings().await?;
         let work_items = self.repository.list_work_items().await?;
         let latest_discovery = self
             .repository
@@ -252,9 +306,19 @@ impl ConductorService {
                 .or_insert(0usize) += 1;
         }
 
+        let mut findings_by_severity = BTreeMap::new();
+        for finding in &findings {
+            *findings_by_severity
+                .entry(finding.severity.as_str().to_string())
+                .or_insert(0usize) += 1;
+        }
+
         Ok(DashboardSummary {
             generated_at: now_utc(),
             services_total: services.len(),
+            repositories_total: repositories.len(),
+            findings_total: findings.len(),
+            findings_by_severity,
             services_healthy: services
                 .iter()
                 .filter(|service| matches!(service.health, crate::models::ServiceHealth::Healthy))

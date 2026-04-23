@@ -1,14 +1,37 @@
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 use crate::models::{
-    DiscoveryRun, ImprovementCycle, ServiceMetricSample, ServiceSnapshot, WorkExecution, WorkItem,
-    WorkItemPatch,
+    ConductorEvent, DiscoveryRun, FindingEvidence, FindingProvenance, FindingRecord,
+    ImprovementCycle, RepositorySnapshot, ServiceMetricSample, ServiceSnapshot, WorkExecution,
+    WorkItem, WorkItemPatch,
 };
 
 #[async_trait]
 pub trait ConductorRepository: Send + Sync {
     async fn list_service_snapshots(&self) -> anyhow::Result<Vec<ServiceSnapshot>>;
     async fn replace_service_snapshots(&self, services: &[ServiceSnapshot]) -> anyhow::Result<()>;
+    async fn list_repository_snapshots(&self) -> anyhow::Result<Vec<RepositorySnapshot>>;
+    async fn replace_repository_snapshots(
+        &self,
+        repositories: &[RepositorySnapshot],
+    ) -> anyhow::Result<()>;
+    async fn list_findings(&self) -> anyhow::Result<Vec<FindingRecord>>;
+    async fn get_finding(&self, id: uuid::Uuid) -> anyhow::Result<Option<FindingRecord>>;
+    async fn replace_findings(
+        &self,
+        findings: &[FindingRecord],
+        evidence: &[FindingEvidence],
+        provenance: &[FindingProvenance],
+    ) -> anyhow::Result<()>;
+    async fn list_finding_evidence(
+        &self,
+        finding_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<FindingEvidence>>;
+    async fn list_finding_provenance(
+        &self,
+        finding_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<FindingProvenance>>;
 
     async fn insert_discovery_run(&self, run: &DiscoveryRun) -> anyhow::Result<()>;
     async fn list_discovery_runs(&self, limit: usize) -> anyhow::Result<Vec<DiscoveryRun>>;
@@ -35,6 +58,27 @@ pub trait ConductorRepository: Send + Sync {
         &self,
         dedupe_key: &str,
     ) -> anyhow::Result<Option<WorkItem>>;
+    async fn claim_scheduled_work_items(
+        &self,
+        now: DateTime<Utc>,
+        claimed_by: &str,
+        max_concurrent_executions: usize,
+        claim_ttl_seconds: u64,
+    ) -> anyhow::Result<Vec<WorkItem>>;
+    async fn claim_work_item_for_execution(
+        &self,
+        id: uuid::Uuid,
+        now: DateTime<Utc>,
+        claimed_by: &str,
+        claim_ttl_seconds: u64,
+        force_schedule: bool,
+        max_concurrent_executions: usize,
+    ) -> anyhow::Result<Option<WorkItem>>;
+    async fn release_work_item_claim(
+        &self,
+        id: uuid::Uuid,
+        claim_token: uuid::Uuid,
+    ) -> anyhow::Result<bool>;
 
     async fn upsert_work_execution(&self, execution: &WorkExecution) -> anyhow::Result<()>;
     async fn list_work_executions(&self, limit: usize) -> anyhow::Result<Vec<WorkExecution>>;
@@ -46,4 +90,6 @@ pub trait ConductorRepository: Send + Sync {
 
     async fn insert_improvement_cycle(&self, cycle: &ImprovementCycle) -> anyhow::Result<()>;
     async fn list_improvement_cycles(&self, limit: usize) -> anyhow::Result<Vec<ImprovementCycle>>;
+    async fn insert_conductor_event(&self, event: &ConductorEvent) -> anyhow::Result<()>;
+    async fn list_conductor_events(&self, limit: usize) -> anyhow::Result<Vec<ConductorEvent>>;
 }

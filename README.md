@@ -1,20 +1,23 @@
 # Conductor
 
-Rust control-plane service for the NeuralMimicry stack. Conductor discovers the deployed topology from the SwarmHPC Ansible playbooks, probes the live service surfaces for Gail, Tracey, Continuum, Refiner, and AARNN, persists state in Postgres, and drives an improvement queue through an admin dashboard and API.
+Rust control-plane service for the NeuralMimicry stack. Conductor discovers the deployed topology from the SwarmHPC Ansible playbooks, scans the mounted NeuralMimicry repositories, optionally enriches that inventory from the GitHub organisation, probes the live service surfaces for Gail, Tracey, Continuum, Refiner, and AARNN, persists state in Postgres, and drives an improvement queue through an admin dashboard and API.
 
 ## What It Does
 
-- Parses `/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible/*.yml` and related `group_vars` / `host_vars` to infer the deployed topology.
-- Resolves repo hints for Gail, Tracey, Continuum (`nmc`), Refiner (`rag_demo`), and AARNN (`aarnn_rust`).
+- Parses the SwarmHPC Ansible tree, including inventory groups, `group_vars`, `host_vars`, and tenant playbooks, to infer the deployed topology.
+- Builds a first-class repository inventory from the mounted local estate under `/home/pbisaacs/Developer/neuralmimicry` and optional GitHub organisation metadata.
+- Resolves repository URLs and branches from Ansible defaults, local git metadata, and explicit repo hints for cross-checking.
 - Probes live endpoints to classify health, capture surfaced capabilities, and persist snapshots.
-- Runs an improvement-planning loop that turns health, dependency, storage, and pressure signals into graph-aware work items.
+- Derives typed findings, evidence, and provenance records from repository inventory, service topology, runtime probes, and trend summaries.
+- Runs an improvement-planning loop that turns evidence-backed findings into graph-aware work items.
 - Uses Gail as an optional planning advisor and stores its response alongside each planning cycle.
 - Exposes a dashboard for queue visibility, progress updates, approvals, reprioritisation, scheduling, admin overrides, and manual discovery/planning/execution runs.
-- Stores service snapshots, discovery runs, metric samples, work items, work executions, and planning cycles in Postgres.
+- Stores service snapshots, repository snapshots, typed findings, evidence, provenance, discovery runs, metric samples, work items, work executions, planning cycles, and persistent conductor events in Postgres.
 
 ## Current Boundaries
 
 - Conductor now executes approved, scheduled, dependency-satisfied work items through Refiner's planning and job APIs.
+- Execution selection now respects `scheduled_for`, uses DB-backed claims to avoid duplicate dispatch, and supports `dry_run` and `emergency_stop` controls.
 - Conductor still does not mutate repositories directly; Refiner remains the only code-change executor.
 - Gail is used as an advisory planner, not as the sole orchestration source of truth.
 - AARNN is treated as a self-improvement target and telemetry source; Conductor does not yet build or retrain AARNN topologies automatically.
@@ -32,14 +35,20 @@ cargo run -- --config config/conductor.yaml
 
 4. Open `http://127.0.0.1:8091/dashboard`.
 
-If `allow_dashboard_without_token` is `true`, read-only dashboard API calls remain public while planning, patching, and manual run triggers still require the bearer token.
+Read APIs are protected by default. Set `allow_dashboard_without_token` to `true` only if you explicitly want public read-only access.
 
 ## Key APIs
 
 - `GET /healthz`
 - `GET /api/v1/summary`
+- `GET /api/v1/findings`
+- `GET /api/v1/findings/{id}`
+- `GET /api/v1/findings/{id}/evidence`
+- `GET /api/v1/findings/{id}/provenance`
+- `GET /api/v1/repositories`
 - `GET /api/v1/services`
 - `GET /api/v1/topology`
+- `GET /api/v1/events`
 - `GET /api/v1/work-items`
 - `GET /api/v1/work-items/{id}`
 - `PATCH /api/v1/work-items/{id}`
@@ -53,12 +62,16 @@ If `allow_dashboard_without_token` is `true`, read-only dashboard API calls rema
 ## Storage Model
 
 - Postgres is the system of record.
+- `repository_snapshots` now hold the SCM and local-estate inventory that planning and future findings will build on.
+- `findings`, `finding_evidence`, and `finding_provenance` now bridge raw inventory/probe state and queued work items with evidence-backed analysis records.
+- `work_items` now include short-lived execution claims for safe dispatch coordination.
 - `data/` is reserved for any local persistent artifacts Conductor may emit in later iterations.
 - SQL migrations live in `migrations/` and are executed automatically on startup by default.
 
 ## Local Paths Assumed By Default
 
 - Ansible: `/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible`
+- Local repository estate: `/home/pbisaacs/Developer/neuralmimicry`
 - Gail: `/home/pbisaacs/Developer/neuralmimicry/gail`
 - Tracey: `/home/pbisaacs/Developer/neuralmimicry/tracey`
 - Continuum: `/home/pbisaacs/Developer/neuralmimicry/nmc`
@@ -70,3 +83,4 @@ If `allow_dashboard_without_token` is `true`, read-only dashboard API calls rema
 - `docs/ARCHITECTURE.md`
 - `docs/TARGET_ARCHITECTURE.md`
 - `docs/OPERATIONS.md`
+- `docs/FORMAL_GAP_ANALYSIS.md`

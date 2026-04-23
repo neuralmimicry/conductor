@@ -302,8 +302,8 @@ async fn probe_ollama(
     service: &ServiceSnapshot,
 ) -> Result<ProbeResult> {
     let external = resolve_external_config(config, service.service_key.as_str());
-    let base_url =
-        resolve_base_url(service, external).ok_or_else(|| anyhow!("no Ollama base URL available"))?;
+    let base_url = resolve_base_url(service, external)
+        .ok_or_else(|| anyhow!("no Ollama base URL available"))?;
 
     let tags = get_json(
         client,
@@ -311,7 +311,7 @@ async fn probe_ollama(
         "/api/tags",
         external.bearer_token.as_deref(),
     )
-        .await?;
+    .await?;
 
     let model_count = tags
         .get("models")
@@ -321,7 +321,10 @@ async fn probe_ollama(
 
     Ok(ProbeResult {
         endpoint: Some(base_url),
-        summary: format!("Ollama availability confirmed via /api/tags ({} models visible)", model_count),
+        summary: format!(
+            "Ollama availability confirmed via /api/tags ({} models visible)",
+            model_count
+        ),
         metrics: json!({
             "availability": tags,
             "model_count": model_count,
@@ -343,7 +346,7 @@ async fn probe_generic(
         "/healthz",
         external.bearer_token.as_deref(),
     )
-        .await
+    .await
     {
         Ok(value) => (value, "/healthz"),
         Err(_) => match get_json(
@@ -352,7 +355,7 @@ async fn probe_generic(
             "/health",
             external.bearer_token.as_deref(),
         )
-            .await
+        .await
         {
             Ok(value) => (value, "/health"),
             Err(_) => {
@@ -362,7 +365,7 @@ async fn probe_generic(
                     "/api/tags",
                     external.bearer_token.as_deref(),
                 )
-                    .await?;
+                .await?;
                 (value, "/api/tags")
             }
         },

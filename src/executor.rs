@@ -52,29 +52,40 @@ pub async fn run_execution_cycle(
     if !config.execution.enabled {
         return Ok(Vec::new());
     }
-
-    let active = repository
-        .list_work_executions(200)
-        .await?
-        .into_iter()
-        .filter(|execution| !execution.status.is_terminal())
-        .count();
-    if active >= config.execution.max_concurrent_executions {
+    if config.execution.emergency_stop {
+        emit_event(
+            event_callback,
+            ConductorEvent::new(
+                "execution.cycle.skipped",
+                "execution cycle skipped because emergency_stop is enabled",
+                json!({"reason": "emergency_stop"}),
+            ),
+        );
+        return Ok(Vec::new());
+    }
+    if config.execution.dry_run {
+        emit_event(
+            event_callback,
+            ConductorEvent::new(
+                "execution.cycle.skipped",
+                "execution cycle skipped because dry_run is enabled",
+                json!({"reason": "dry_run"}),
+            ),
+        );
         return Ok(Vec::new());
     }
 
-    let available_slots = config.execution.max_concurrent_executions - active;
-    let work_items = repository.list_work_items().await?;
+    let work_items = repository
+        .claim_scheduled_work_items(
+            crate::models::now_utc(),
+            execution_instance_id(config),
+            config.execution.max_concurrent_executions,
+            config.execution.claim_ttl_seconds,
+        )
+        .await?;
     let mut executed = Vec::new();
-    for item in work_items
-        .iter()
-        .into_iter()
-        .filter(|item| item.execution_approved && matches!(item.status, WorkStatus::Scheduled))
-        .take(available_slots)
-    {
-        executed.push(
-            execute_specific_work_item(repository, config, item.id, false, event_callback).await?,
-        );
+    for item in work_items {
+        executed.push(dispatch_claimed_work_item(repository, config, item, event_callback).await?);
     }
     Ok(executed)
 }
@@ -86,7 +97,13 @@ pub async fn execute_specific_work_item(
     force_schedule: bool,
     event_callback: Option<&ExecutionEventCallback>,
 ) -> Result<WorkExecution> {
-    let mut item = repository
+    if config.execution.emergency_stop {
+        return Err(anyhow!(
+            "execution is halted because execution.emergency_stop is enabled"
+        ));
+    }
+
+    let item = repository
         .get_work_item(work_item_id)
         .await?
         .ok_or_else(|| anyhow!("work item {} not found", work_item_id))?;
@@ -96,12 +113,83 @@ pub async fn execute_specific_work_item(
             work_item_id
         ));
     }
-    if force_schedule && !matches!(item.status, WorkStatus::Scheduled) {
-        item.status = WorkStatus::Scheduled;
+    if !force_schedule
+        && item
+            .scheduled_for
+            .is_some_and(|scheduled_for| scheduled_for > crate::models::now_utc())
+    {
+        return Err(anyhow!(
+            "work item {} is scheduled for the future and is not yet due",
+            work_item_id
+        ));
     }
 
+    if config.execution.dry_run {
+        return preview_work_item_execution(
+            repository,
+            config,
+            item,
+            force_schedule,
+            event_callback,
+        )
+        .await;
+    }
+
+    let claimed = repository
+        .claim_work_item_for_execution(
+            work_item_id,
+            crate::models::now_utc(),
+            execution_instance_id(config),
+            config.execution.claim_ttl_seconds,
+            force_schedule,
+            config.execution.max_concurrent_executions,
+        )
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "work item {} is already claimed or no execution capacity is available",
+                work_item_id
+            )
+        })?;
+    dispatch_claimed_work_item(repository, config, claimed, event_callback).await
+}
+
+async fn dispatch_claimed_work_item(
+    repository: &dyn ConductorRepository,
+    config: &ConductorConfig,
+    mut item: WorkItem,
+    event_callback: Option<&ExecutionEventCallback>,
+) -> Result<WorkExecution> {
+    let claim_token = item
+        .claim_token
+        .ok_or_else(|| anyhow!("work item {} does not have an execution claim", item.id))?;
+
+    let result = dispatch_claimed_work_item_inner(
+        repository,
+        config,
+        &mut item,
+        claim_token,
+        event_callback,
+    )
+    .await;
+    if item.claim_token.is_some() {
+        let _ = repository
+            .release_work_item_claim(item.id, claim_token)
+            .await;
+        item.clear_claim();
+    }
+    result
+}
+
+async fn dispatch_claimed_work_item_inner(
+    repository: &dyn ConductorRepository,
+    config: &ConductorConfig,
+    item: &mut WorkItem,
+    claim_token: Uuid,
+    event_callback: Option<&ExecutionEventCallback>,
+) -> Result<WorkExecution> {
     let work_items = repository.list_work_items().await?;
-    let dependency_blockers = dependency_blockers(&item, &work_items);
+    let dependency_blockers = dependency_blockers(item, &work_items);
     if !dependency_blockers.is_empty() {
         let message = format!(
             "execution blocked by dependency graph: {}",
@@ -127,7 +215,7 @@ pub async fn execute_specific_work_item(
             event_callback,
             "execution.blocked",
             message.clone(),
-            Some(&item),
+            Some(item),
             Some(&execution),
             Some("blocked"),
             json!({
@@ -136,7 +224,11 @@ pub async fn execute_specific_work_item(
             }),
         );
         repository.upsert_work_execution(&execution).await?;
-        repository.upsert_work_item(&item).await?;
+        repository.upsert_work_item(item).await?;
+        let _ = repository
+            .release_work_item_claim(item.id, claim_token)
+            .await;
+        item.clear_claim();
         return Ok(execution);
     }
 
@@ -146,7 +238,7 @@ pub async fn execute_specific_work_item(
             .iter()
             .find(|service| service.service_key == target)
     });
-    let policy = evaluate_work_item(config, &item, target_service);
+    let policy = evaluate_work_item(config, item, target_service);
 
     let mut execution = WorkExecution::new(item.id, item.target_service.clone());
     execution.policy = policy_evaluation_to_value(&policy);
@@ -156,22 +248,17 @@ pub async fn execute_specific_work_item(
         let message = policy.reasons.join("; ");
         execution.error = Some(message.clone());
         execution.mark_status(ExecutionStatus::Blocked);
-        if matches!(
-            policy.verdict,
-            PolicyVerdict::NeedsApproval | PolicyVerdict::Blocked
-        ) {
-            item.status = WorkStatus::OnHold;
-            item.notes.push(format!(
-                "{} execution blocked by policy: {}",
-                crate::models::now_utc().to_rfc3339(),
-                message
-            ));
-        }
+        item.status = WorkStatus::OnHold;
+        item.notes.push(format!(
+            "{} execution blocked by policy: {}",
+            crate::models::now_utc().to_rfc3339(),
+            message
+        ));
         emit_execution_event(
             event_callback,
             "execution.blocked",
             message.clone(),
-            Some(&item),
+            Some(item),
             Some(&execution),
             Some("blocked"),
             json!({
@@ -180,12 +267,20 @@ pub async fn execute_specific_work_item(
             }),
         );
         repository.upsert_work_execution(&execution).await?;
-        repository.upsert_work_item(&item).await?;
+        repository.upsert_work_item(item).await?;
+        let _ = repository
+            .release_work_item_claim(item.id, claim_token)
+            .await;
+        item.clear_claim();
         return Ok(execution);
     }
 
     item.status = WorkStatus::InOperation;
     item.progress_pct = 5;
+    if item.started_at.is_none() {
+        item.started_at = Some(crate::models::now_utc());
+    }
+    item.finished_at = None;
     item.notes.push(format!(
         "{} execution started through Refiner",
         crate::models::now_utc().to_rfc3339()
@@ -194,24 +289,63 @@ pub async fn execute_specific_work_item(
         event_callback,
         "execution.started",
         format!("execution started for {}", item.title),
-        Some(&item),
+        Some(item),
         Some(&execution),
         Some(item.status.as_str()),
         json!({
             "target_service": item.target_service.clone(),
             "progress_pct": item.progress_pct,
+            "claimed_by": item.claimed_by.clone(),
         }),
     );
-    repository.upsert_work_item(&item).await?;
+    repository.upsert_work_item(item).await?;
     repository.upsert_work_execution(&execution).await?;
 
-    let refiner_base_url = refiner_base_url(config, &services)?;
-    let client = build_refiner_client(config.integrations.refiner.timeout_seconds.max(1))?;
-    login_refiner_if_configured(&client, config, &refiner_base_url).await?;
+    let _ = repository
+        .release_work_item_claim(item.id, claim_token)
+        .await;
+    item.clear_claim();
+
+    let refiner_base_url = match refiner_base_url(config, &services) {
+        Ok(value) => value,
+        Err(error) => {
+            return finalize_execution_failure(
+                repository,
+                item,
+                &mut execution,
+                event_callback,
+                error.to_string(),
+            )
+            .await;
+        }
+    };
+    let client = match build_refiner_client(config.integrations.refiner.timeout_seconds.max(1)) {
+        Ok(client) => client,
+        Err(error) => {
+            return finalize_execution_failure(
+                repository,
+                item,
+                &mut execution,
+                event_callback,
+                error.to_string(),
+            )
+            .await;
+        }
+    };
+    if let Err(error) = login_refiner_if_configured(&client, config, &refiner_base_url).await {
+        return finalize_execution_failure(
+            repository,
+            item,
+            &mut execution,
+            event_callback,
+            error.to_string(),
+        )
+        .await;
+    }
 
     execution.mark_status(ExecutionStatus::Planning);
-    let prompt = build_refiner_prompt(&item, target_service, &policy);
-    let plan_response = post_refiner_json(
+    let prompt = build_refiner_prompt(item, target_service, &policy);
+    let plan_response = match post_refiner_json(
         &client,
         config,
         &refiner_base_url,
@@ -224,12 +358,25 @@ pub async fn execute_specific_work_item(
         }),
     )
     .await
-    .context("failed to create Refiner execution plan")?;
+    .context("failed to create Refiner execution plan")
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return finalize_execution_failure(
+                repository,
+                item,
+                &mut execution,
+                event_callback,
+                error.to_string(),
+            )
+            .await;
+        }
+    };
     emit_execution_event(
         event_callback,
         "execution.planning_submitted",
         format!("planning response received for {}", item.title),
-        Some(&item),
+        Some(item),
         Some(&execution),
         Some(execution.status.as_str()),
         json!({
@@ -239,15 +386,27 @@ pub async fn execute_specific_work_item(
                 .unwrap_or_default(),
         }),
     );
-    let job_payload = build_job_payload(config, &item, target_service, &plan_response)?;
+    let job_payload = match build_job_payload(config, item, target_service, &plan_response) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return finalize_execution_failure(
+                repository,
+                item,
+                &mut execution,
+                event_callback,
+                error.to_string(),
+            )
+            .await;
+        }
+    };
     execution.request_payload = job_payload.clone();
     execution.latest_payload = json!({"plan_response": plan_response});
     repository.upsert_work_execution(&execution).await?;
 
     item.progress_pct = 20;
-    repository.upsert_work_item(&item).await?;
+    repository.upsert_work_item(item).await?;
 
-    let estimate_response = post_refiner_json(
+    let estimate_response = match post_refiner_json(
         &client,
         config,
         &refiner_base_url,
@@ -255,14 +414,27 @@ pub async fn execute_specific_work_item(
         &job_payload,
     )
     .await
-    .context("failed Refiner estimate gate")?;
+    .context("failed Refiner estimate gate")
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return finalize_execution_failure(
+                repository,
+                item,
+                &mut execution,
+                event_callback,
+                error.to_string(),
+            )
+            .await;
+        }
+    };
     execution.latest_payload = json!({
         "plan_response": execution.latest_payload.get("plan_response").cloned().unwrap_or_else(|| json!({})),
         "estimate_response": estimate_response,
     });
     repository.upsert_work_execution(&execution).await?;
 
-    let submit_response = post_refiner_json(
+    let submit_response = match post_refiner_json(
         &client,
         config,
         &refiner_base_url,
@@ -270,13 +442,38 @@ pub async fn execute_specific_work_item(
         &job_payload,
     )
     .await
-    .context("failed to submit Refiner job")?;
-    let refiner_job_id = submit_response
+    .context("failed to submit Refiner job")
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return finalize_execution_failure(
+                repository,
+                item,
+                &mut execution,
+                event_callback,
+                error.to_string(),
+            )
+            .await;
+        }
+    };
+    let refiner_job_id = match submit_response
         .get("id")
         .and_then(Value::as_str)
         .or_else(|| submit_response.get("job_id").and_then(Value::as_str))
         .map(ToString::to_string)
-        .ok_or_else(|| anyhow!("Refiner job submission did not return an id"))?;
+    {
+        Some(job_id) => job_id,
+        None => {
+            return finalize_execution_failure(
+                repository,
+                item,
+                &mut execution,
+                event_callback,
+                "Refiner job submission did not return an id",
+            )
+            .await;
+        }
+    };
     execution.refiner_job_id = Some(refiner_job_id.clone());
     execution.mark_status(ExecutionStatus::Submitted);
     execution.latest_payload = json!({
@@ -288,7 +485,7 @@ pub async fn execute_specific_work_item(
         event_callback,
         "execution.job_submitted",
         format!("Refiner job {} submitted", refiner_job_id),
-        Some(&item),
+        Some(item),
         Some(&execution),
         Some(execution.status.as_str()),
         json!({
@@ -304,19 +501,32 @@ pub async fn execute_specific_work_item(
         crate::models::now_utc().to_rfc3339(),
         refiner_job_id
     ));
-    repository.upsert_work_item(&item).await?;
+    repository.upsert_work_item(item).await?;
 
-    let terminal = poll_refiner_job(
+    let terminal = match poll_refiner_job(
         &client,
         config,
         &refiner_base_url,
         refiner_job_id.as_str(),
-        &mut item,
+        item,
         &mut execution,
         repository,
         event_callback,
     )
-    .await?;
+    .await
+    {
+        Ok(detail) => detail,
+        Err(error) => {
+            return finalize_execution_failure(
+                repository,
+                item,
+                &mut execution,
+                event_callback,
+                error.to_string(),
+            )
+            .await;
+        }
+    };
 
     execution.mark_status(ExecutionStatus::Verifying);
     let verification = verify_refiner_result(&terminal);
@@ -341,7 +551,7 @@ pub async fn execute_specific_work_item(
             event_callback,
             "execution.verification",
             format!("Refiner job {} passed verification", refiner_job_id),
-            Some(&item),
+            Some(item),
             Some(&execution),
             Some("success"),
             verification.clone(),
@@ -362,6 +572,7 @@ pub async fn execute_specific_work_item(
         execution.error = Some(failure_reason.clone());
         execution.mark_status(ExecutionStatus::Failure);
         item.status = WorkStatus::Failure;
+        item.finished_at = Some(crate::models::now_utc());
         item.notes.push(format!(
             "{} Refiner job {} failed verification: {}",
             crate::models::now_utc().to_rfc3339(),
@@ -372,7 +583,7 @@ pub async fn execute_specific_work_item(
             event_callback,
             "execution.verification",
             format!("Refiner job {} failed verification", refiner_job_id),
-            Some(&item),
+            Some(item),
             Some(&execution),
             Some("failure"),
             verification.clone(),
@@ -381,8 +592,146 @@ pub async fn execute_specific_work_item(
 
     item.touch_execution(execution.id, execution.policy.clone());
     repository.upsert_work_execution(&execution).await?;
+    repository.upsert_work_item(item).await?;
+    Ok(execution)
+}
+
+async fn preview_work_item_execution(
+    repository: &dyn ConductorRepository,
+    config: &ConductorConfig,
+    mut item: WorkItem,
+    force_schedule: bool,
+    event_callback: Option<&ExecutionEventCallback>,
+) -> Result<WorkExecution> {
+    if force_schedule && !matches!(item.status, WorkStatus::Scheduled) {
+        item.status = WorkStatus::Scheduled;
+    }
+
+    let work_items = repository.list_work_items().await?;
+    let dependency_blockers = dependency_blockers(&item, &work_items);
+    if !dependency_blockers.is_empty() {
+        let policy = json!({
+            "verdict": "blocked",
+            "risk_level": "dependency_graph",
+            "reasons": dependency_blockers,
+        });
+        let mut execution = WorkExecution::new(item.id, item.target_service.clone());
+        execution.policy = policy.clone();
+        execution.error = Some("dry-run preview blocked by dependency graph".to_string());
+        execution.verification = json!({
+            "passed": false,
+            "mode": "dry_run",
+            "reasons": dependency_blockers,
+        });
+        execution.mark_status(ExecutionStatus::Blocked);
+        item.status = WorkStatus::OnHold;
+        item.touch_execution(execution.id, policy);
+        repository.upsert_work_execution(&execution).await?;
+        repository.upsert_work_item(&item).await?;
+        return Ok(execution);
+    }
+
+    let services = repository.list_service_snapshots().await?;
+    let target_service = item.target_service.as_deref().and_then(|target| {
+        services
+            .iter()
+            .find(|service| service.service_key == target)
+    });
+    let policy = evaluate_work_item(config, &item, target_service);
+    let mut execution = WorkExecution::new(item.id, item.target_service.clone());
+    execution.policy = policy_evaluation_to_value(&policy);
+    item.touch_execution(execution.id, execution.policy.clone());
+
+    if !matches!(policy.verdict, PolicyVerdict::Allowed) {
+        execution.error = Some(policy.reasons.join("; "));
+        execution.verification = json!({
+            "passed": false,
+            "mode": "dry_run",
+            "reasons": policy.reasons,
+        });
+        execution.mark_status(ExecutionStatus::Blocked);
+        item.status = WorkStatus::OnHold;
+        repository.upsert_work_execution(&execution).await?;
+        repository.upsert_work_item(&item).await?;
+        return Ok(execution);
+    }
+
+    let prompt = build_refiner_prompt(&item, target_service, &policy);
+    let preview_payload = build_job_payload(config, &item, target_service, &json!({}))?;
+    execution.request_payload = preview_payload.clone();
+    execution.latest_payload = json!({
+        "mode": "dry_run",
+        "prompt": prompt,
+        "job_payload": preview_payload,
+    });
+    execution.verification = json!({
+        "passed": false,
+        "mode": "dry_run",
+        "reason": "execution.dry_run is enabled",
+    });
+    execution.mark_status(ExecutionStatus::Cancelled);
+    item.notes.push(format!(
+        "{} dry-run preview generated; no external execution was started",
+        crate::models::now_utc().to_rfc3339()
+    ));
+    emit_execution_event(
+        event_callback,
+        "execution.dry_run",
+        format!("dry-run preview generated for {}", item.title),
+        Some(&item),
+        Some(&execution),
+        Some(execution.status.as_str()),
+        execution.latest_payload.clone(),
+    );
+    repository.upsert_work_execution(&execution).await?;
     repository.upsert_work_item(&item).await?;
     Ok(execution)
+}
+
+async fn finalize_execution_failure(
+    repository: &dyn ConductorRepository,
+    item: &mut WorkItem,
+    execution: &mut WorkExecution,
+    event_callback: Option<&ExecutionEventCallback>,
+    message: impl Into<String>,
+) -> Result<WorkExecution> {
+    let message = message.into();
+    execution.error = Some(message.clone());
+    execution.mark_status(ExecutionStatus::Failure);
+    item.status = WorkStatus::Failure;
+    if item.started_at.is_none() {
+        item.started_at = Some(crate::models::now_utc());
+    }
+    item.finished_at = Some(crate::models::now_utc());
+    item.notes.push(format!(
+        "{} execution failed: {}",
+        crate::models::now_utc().to_rfc3339(),
+        message
+    ));
+    item.touch_execution(execution.id, execution.policy.clone());
+    emit_execution_event(
+        event_callback,
+        "execution.failed",
+        message,
+        Some(item),
+        Some(execution),
+        Some("failure"),
+        json!({
+            "policy": execution.policy.clone(),
+            "target_service": item.target_service.clone(),
+        }),
+    );
+    repository.upsert_work_execution(execution).await?;
+    repository.upsert_work_item(item).await?;
+    Ok(execution.clone())
+}
+
+fn execution_instance_id(config: &ConductorConfig) -> &str {
+    config
+        .execution
+        .instance_id
+        .as_deref()
+        .unwrap_or("conductor")
 }
 
 fn dependency_blockers(item: &WorkItem, work_items: &[WorkItem]) -> Vec<String> {
@@ -524,7 +873,7 @@ fn build_job_payload(
         json!(requirements_text(plan_response, work_item, service)),
     );
     payload.insert("project_run".to_string(), json!(true));
-    payload.insert("dry_run".to_string(), json!(false));
+    payload.insert("dry_run".to_string(), json!(config.execution.dry_run));
     payload.insert(
         "token_scope".to_string(),
         json!(config.execution.token_scope.clone()),
@@ -817,6 +1166,7 @@ mod tests {
         models::{NewWorkItem, ServiceHealth},
         storage::memory::MemoryRepository,
     };
+    use chrono::Duration as ChronoDuration;
     use std::sync::Arc;
 
     fn sample_service() -> ServiceSnapshot {
@@ -826,6 +1176,7 @@ mod tests {
             kind: "tenant_service".to_string(),
             role_name: "continuum_tenant_conductor".to_string(),
             playbooks: vec![],
+            host_targets: vec![],
             hosts: vec![],
             namespace: None,
             service_name: None,
@@ -1022,5 +1373,133 @@ mod tests {
             .expect("stored item");
         assert_eq!(refreshed.status, WorkStatus::OnHold);
         assert_eq!(refreshed.last_execution_id, Some(execution.id));
+    }
+
+    #[tokio::test]
+    async fn execution_cycle_respects_future_schedule() {
+        let config = ConductorConfig::default();
+        let repository = Arc::new(MemoryRepository::new());
+
+        let scheduled = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("future:scheduled".to_string()),
+            title: "Future".to_string(),
+            summary: "Do not run yet".to_string(),
+            target_service: Some("conductor".to_string()),
+            status: Some(WorkStatus::Scheduled),
+            priority: Some(80),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "wait"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: Some(crate::models::now_utc() + ChronoDuration::hours(2)),
+        });
+        repository
+            .upsert_work_item(&scheduled)
+            .await
+            .expect("scheduled item");
+
+        let executed = run_execution_cycle(repository.as_ref(), &config, None)
+            .await
+            .expect("execution cycle");
+
+        assert!(executed.is_empty());
+        let stored = repository
+            .get_work_item(scheduled.id)
+            .await
+            .expect("stored")
+            .expect("item");
+        assert_eq!(stored.status, WorkStatus::Scheduled);
+        assert!(stored.claim_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn manual_execution_returns_dry_run_preview_when_enabled() {
+        let mut config = ConductorConfig::default();
+        config.execution.dry_run = true;
+        let repository = Arc::new(MemoryRepository::new());
+
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("dryrun:preview".to_string()),
+            title: "Preview".to_string(),
+            summary: "Generate a dry-run payload".to_string(),
+            target_service: Some("conductor".to_string()),
+            status: Some(WorkStatus::Scheduled),
+            priority: Some(70),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "preview"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        repository.upsert_work_item(&item).await.expect("item");
+        repository
+            .replace_service_snapshots(&[sample_service()])
+            .await
+            .expect("services");
+
+        let execution =
+            execute_specific_work_item(repository.as_ref(), &config, item.id, false, None)
+                .await
+                .expect("dry-run execution");
+
+        assert_eq!(execution.status, ExecutionStatus::Cancelled);
+        assert_eq!(
+            execution.latest_payload.get("mode").and_then(Value::as_str),
+            Some("dry_run")
+        );
+        assert_eq!(
+            execution
+                .request_payload
+                .get("dry_run")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_cycle_skips_when_emergency_stop_is_enabled() {
+        let mut config = ConductorConfig::default();
+        config.execution.emergency_stop = true;
+        let repository = Arc::new(MemoryRepository::new());
+
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("emergency:stop".to_string()),
+            title: "Stop".to_string(),
+            summary: "Should not run".to_string(),
+            target_service: Some("conductor".to_string()),
+            status: Some(WorkStatus::Scheduled),
+            priority: Some(90),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "noop"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        repository.upsert_work_item(&item).await.expect("item");
+
+        let executed = run_execution_cycle(repository.as_ref(), &config, None)
+            .await
+            .expect("execution cycle");
+
+        assert!(executed.is_empty());
+        assert!(
+            repository
+                .list_work_executions(10)
+                .await
+                .expect("executions")
+                .is_empty()
+        );
     }
 }
