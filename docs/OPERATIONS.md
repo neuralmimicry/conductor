@@ -76,6 +76,8 @@ Important Refiner and Tracey sync controls in `config/conductor.yaml`:
 
 - `integrations.refiner.sync_interval_seconds`: background cadence for Refiner-backed traceability enrichment. Set to `0` to disable job/workspace/requirements sync.
 - `integrations.tracey.sync_interval_seconds`: background cadence for Tracey-backed runtime, rollout, rollback, and incident-signal sync. Set to `0` to disable runtime correlation refresh.
+- `CONTINUUM_BASE_URL`: may point either at the native Continuum root or the public monitoring path. Conductor now normalises the NeuralMimicry public edge to `/services/health/monitoring` automatically when needed and reuses Continuum for Tracey fleet, analytics, and assessment correlation.
+- `REFINER_BASE_URL`: may stay unset for in-cluster execution, but when public routing is required Conductor now prefers `https://refiner.neuralmimicry.ai`, then the shared `https://api.neuralmimicry.ai` edge, then the discovered service URL.
 
 ## Running Locally
 
@@ -110,7 +112,7 @@ docker run --rm -p 8091:8091 \
 12. Use `POST /api/v1/work-items/{id}/links/jira` to create or dedupe a Jira issue natively from the selected work item.
 13. Use `POST /api/v1/work-items/{id}/links/confluence` to publish or refresh a Confluence page natively from the selected work item.
 14. Use `POST /api/v1/work-items/{id}/links/sync` or `POST /api/v1/links/sync` to refresh Refiner, Tracey, Jira, and Confluence state back into persisted traceability links.
-15. Use `GET /api/v1/traceability/graph` when you need the estate-level evidence path from service/repository finding through work item, execution, rollout, and external references.
+15. Use `GET /api/v1/traceability/graph` when you need the estate-level evidence path from service/repository finding through work item, execution, rollout, swarm runtime evidence, and external references.
 
 ## Failure Modes
 
@@ -169,6 +171,16 @@ curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
 curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
   http://127.0.0.1:8091/api/v1/traceability/graph | jq '.graph | {node_totals, relationship_totals, edges: (.edges | length)}'
 ```
+
+For the current NeuralMimicry public edge, successful Tracey swarm sync depends on either:
+
+- a reachable `CONTINUUM_BASE_URL`, or
+- discovery exposing the existing Continuum monitoring path and token.
+
+Successful Refiner public-edge sync depends on either:
+
+- `https://refiner.neuralmimicry.ai` being live on vega, or
+- the shared `https://api.neuralmimicry.ai` edge still fronting the same Refiner instance.
 
 ## Safe Extension Path
 

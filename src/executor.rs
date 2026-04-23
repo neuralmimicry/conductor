@@ -317,8 +317,8 @@ async fn dispatch_claimed_work_item_inner(
         .await;
     item.clear_claim();
 
-    let refiner_base_url = match refiner_base_url(config, &services) {
-        Ok(value) => value,
+    let client = match build_refiner_client(config.integrations.refiner.timeout_seconds.max(1)) {
+        Ok(client) => client,
         Err(error) => {
             return finalize_execution_failure(
                 repository,
@@ -330,8 +330,8 @@ async fn dispatch_claimed_work_item_inner(
             .await;
         }
     };
-    let client = match build_refiner_client(config.integrations.refiner.timeout_seconds.max(1)) {
-        Ok(client) => client,
+    let refiner_base_url = match refiner_base_url(&client, config, &services).await {
+        Ok(value) => value,
         Err(error) => {
             return finalize_execution_failure(
                 repository,
@@ -891,20 +891,20 @@ fn dependency_blockers(item: &WorkItem, work_items: &[WorkItem]) -> Vec<String> 
     blockers
 }
 
-fn refiner_base_url(config: &ConductorConfig, services: &[ServiceSnapshot]) -> Result<String> {
-    if let Some(base_url) = config.integrations.refiner.base_url.clone() {
-        return Ok(base_url);
-    }
-    services
-        .iter()
-        .find(|service| service.service_key == "refiner")
-        .and_then(|service| {
-            service
-                .public_url
-                .clone()
-                .or_else(|| service.internal_url.clone())
-        })
-        .ok_or_else(|| anyhow!("no Refiner base URL configured or discovered"))
+async fn refiner_base_url(
+    client: &Client,
+    config: &ConductorConfig,
+    services: &[ServiceSnapshot],
+) -> Result<String> {
+    crate::integrations::refiner::select_live_base_url(
+        client,
+        &config.integrations.refiner,
+        services
+            .iter()
+            .find(|service| service.service_key == "refiner"),
+    )
+    .await?
+    .ok_or_else(|| anyhow!("no Refiner base URL configured or discovered"))
 }
 
 fn build_refiner_client(timeout_seconds: u64) -> Result<Client> {

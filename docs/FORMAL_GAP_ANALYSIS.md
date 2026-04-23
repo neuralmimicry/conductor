@@ -1108,10 +1108,14 @@ Delivered in this pass:
 
 - `conductor` now reuses Refiner job, requirements, and workspace APIs to auto-correlate `job`, `build`, `requirements`, `workspace`, and `rollout` records into persisted `traceability_links`
 - `conductor` now reuses Tracey `/status` and `/loader/status` signals to auto-correlate `runtime`, `rollout`, `loader_threat`, `rollback`, and `incident` style references into that same traceability substrate
+- `conductor` now reuses Continuum `/tracey/agents`, `/tracey/fleet`, `/tracey/analytics`, and `/tracey/assessment/fleet` so Tracey is treated as a multi-instance swarm rather than a single local agent
+- Tracey correlation now distinguishes fleet-level state, per-agent state, compromise posture, and deep-dive references while still keeping local loader and rollback detail sourced from the Tracey node itself
+- Refiner base URL selection is now resilient across the intended `refiner.neuralmimicry.ai` public edge, the current shared `api.neuralmimicry.ai` edge, and discovered internal service URLs
+- SwarmHPC rollout config has been updated so vega can expose `refiner.neuralmimicry.ai` as a dedicated nginx/TLS/DNS-backed alias for the existing Refiner instance
 - background loops now include optional Refiner and Tracey sync intervals so the graph and DORA correlation can refresh without manual operator attachment
 - a new `GET /api/v1/traceability/graph` route materialises an estate-wide graph view across services, repositories, findings, work items, executions, and external references
 - the dashboard now surfaces estate graph totals alongside the existing per-work-item traceability view, keeping the UI consistent while broadening scope
-- test coverage now includes a mock Refiner + Tracey sync round-trip and an estate-graph API round-trip
+- test coverage now includes a mock Refiner + Tracey + Continuum sync round-trip, Refiner base-URL fallback tests, Continuum base-URL fallback tests, and an estate-graph API round-trip
 
 Residual Phase 2f work still worth doing:
 

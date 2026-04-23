@@ -17,7 +17,10 @@ use crate::{
     discovery::discover_and_probe,
     error::ApiError,
     executor::{ExecutionEventCallback, execute_specific_work_item, run_execution_cycle},
-    integrations::{atlassian::AtlassianClients, refiner::RefinerClient, tracey::TraceyClient},
+    integrations::{
+        atlassian::AtlassianClients, continuum::ContinuumClient, refiner::RefinerClient,
+        tracey::TraceyClient,
+    },
     models::{
         ConductorEvent, ConfluencePageLinkRequest, DashboardSummary, DeliveryStage, DiscoveryRun,
         DoraMetricsSummary, ExternalLinkOperationResult, FindingEvidence, FindingProvenance,
@@ -985,7 +988,9 @@ impl ConductorService {
             .find(|service| service.service_key == "refiner");
         let mut errors = Vec::new();
         let mut refiner_client =
-            match RefinerClient::from_sources(&self.config.integrations.refiner, refiner_service) {
+            match RefinerClient::from_sources(&self.config.integrations.refiner, refiner_service)
+                .await
+            {
                 Ok(client) => client,
                 Err(error) => {
                     errors.push(format!("refiner client unavailable: {}", error));
@@ -1084,97 +1089,171 @@ impl ConductorService {
         } else {
             self.repository.list_work_executions(1000).await?
         };
-
-        let candidate = if let Some(work_item_id) = work_item_id {
+        let candidates = if let Some(work_item_id) = work_item_id {
             let work_item = work_items_by_id.get(&work_item_id).cloned();
             let execution = executions
                 .into_iter()
                 .max_by_key(execution_sort_key)
                 .filter(|execution| targets_service("tracey", Some(execution), work_item.as_ref()));
             match (work_item, execution) {
-                (Some(work_item), Some(execution)) => Some((work_item, execution)),
-                _ => None,
+                (Some(work_item), Some(execution)) => vec![(work_item, execution)],
+                _ => Vec::new(),
             }
         } else {
-            executions
-                .into_iter()
-                .filter_map(|execution| {
-                    let work_item = work_items_by_id.get(&execution.work_item_id)?.clone();
-                    if targets_service("tracey", Some(&execution), Some(&work_item)) {
-                        Some((work_item, execution))
-                    } else {
-                        None
-                    }
-                })
-                .max_by_key(|(_, execution)| execution_sort_key(execution))
+            let mut latest_by_work_item = HashMap::new();
+            for execution in executions {
+                let Some(work_item) = work_items_by_id.get(&execution.work_item_id).cloned() else {
+                    continue;
+                };
+                if !targets_service("tracey", Some(&execution), Some(&work_item)) {
+                    continue;
+                }
+                let replace = latest_by_work_item
+                    .get(&execution.work_item_id)
+                    .map(|(_, current): &(WorkItem, WorkExecution)| {
+                        execution_sort_key(&execution) > execution_sort_key(current)
+                    })
+                    .unwrap_or(true);
+                if replace {
+                    latest_by_work_item.insert(execution.work_item_id, (work_item, execution));
+                }
+            }
+            let mut values = latest_by_work_item.into_values().collect::<Vec<_>>();
+            values.sort_by(|(_, left), (_, right)| {
+                execution_sort_key(right)
+                    .cmp(&execution_sort_key(left))
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            values
         };
 
-        let Some((work_item, execution)) = candidate else {
+        if candidates.is_empty() {
             return Ok((Vec::new(), Vec::new()));
-        };
+        }
 
         let services = self.repository.list_service_snapshots().await?;
         let tracey_service = services
             .iter()
             .find(|service| service.service_key == "tracey");
+        let continuum_service = services
+            .iter()
+            .find(|service| service.service_key == "continuum");
         let mut errors = Vec::new();
         let mut status = tracey_service
             .and_then(tracey_status_from_probe)
             .or_else(|| tracey_service.and_then(tracey_status_from_probe_root));
         let mut loader_status = tracey_service.and_then(tracey_loader_status_from_probe);
-
-        if let Some(client) =
+        let mut stored = Vec::new();
+        let tracey_client =
             match TraceyClient::from_sources(&self.config.integrations.tracey, tracey_service) {
                 Ok(client) => client,
                 Err(error) => {
                     errors.push(format!("tracey client unavailable: {}", error));
                     None
                 }
-            }
-        {
+            };
+        let mut runtime_source_kind = "probe_snapshot".to_string();
+        if let Some(client) = tracey_client.as_ref() {
+            let mut live_runtime = false;
             match client.status().await {
-                Ok(live_status) => status = Some(live_status),
+                Ok(live_status) => {
+                    status = Some(live_status);
+                    live_runtime = true;
+                }
                 Err(error) => errors.push(format!("tracey status: {}", error)),
             }
             match client.loader_status().await {
                 Ok(live_loader_status) => {
                     if live_loader_status.is_some() {
                         loader_status = live_loader_status;
+                        live_runtime = true;
                     }
                 }
                 Err(error) => errors.push(format!("tracey loader status: {}", error)),
             }
+            if live_runtime {
+                runtime_source_kind = "live_status".to_string();
+            }
+        }
 
+        let mut continuum_snapshot = TraceyContinuumSnapshot::from_probe(continuum_service);
+        let continuum_client = match ContinuumClient::from_sources(
+            &self.config.integrations.continuum,
+            continuum_service,
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(error) => {
+                errors.push(format!("continuum client unavailable: {}", error));
+                None
+            }
+        };
+        if let Some(client) = continuum_client.as_ref() {
+            let mut live_continuum = false;
+            continuum_snapshot.base_url = Some(client.base_url().to_string());
+
+            match client.health().await {
+                Ok(health) => {
+                    continuum_snapshot.health = Some(health);
+                    live_continuum = true;
+                }
+                Err(error) => errors.push(format!("continuum health: {}", error)),
+            }
+            match client.tracey_agents().await {
+                Ok(agents) => {
+                    continuum_snapshot.agents = Some(agents);
+                    live_continuum = true;
+                }
+                Err(error) => errors.push(format!("continuum tracey agents: {}", error)),
+            }
+            match client.tracey_fleet().await {
+                Ok(fleet) => {
+                    continuum_snapshot.fleet = Some(fleet);
+                    live_continuum = true;
+                }
+                Err(error) => errors.push(format!("continuum tracey fleet: {}", error)),
+            }
+            match client.tracey_analytics(7200, 120, 25).await {
+                Ok(analytics) => {
+                    continuum_snapshot.analytics = Some(analytics);
+                    live_continuum = true;
+                }
+                Err(error) => errors.push(format!("continuum tracey analytics: {}", error)),
+            }
+            match client.tracey_assessment_fleet().await {
+                Ok(assessment) => {
+                    continuum_snapshot.assessment = Some(assessment);
+                    live_continuum = true;
+                }
+                Err(error) => errors.push(format!("continuum tracey assessment: {}", error)),
+            }
+            if live_continuum {
+                continuum_snapshot.source_kind = "live_status".to_string();
+            }
+        }
+
+        if tracey_client.is_none() {
+            runtime_source_kind = "probe_snapshot".to_string();
+        }
+
+        for (work_item, execution) in candidates {
             let synced = build_tracey_traceability_requests(
-                Some(&client),
+                tracey_client.as_ref(),
+                continuum_client.as_ref(),
+                &continuum_snapshot,
+                &runtime_source_kind,
                 &work_item,
                 &execution,
                 status.as_ref(),
                 loader_status.as_ref(),
                 tracey_service,
             );
-            let mut stored = Vec::new();
             for request in synced {
                 let link = TraceabilityLink::from_new(Some(work_item.id), request);
                 self.repository.upsert_traceability_link(&link).await?;
                 stored.push(link);
             }
-            return Ok((unique_traceability_links(stored), unique_strings(errors)));
-        }
-
-        let synced = build_tracey_traceability_requests(
-            None,
-            &work_item,
-            &execution,
-            status.as_ref(),
-            loader_status.as_ref(),
-            tracey_service,
-        );
-        let mut stored = Vec::new();
-        for request in synced {
-            let link = TraceabilityLink::from_new(Some(work_item.id), request);
-            self.repository.upsert_traceability_link(&link).await?;
-            stored.push(link);
         }
 
         Ok((unique_traceability_links(stored), unique_strings(errors)))
@@ -3127,21 +3206,111 @@ fn build_refiner_traceability_requests(
     ]
 }
 
+#[derive(Clone, Debug, Default)]
+struct TraceyContinuumSnapshot {
+    source_kind: String,
+    base_url: Option<String>,
+    health: Option<Value>,
+    agents: Option<Value>,
+    fleet: Option<Value>,
+    analytics: Option<Value>,
+    assessment: Option<Value>,
+}
+
+impl TraceyContinuumSnapshot {
+    fn from_probe(service: Option<&ServiceSnapshot>) -> Self {
+        Self {
+            source_kind: "probe_snapshot".to_string(),
+            base_url: service
+                .and_then(|item| item.probe.get("endpoint").and_then(Value::as_str))
+                .map(ToString::to_string)
+                .or_else(|| service.and_then(|item| item.public_url.clone()))
+                .or_else(|| service.and_then(|item| item.internal_url.clone())),
+            health: service.and_then(continuum_health_from_probe),
+            agents: service.and_then(continuum_tracey_agents_from_probe),
+            fleet: service.and_then(continuum_tracey_fleet_from_probe),
+            analytics: service.and_then(continuum_tracey_analytics_from_probe),
+            assessment: service.and_then(continuum_tracey_assessment_from_probe),
+        }
+    }
+
+    fn has_data(&self) -> bool {
+        self.health.is_some()
+            || self.agents.is_some()
+            || self.fleet.is_some()
+            || self.analytics.is_some()
+            || self.assessment.is_some()
+    }
+
+    fn fleet_url(&self) -> Option<String> {
+        self.base_url
+            .as_ref()
+            .map(|value| format!("{}/tracey/fleet", value.trim_end_matches('/')))
+    }
+
+    fn analytics_url(&self) -> Option<String> {
+        self.base_url.as_ref().map(|value| {
+            format!(
+                "{}/tracey/analytics?window_seconds=7200&bucket_seconds=120&log_limit=25",
+                value.trim_end_matches('/')
+            )
+        })
+    }
+
+    fn assessment_url(&self) -> Option<String> {
+        self.base_url
+            .as_ref()
+            .map(|value| format!("{}/tracey/assessment/fleet", value.trim_end_matches('/')))
+    }
+
+    fn agent_analysis_url(&self, agent_id: &str) -> Option<String> {
+        self.base_url.as_ref().map(|value| {
+            format!(
+                "{}/tracey/agents/{}/analysis",
+                value.trim_end_matches('/'),
+                agent_id.trim()
+            )
+        })
+    }
+
+    fn agent_deepdive_url(&self, agent_id: &str) -> Option<String> {
+        self.base_url.as_ref().map(|value| {
+            format!(
+                "{}/tracey/agents/{}/deepdive",
+                value.trim_end_matches('/'),
+                agent_id.trim()
+            )
+        })
+    }
+}
+
 fn build_tracey_traceability_requests(
     client: Option<&TraceyClient>,
+    continuum_client: Option<&ContinuumClient>,
+    continuum_snapshot: &TraceyContinuumSnapshot,
+    runtime_source_kind: &str,
     work_item: &WorkItem,
     execution: &WorkExecution,
     status: Option<&Value>,
     loader_status: Option<&Value>,
     tracey_service: Option<&ServiceSnapshot>,
 ) -> Vec<NewTraceabilityLink> {
-    if status.is_none() && loader_status.is_none() && tracey_service.is_none() {
+    if status.is_none()
+        && loader_status.is_none()
+        && tracey_service.is_none()
+        && !continuum_snapshot.has_data()
+    {
         return Vec::new();
     }
 
     let finding_key = work_item_finding_key(work_item);
+    let agents = continuum_snapshot.agents.as_ref();
+    let fleet = continuum_snapshot.fleet.as_ref();
+    let analytics = continuum_snapshot.analytics.as_ref();
+    let assessment = continuum_snapshot.assessment.as_ref();
     let agent_id = json_string_at_opt(loader_status, &["agent_id"])
         .or_else(|| json_string_at_opt(status, &["agent_id"]))
+        .or_else(|| first_tracey_agent_id(agents))
         .or_else(|| tracey_service.map(|service| service.display_name.clone()))
         .unwrap_or_else(|| "tracey".to_string());
     let version = json_string_at_opt(loader_status, &["version"])
@@ -3231,16 +3400,65 @@ fn build_tracey_traceability_requests(
     let loader_url = client
         .map(TraceyClient::loader_status_url)
         .or_else(|| runtime_url.clone());
-    let source_kind = if client.is_some() {
-        "live_status"
-    } else {
+    let fleet_url = continuum_client
+        .map(ContinuumClient::tracey_fleet_url)
+        .or_else(|| continuum_snapshot.fleet_url());
+    let analytics_url = continuum_client
+        .map(|value| value.tracey_analytics_url(7200, 120, 25))
+        .or_else(|| continuum_snapshot.analytics_url());
+    let assessment_url = continuum_client
+        .map(ContinuumClient::tracey_assessment_fleet_url)
+        .or_else(|| continuum_snapshot.assessment_url());
+    let continuum_source_kind = if continuum_snapshot.source_kind.trim().is_empty() {
         "probe_snapshot"
+    } else {
+        continuum_snapshot.source_kind.as_str()
     };
-    let status_excerpt = compact_tracey_status(status, tracey_service, source_kind);
+    let status_excerpt = compact_tracey_status(status, tracey_service, runtime_source_kind);
     let loader_excerpt = compact_tracey_loader(loader_status);
     let threat_excerpt = compact_tracey_loader_threat_summary(status, loader_status);
+    let continuum_health_excerpt = compact_continuum_health(continuum_snapshot.health.as_ref());
+    let agents_excerpt = compact_tracey_agents(agents);
+    let fleet_excerpt = compact_tracey_fleet(fleet);
+    let analytics_excerpt = compact_tracey_analytics(analytics);
+    let assessment_excerpt = compact_tracey_assessment(assessment);
+    let primary_agent_excerpt = compact_tracey_agent_entry(
+        tracey_agent_entry(agents, &agent_id),
+        tracey_assessment_entry(assessment, &agent_id),
+    );
+    let fleet_status = derive_tracey_fleet_status(fleet, agents, assessment);
+    let deep_dive_active = json_bool_at_opt(status, &["tracey_guard", "summary", "deep_dive"])
+        .unwrap_or(false)
+        || json_bool_at_opt(loader_status, &["deep_dive"]).unwrap_or(false);
 
-    let mut requests = vec![
+    let mut requests = Vec::new();
+
+    if continuum_snapshot.has_data() {
+        requests.push(NewTraceabilityLink {
+            execution_id: Some(execution.id),
+            finding_key: finding_key.clone(),
+            system: "tracey".to_string(),
+            reference_type: "fleet".to_string(),
+            reference_key: "fleet:tracey".to_string(),
+            title: Some("Tracey swarm fleet".to_string()),
+            status: Some(fleet_status),
+            url: fleet_url.clone(),
+            metadata: json!({
+                "continuum_source": continuum_source_kind,
+                "continuum": continuum_health_excerpt,
+                "fleet": fleet_excerpt,
+                "agents": agents_excerpt,
+                "analytics": analytics_excerpt,
+                "assessment": assessment_excerpt,
+                "delivery_stage": execution.delivery_stage.as_str(),
+                "rollout_strategy": execution.rollout_strategy.as_str(),
+                "analytics_url": analytics_url,
+                "assessment_url": assessment_url,
+            }),
+        });
+    }
+
+    requests.extend([
         NewTraceabilityLink {
             execution_id: Some(execution.id),
             finding_key: finding_key.clone(),
@@ -3251,9 +3469,13 @@ fn build_tracey_traceability_requests(
             status: Some(posture.clone().unwrap_or(runtime_status.clone())),
             url: runtime_url.clone(),
             metadata: json!({
-                "source": source_kind,
+                "source": runtime_source_kind,
+                "continuum_source": continuum_source_kind,
                 "status": status_excerpt,
                 "loader": loader_excerpt,
+                "fleet": fleet_excerpt,
+                "agent": primary_agent_excerpt,
+                "assessment": assessment_excerpt,
                 "delivery_stage": execution.delivery_stage.as_str(),
                 "rollout_strategy": execution.rollout_strategy.as_str(),
             }),
@@ -3274,7 +3496,8 @@ fn build_tracey_traceability_requests(
             status: Some(rollout_status),
             url: loader_url.clone(),
             metadata: json!({
-                "source": source_kind,
+                "source": runtime_source_kind,
+                "continuum_source": continuum_source_kind,
                 "version": version,
                 "channel": channel,
                 "pending_rollback": pending_rollback,
@@ -3283,11 +3506,12 @@ fn build_tracey_traceability_requests(
                 "status": status_excerpt,
                 "loader": loader_excerpt,
                 "loader_threats": threat_excerpt,
+                "fleet": fleet_excerpt,
                 "delivery_stage": execution.delivery_stage.as_str(),
                 "rollout_strategy": execution.rollout_strategy.as_str(),
             }),
         },
-    ];
+    ]);
 
     if let Some(status) = loader_threat_status {
         requests.push(NewTraceabilityLink {
@@ -3300,9 +3524,11 @@ fn build_tracey_traceability_requests(
             status: Some(status),
             url: loader_url.clone(),
             metadata: json!({
-                "source": source_kind,
+                "source": runtime_source_kind,
+                "continuum_source": continuum_source_kind,
                 "summary": threat_excerpt,
                 "status": status_excerpt,
+                "fleet": fleet_excerpt,
                 "delivery_stage": execution.delivery_stage.as_str(),
                 "rollout_strategy": execution.rollout_strategy.as_str(),
             }),
@@ -3330,7 +3556,7 @@ fn build_tracey_traceability_requests(
             status: Some("pending".to_string()),
             url: loader_url.clone(),
             metadata: json!({
-                "source": source_kind,
+                "source": runtime_source_kind,
                 "version": version,
                 "rollback_previous_version": rollback_previous_version,
                 "loader": loader_excerpt,
@@ -3343,7 +3569,7 @@ fn build_tracey_traceability_requests(
     if pending_rollback || blocked_provider_count > 0 || blocked_artifact_count > 0 {
         requests.push(NewTraceabilityLink {
             execution_id: Some(execution.id),
-            finding_key,
+            finding_key: finding_key.clone(),
             system: "tracey".to_string(),
             reference_type: "incident".to_string(),
             reference_key: if pending_rollback {
@@ -3364,7 +3590,8 @@ fn build_tracey_traceability_requests(
             status: Some("open".to_string()),
             url: loader_url,
             metadata: json!({
-                "source": source_kind,
+                "source": runtime_source_kind,
+                "continuum_source": continuum_source_kind,
                 "pending_rollback": pending_rollback,
                 "rollback_previous_version": rollback_previous_version,
                 "summary": threat_excerpt,
@@ -3374,6 +3601,103 @@ fn build_tracey_traceability_requests(
                 "rollout_strategy": execution.rollout_strategy.as_str(),
             }),
         });
+    }
+
+    for agent_ref in relevant_tracey_agent_ids(agents, assessment, Some(agent_id.as_str())) {
+        let agent = tracey_agent_entry(agents, &agent_ref);
+        let assessment_entry = tracey_assessment_entry(assessment, &agent_ref);
+        let agent_url = continuum_client
+            .map(|value| value.tracey_agent_analysis_url(&agent_ref))
+            .or_else(|| continuum_snapshot.agent_analysis_url(&agent_ref));
+        let compromise_url = assessment_url.clone().or_else(|| agent_url.clone());
+        let deepdive_url = continuum_client
+            .map(|value| value.tracey_agent_deepdive_url(&agent_ref))
+            .or_else(|| continuum_snapshot.agent_deepdive_url(&agent_ref))
+            .or_else(|| agent_url.clone());
+        let agent_excerpt = compact_tracey_agent_entry(agent, assessment_entry);
+        let agent_status = derive_tracey_agent_status(agent, assessment_entry, &runtime_status);
+
+        requests.push(NewTraceabilityLink {
+            execution_id: Some(execution.id),
+            finding_key: finding_key.clone(),
+            system: "tracey".to_string(),
+            reference_type: "agent".to_string(),
+            reference_key: format!("agent:{}", agent_ref),
+            title: Some(format!("Tracey agent {}", agent_ref)),
+            status: Some(agent_status),
+            url: agent_url.clone(),
+            metadata: json!({
+                "continuum_source": continuum_source_kind,
+                "agent": agent_excerpt,
+                "fleet": fleet_excerpt,
+                "analytics": analytics_excerpt,
+                "assessment": assessment_excerpt,
+                "delivery_stage": execution.delivery_stage.as_str(),
+                "rollout_strategy": execution.rollout_strategy.as_str(),
+            }),
+        });
+
+        if tracey_agent_requires_attention(agent, assessment_entry) {
+            requests.push(NewTraceabilityLink {
+                execution_id: Some(execution.id),
+                finding_key: finding_key.clone(),
+                system: "tracey".to_string(),
+                reference_type: "incident".to_string(),
+                reference_key: format!("incident:agent:{}", agent_ref),
+                title: Some(format!("Tracey swarm incident {}", agent_ref)),
+                status: Some("open".to_string()),
+                url: agent_url.clone(),
+                metadata: json!({
+                    "continuum_source": continuum_source_kind,
+                    "agent": agent_excerpt,
+                    "fleet": fleet_excerpt,
+                    "assessment": compact_tracey_assessment_agent(assessment_entry),
+                    "delivery_stage": execution.delivery_stage.as_str(),
+                    "rollout_strategy": execution.rollout_strategy.as_str(),
+                }),
+            });
+        }
+
+        if tracey_assessment_is_compromised(assessment_entry) {
+            requests.push(NewTraceabilityLink {
+                execution_id: Some(execution.id),
+                finding_key: finding_key.clone(),
+                system: "tracey".to_string(),
+                reference_type: "compromise".to_string(),
+                reference_key: format!("compromise:{}", agent_ref),
+                title: Some(format!("Tracey compromise posture {}", agent_ref)),
+                status: Some(tracey_compromise_status(assessment_entry)),
+                url: compromise_url,
+                metadata: json!({
+                    "continuum_source": continuum_source_kind,
+                    "agent": agent_excerpt,
+                    "assessment": compact_tracey_assessment_agent(assessment_entry),
+                    "delivery_stage": execution.delivery_stage.as_str(),
+                    "rollout_strategy": execution.rollout_strategy.as_str(),
+                }),
+            });
+        }
+
+        if (deep_dive_active && agent_ref == agent_id) || tracey_agent_deep_dive_active(agent) {
+            requests.push(NewTraceabilityLink {
+                execution_id: Some(execution.id),
+                finding_key: finding_key.clone(),
+                system: "tracey".to_string(),
+                reference_type: "deepdive".to_string(),
+                reference_key: format!("deepdive:{}", agent_ref),
+                title: Some(format!("Tracey deep-dive {}", agent_ref)),
+                status: Some("active".to_string()),
+                url: deepdive_url,
+                metadata: json!({
+                    "source": runtime_source_kind,
+                    "continuum_source": continuum_source_kind,
+                    "agent": agent_excerpt,
+                    "status": status_excerpt,
+                    "loader": loader_excerpt,
+                    "assessment": compact_tracey_assessment_agent(assessment_entry),
+                }),
+            });
+        }
     }
 
     requests
@@ -3475,6 +3799,24 @@ fn compact_tracey_status(
         "agent_version": status.and_then(|value| value.get("agent_version")),
         "status": status.and_then(|value| value.get("status")),
         "posture": status.and_then(|value| value.get("posture")),
+        "tracey_guard": status.and_then(|value| value.get("tracey_guard")).map(|guard| {
+            json!({
+                "summary": guard.get("summary").map(|summary| {
+                    json!({
+                        "enabled": summary.get("enabled"),
+                        "deep_dive": summary.get("deep_dive"),
+                        "healthy_devices": summary.get("healthy_devices"),
+                        "suspect_devices": summary.get("suspect_devices"),
+                        "quarantined_devices": summary.get("quarantined_devices"),
+                        "condemned_devices": summary.get("condemned_devices"),
+                    })
+                }),
+                "gpu_health": guard
+                    .get("gpu_health")
+                    .and_then(Value::as_array)
+                    .map(|entries| entries.iter().take(4).cloned().collect::<Vec<_>>()),
+            })
+        }),
         "continuum_loop": status.and_then(|value| value.get("continuum_loop")).map(|loop_status| {
             json!({
                 "mode": loop_status.get("mode"),
@@ -3523,6 +3865,438 @@ fn compact_tracey_loader_threat_summary(
         "highest_artifact_risk": summary.get("highest_artifact_risk"),
         "remote_reporters": summary.get("remote_reporters"),
     })
+}
+
+fn compact_continuum_health(health: Option<&Value>) -> Value {
+    let Some(health) = health else {
+        return json!({});
+    };
+    let payload = traceability_response_data(health);
+    json!({
+        "service": payload.get("service"),
+        "status": payload.get("status"),
+        "version": payload.get("version"),
+        "message": health.get("message"),
+        "success": health.get("success"),
+    })
+}
+
+fn compact_tracey_agents(agents: Option<&Value>) -> Value {
+    let Some(agents) = agents else {
+        return json!({});
+    };
+    let payload = traceability_response_data(agents);
+    let items = payload
+        .get("agents")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .take(6)
+                .map(|entry| compact_tracey_agent_entry(Some(entry), None))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "summary": payload.get("summary"),
+        "stale_after_seconds": payload.get("stale_after_seconds"),
+        "probe_watch_summary": payload.get("probe_watch_summary"),
+        "tracey_policy": payload.get("tracey_policy"),
+        "requirement_summary": payload.get("requirement_summary"),
+        "agents_preview": items,
+    })
+}
+
+fn compact_tracey_fleet(fleet: Option<&Value>) -> Value {
+    let Some(fleet) = fleet else {
+        return json!({});
+    };
+    let payload = traceability_response_data(fleet);
+    let zone_breakdown = payload
+        .get("zone_breakdown")
+        .and_then(Value::as_array)
+        .map(|entries| entries.iter().take(6).cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let rack_preview = payload
+        .get("racks")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .take(6)
+                .map(|entry| {
+                    json!({
+                        "rack": entry.get("rack"),
+                        "zone": entry.get("zone"),
+                        "status": entry.get("status"),
+                        "agents_total": entry.get("agents_total"),
+                        "healthy": entry.get("healthy"),
+                        "degraded": entry.get("degraded"),
+                        "offline": entry.get("offline"),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let recent_actions = payload
+        .get("recent_actions")
+        .and_then(Value::as_array)
+        .map(|entries| entries.iter().take(8).cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    json!({
+        "summary": payload.get("summary"),
+        "zone_breakdown": zone_breakdown,
+        "racks_preview": rack_preview,
+        "recent_actions": recent_actions,
+    })
+}
+
+fn compact_tracey_analytics(analytics: Option<&Value>) -> Value {
+    let Some(analytics) = analytics else {
+        return json!({});
+    };
+    let payload = traceability_response_data(analytics);
+    let agent_preview = payload
+        .get("agents")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .take(6)
+                .map(|entry| {
+                    json!({
+                        "agent_id": entry.get("agent_id"),
+                        "status": entry.get("status"),
+                        "healthy": entry.get("healthy"),
+                        "offline": entry.get("offline"),
+                        "degraded": entry.get("degraded"),
+                        "compromise_risk": entry.get("compromise_risk"),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "summary": payload.get("summary"),
+        "agents_preview": agent_preview,
+        "series_points": payload
+            .get("series")
+            .and_then(Value::as_array)
+            .map(|entries| entries.len()),
+    })
+}
+
+fn compact_tracey_assessment(assessment: Option<&Value>) -> Value {
+    let Some(assessment) = assessment else {
+        return json!({});
+    };
+    let payload = traceability_response_data(assessment);
+    let agents = payload
+        .get("agents")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .take(6)
+                .map(|entry| compact_tracey_assessment_agent(Some(entry)))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "mirror": payload.get("mirror"),
+        "progress": payload.get("progress"),
+        "communication": payload.get("communication"),
+        "agents_preview": agents,
+    })
+}
+
+fn compact_tracey_agent_entry(agent: Option<&Value>, assessment: Option<&Value>) -> Value {
+    let Some(agent) = agent else {
+        return json!({});
+    };
+    json!({
+        "agent_id": agent.get("agent_id"),
+        "cluster": agent.get("cluster"),
+        "zone": agent.get("zone"),
+        "rack": agent.get("rack"),
+        "host": agent.get("host"),
+        "status": agent.get("status"),
+        "version": agent.get("version"),
+        "stale": agent.get("stale"),
+        "last_seen_seconds_ago": agent.get("last_seen_seconds_ago"),
+        "probe_watch": agent.get("probe_watch"),
+        "metrics": agent.get("metrics"),
+        "assessment": compact_tracey_assessment_agent(assessment),
+    })
+}
+
+fn compact_tracey_assessment_agent(assessment: Option<&Value>) -> Value {
+    let Some(assessment) = assessment else {
+        return json!({});
+    };
+    json!({
+        "agent_id": assessment.get("agent_id"),
+        "status": assessment.get("status"),
+        "compromise_score": assessment.get("compromise_score").or_else(|| assessment.get("risk_score")),
+        "cve_count": assessment.get("cve_count").or_else(|| assessment.get("cves")),
+        "kev_count": assessment.get("kev_count"),
+        "expected_slices": assessment.get("expected_slices"),
+        "completed_slices": assessment.get("completed_slices"),
+    })
+}
+
+fn traceability_response_data(value: &Value) -> &Value {
+    value.get("data").unwrap_or(value)
+}
+
+fn tracey_agent_entries<'a>(agents: Option<&'a Value>) -> Vec<&'a Value> {
+    agents
+        .map(traceability_response_data)
+        .and_then(|payload| payload.get("agents"))
+        .and_then(Value::as_array)
+        .map(|entries| entries.iter().collect::<Vec<_>>())
+        .unwrap_or_default()
+}
+
+fn tracey_assessment_entries<'a>(assessment: Option<&'a Value>) -> Vec<&'a Value> {
+    assessment
+        .map(traceability_response_data)
+        .and_then(|payload| payload.get("agents"))
+        .and_then(Value::as_array)
+        .map(|entries| entries.iter().collect::<Vec<_>>())
+        .unwrap_or_default()
+}
+
+fn first_tracey_agent_id(agents: Option<&Value>) -> Option<String> {
+    tracey_agent_entries(agents)
+        .into_iter()
+        .find_map(|entry| json_string_at(entry, &["agent_id"]))
+}
+
+fn tracey_agent_entry<'a>(agents: Option<&'a Value>, agent_id: &str) -> Option<&'a Value> {
+    let agent_id = agent_id.trim();
+    if agent_id.is_empty() {
+        return None;
+    }
+    tracey_agent_entries(agents).into_iter().find(|entry| {
+        entry
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.trim() == agent_id)
+    })
+}
+
+fn tracey_assessment_entry<'a>(assessment: Option<&'a Value>, agent_id: &str) -> Option<&'a Value> {
+    let agent_id = agent_id.trim();
+    if agent_id.is_empty() {
+        return None;
+    }
+    tracey_assessment_entries(assessment)
+        .into_iter()
+        .find(|entry| {
+            entry
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.trim() == agent_id)
+        })
+}
+
+fn relevant_tracey_agent_ids(
+    agents: Option<&Value>,
+    assessment: Option<&Value>,
+    preferred_agent_id: Option<&str>,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    if let Some(preferred) = preferred_agent_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        push_unique_string(&mut ids, preferred.to_string());
+    }
+    for agent in tracey_agent_entries(agents) {
+        let Some(agent_id) = json_string_at(agent, &["agent_id"]) else {
+            continue;
+        };
+        if tracey_agent_requires_attention(
+            Some(agent),
+            tracey_assessment_entry(assessment, &agent_id),
+        ) {
+            push_unique_string(&mut ids, agent_id);
+        }
+    }
+    for entry in tracey_assessment_entries(assessment) {
+        let Some(agent_id) = json_string_at(entry, &["agent_id"]) else {
+            continue;
+        };
+        if tracey_assessment_is_compromised(Some(entry)) {
+            push_unique_string(&mut ids, agent_id);
+        }
+    }
+    if ids.is_empty() {
+        if let Some(first) = first_tracey_agent_id(agents) {
+            push_unique_string(&mut ids, first);
+        }
+    }
+    ids.truncate(4);
+    ids
+}
+
+fn push_unique_string(values: &mut Vec<String>, candidate: String) {
+    if !values.iter().any(|value| value == &candidate) {
+        values.push(candidate);
+    }
+}
+
+fn derive_tracey_fleet_status(
+    fleet: Option<&Value>,
+    agents: Option<&Value>,
+    assessment: Option<&Value>,
+) -> String {
+    let payload = fleet.map(traceability_response_data);
+    let summary = payload.and_then(|value| value.get("summary"));
+    let degraded = summary
+        .and_then(|value| value.get("degraded"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let offline = summary
+        .and_then(|value| value.get("offline"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let stale = summary
+        .and_then(|value| value.get("stale"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let high_alerts = summary
+        .and_then(|value| value.get("probe_high_alerts"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let alerts = summary
+        .and_then(|value| value.get("probe_alerts"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let highest_compromise = tracey_assessment_entries(assessment)
+        .into_iter()
+        .map(|entry| tracey_compromise_score(Some(entry)))
+        .fold(0.0, f64::max);
+    let affected_agents = tracey_agent_entries(agents)
+        .into_iter()
+        .filter(|entry| {
+            let agent_id = json_string_at(entry, &["agent_id"]).unwrap_or_default();
+            tracey_agent_requires_attention(
+                Some(entry),
+                tracey_assessment_entry(assessment, agent_id.as_str()),
+            )
+        })
+        .count();
+
+    if offline > 0 || high_alerts > 0 || highest_compromise >= 0.85 {
+        "critical".to_string()
+    } else if degraded > 0 || stale > 0 || alerts > 0 || affected_agents > 0 {
+        "degraded".to_string()
+    } else {
+        "healthy".to_string()
+    }
+}
+
+fn derive_tracey_agent_status(
+    agent: Option<&Value>,
+    assessment: Option<&Value>,
+    default: &str,
+) -> String {
+    if tracey_assessment_is_compromised(assessment) {
+        return tracey_compromise_status(assessment);
+    }
+    if tracey_agent_requires_attention(agent, assessment) {
+        return agent
+            .and_then(|value| value.get("status"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "warning".to_string());
+    }
+    agent
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn tracey_agent_requires_attention(agent: Option<&Value>, assessment: Option<&Value>) -> bool {
+    let status = agent
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let stale = agent
+        .and_then(|value| value.get("stale"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    stale
+        || (!status.is_empty()
+            && !matches!(
+                status.as_str(),
+                "healthy" | "ok" | "online" | "guarded" | "observed"
+            ))
+        || tracey_probe_watch_alert_count(agent) > 0
+        || tracey_assessment_is_compromised(assessment)
+}
+
+fn tracey_probe_watch_alert_count(agent: Option<&Value>) -> u64 {
+    [
+        ["probe_watch", "alerts"].as_slice(),
+        ["probe_watch", "alert_count"].as_slice(),
+        ["probe_watch", "recent_alerts"].as_slice(),
+        ["probe_watch", "high_alerts"].as_slice(),
+    ]
+    .into_iter()
+    .filter_map(|path| json_value_at_opt(agent, path).and_then(Value::as_u64))
+    .max()
+    .unwrap_or_default()
+}
+
+fn tracey_assessment_is_compromised(assessment: Option<&Value>) -> bool {
+    tracey_compromise_score(assessment) >= 0.55 || tracey_kev_count(assessment) > 0
+}
+
+fn tracey_compromise_score(assessment: Option<&Value>) -> f64 {
+    assessment
+        .and_then(|value| {
+            value
+                .get("compromise_score")
+                .or_else(|| value.get("risk_score"))
+                .or_else(|| value.get("score"))
+        })
+        .and_then(Value::as_f64)
+        .unwrap_or_default()
+}
+
+fn tracey_kev_count(assessment: Option<&Value>) -> u64 {
+    assessment
+        .and_then(|value| value.get("kev_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+}
+
+fn tracey_compromise_status(assessment: Option<&Value>) -> String {
+    let score = tracey_compromise_score(assessment);
+    if score >= 0.85 {
+        "critical".to_string()
+    } else if score >= 0.55 || tracey_kev_count(assessment) > 0 {
+        "warning".to_string()
+    } else {
+        "observed".to_string()
+    }
+}
+
+fn tracey_agent_deep_dive_active(agent: Option<&Value>) -> bool {
+    agent
+        .and_then(|value| value.get("deep_dive"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || json_bool_at_opt(agent, &["probe_watch", "deep_dive"]).unwrap_or(false)
 }
 
 fn derive_refiner_rollout_status(job_status: &str, execution: &WorkExecution) -> String {
@@ -3648,6 +4422,47 @@ fn tracey_loader_status_from_probe(service: &ServiceSnapshot) -> Option<Value> {
         .cloned()
 }
 
+fn continuum_health_from_probe(service: &ServiceSnapshot) -> Option<Value> {
+    service
+        .probe
+        .get("metrics")
+        .and_then(|value| value.get("health"))
+        .cloned()
+        .or_else(|| service.probe.get("health").cloned())
+}
+
+fn continuum_tracey_agents_from_probe(service: &ServiceSnapshot) -> Option<Value> {
+    service
+        .probe
+        .get("metrics")
+        .and_then(|value| value.get("tracey_agents"))
+        .cloned()
+}
+
+fn continuum_tracey_fleet_from_probe(service: &ServiceSnapshot) -> Option<Value> {
+    service
+        .probe
+        .get("metrics")
+        .and_then(|value| value.get("tracey_fleet"))
+        .cloned()
+}
+
+fn continuum_tracey_analytics_from_probe(service: &ServiceSnapshot) -> Option<Value> {
+    service
+        .probe
+        .get("metrics")
+        .and_then(|value| value.get("tracey_analytics"))
+        .cloned()
+}
+
+fn continuum_tracey_assessment_from_probe(service: &ServiceSnapshot) -> Option<Value> {
+    service
+        .probe
+        .get("metrics")
+        .and_then(|value| value.get("tracey_assessment_fleet"))
+        .cloned()
+}
+
 fn atlassian_sync_is_configured(config: &ConductorConfig) -> bool {
     config.integrations.atlassian.enabled
         && config
@@ -3698,6 +4513,10 @@ mod tests {
     use tokio::net::TcpListener;
 
     async fn spawn_mock_refiner() -> (String, tokio::task::JoinHandle<()>) {
+        async fn health() -> Json<Value> {
+            Json(json!({"status": "ok"}))
+        }
+
         async fn login() -> Json<Value> {
             Json(json!({"status": "ok"}))
         }
@@ -3776,6 +4595,7 @@ mod tests {
         }
 
         let app = Router::new()
+            .route("/api/health", get(health))
             .route("/api/login", post(login))
             .route(
                 "/api/jobs/{job_id}/requirements/progress",
@@ -3796,6 +4616,188 @@ mod tests {
             axum::serve(listener, app)
                 .await
                 .expect("serve refiner mock");
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    async fn spawn_mock_continuum() -> (String, tokio::task::JoinHandle<()>) {
+        async fn health() -> Json<Value> {
+            Json(json!({
+                "success": true,
+                "message": "nmc_server is healthy.",
+                "data": {
+                    "service": "nmc_server",
+                    "status": "ok",
+                    "version": "0.1.0",
+                }
+            }))
+        }
+
+        async fn tracey_agents() -> Json<Value> {
+            Json(json!({
+                "success": true,
+                "data": {
+                    "summary": {
+                        "total": 2,
+                        "healthy": 1,
+                        "degraded": 1,
+                        "offline": 0,
+                        "stale": 0,
+                        "unknown": 0
+                    },
+                    "stale_after_seconds": 90,
+                    "probe_watch_summary": {
+                        "alerts": 2,
+                        "high_alerts": 1,
+                        "alerted_surfaces": 1
+                    },
+                    "agents": [
+                        {
+                            "agent_id": "tracey-node-1",
+                            "cluster": "prod",
+                            "zone": "zone-a",
+                            "rack": "rack-1",
+                            "host": "node-1",
+                            "status": "healthy",
+                            "version": "2026.04.23",
+                            "stale": false,
+                            "last_seen_seconds_ago": 5,
+                            "probe_watch": {
+                                "alerts": 0,
+                                "high_alerts": 0
+                            },
+                            "metrics": {
+                                "cpu_pct": 18.2,
+                                "mem_pct": 41.0,
+                                "queue_depth": 1
+                            }
+                        },
+                        {
+                            "agent_id": "tracey-node-2",
+                            "cluster": "prod",
+                            "zone": "zone-b",
+                            "rack": "rack-2",
+                            "host": "node-2",
+                            "status": "degraded",
+                            "version": "2026.04.23",
+                            "stale": false,
+                            "last_seen_seconds_ago": 9,
+                            "probe_watch": {
+                                "alerts": 2,
+                                "high_alerts": 1
+                            },
+                            "metrics": {
+                                "cpu_pct": 77.0,
+                                "mem_pct": 83.0,
+                                "queue_depth": 6
+                            }
+                        }
+                    ]
+                }
+            }))
+        }
+
+        async fn tracey_fleet() -> Json<Value> {
+            Json(json!({
+                "success": true,
+                "data": {
+                    "summary": {
+                        "healthy": 1,
+                        "degraded": 1,
+                        "offline": 0,
+                        "stale": 0,
+                        "probe_alerts": 2,
+                        "probe_high_alerts": 1
+                    },
+                    "zone_breakdown": [
+                        {"zone": "zone-a", "status": "healthy"},
+                        {"zone": "zone-b", "status": "degraded"}
+                    ],
+                    "racks": [
+                        {"rack": "rack-1", "zone": "zone-a", "status": "healthy", "agents_total": 1, "healthy": 1, "degraded": 0, "offline": 0},
+                        {"rack": "rack-2", "zone": "zone-b", "status": "degraded", "agents_total": 1, "healthy": 0, "degraded": 1, "offline": 0}
+                    ],
+                    "recent_actions": [
+                        {"action": "hold_loader_promotion", "agent_id": "tracey-node-2"}
+                    ]
+                }
+            }))
+        }
+
+        async fn tracey_analytics() -> Json<Value> {
+            Json(json!({
+                "success": true,
+                "data": {
+                    "summary": {
+                        "agents_total": 2,
+                        "current_healthy": 1,
+                        "current_offline": 0
+                    },
+                    "agents": [
+                        {"agent_id": "tracey-node-1", "status": "healthy", "healthy": true, "offline": false, "degraded": false, "compromise_risk": 0.22},
+                        {"agent_id": "tracey-node-2", "status": "degraded", "healthy": false, "offline": false, "degraded": true, "compromise_risk": 0.91}
+                    ],
+                    "series": [
+                        {"ts": 1713873540000u64, "probe_alerts": 0},
+                        {"ts": 1713873600000u64, "probe_alerts": 2}
+                    ]
+                }
+            }))
+        }
+
+        async fn tracey_assessment_fleet() -> Json<Value> {
+            Json(json!({
+                "success": true,
+                "data": {
+                    "mirror": {
+                        "status": "ok"
+                    },
+                    "progress": {
+                        "completed_slices": 8,
+                        "expected_slices": 8
+                    },
+                    "communication": {
+                        "duplicates": 0
+                    },
+                    "agents": [
+                        {
+                            "agent_id": "tracey-node-2",
+                            "status": "degraded",
+                            "compromise_score": 0.91,
+                            "kev_count": 1,
+                            "cve_count": 3,
+                            "completed_slices": 4,
+                            "expected_slices": 4
+                        },
+                        {
+                            "agent_id": "tracey-node-1",
+                            "status": "healthy",
+                            "compromise_score": 0.22,
+                            "kev_count": 0,
+                            "cve_count": 0,
+                            "completed_slices": 4,
+                            "expected_slices": 4
+                        }
+                    ]
+                }
+            }))
+        }
+
+        let app = Router::new()
+            .route("/health", get(health))
+            .route("/tracey/agents", get(tracey_agents))
+            .route("/tracey/fleet", get(tracey_fleet))
+            .route("/tracey/analytics", get(tracey_analytics))
+            .route("/tracey/assessment/fleet", get(tracey_assessment_fleet));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind continuum");
+        let addr = listener.local_addr().expect("continuum local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve continuum mock");
         });
         (format!("http://{}", addr), handle)
     }
@@ -4056,6 +5058,7 @@ mod tests {
     async fn sync_all_links_correlates_refiner_and_tracey_sources() {
         let (refiner_base_url, refiner_handle) = spawn_mock_refiner().await;
         let (tracey_base_url, tracey_handle) = spawn_mock_tracey().await;
+        let (continuum_base_url, continuum_handle) = spawn_mock_continuum().await;
 
         let mut config = ConductorConfig::default();
         config.integrations.atlassian.enabled = false;
@@ -4065,6 +5068,8 @@ mod tests {
         config.integrations.refiner.sync_interval_seconds = 0;
         config.integrations.tracey.base_url = Some(tracey_base_url.clone());
         config.integrations.tracey.sync_interval_seconds = 0;
+        config.integrations.continuum.base_url = Some(continuum_base_url.clone());
+        config.integrations.continuum.sync_interval_seconds = 0;
 
         let repository = Arc::new(MemoryRepository::new());
         let client = build_http_client(2).expect("http client");
@@ -4175,10 +5180,18 @@ mod tests {
         let incident_link = result
             .links
             .iter()
-            .find(|link| link.system == "tracey" && link.reference_type == "incident")
+            .find(|link| {
+                link.system == "tracey"
+                    && link.reference_type == "incident"
+                    && link.reference_key == "incident:agent:tracey-node-2"
+            })
             .expect("tracey incident link");
         assert_eq!(incident_link.status.as_deref(), Some("open"));
         assert_eq!(incident_link.execution_id, Some(execution.id));
+        assert_eq!(
+            incident_link.metadata["agent"]["agent_id"],
+            json!("tracey-node-2")
+        );
 
         let rollback_link = result
             .links
@@ -4191,7 +5204,27 @@ mod tests {
             json!("2026.04.22")
         );
 
+        let fleet_link = result
+            .links
+            .iter()
+            .find(|link| link.system == "tracey" && link.reference_type == "fleet")
+            .expect("tracey fleet link");
+        assert_eq!(fleet_link.status.as_deref(), Some("critical"));
+        assert_eq!(
+            fleet_link.metadata["agents"]["summary"]["degraded"],
+            json!(1)
+        );
+
+        let compromise_link = result
+            .links
+            .iter()
+            .find(|link| link.system == "tracey" && link.reference_type == "compromise")
+            .expect("tracey compromise link");
+        assert_eq!(compromise_link.reference_key, "compromise:tracey-node-2");
+        assert_eq!(compromise_link.status.as_deref(), Some("critical"));
+
         refiner_handle.abort();
         tracey_handle.abort();
+        continuum_handle.abort();
     }
 }

@@ -33,8 +33,8 @@ The main loops are:
    - Aggregates stage totals, rollout totals, external reference totals, and DORA metrics from persisted work-item, traceability-link, and production-execution history.
    - Feeds the dashboard and summary API with current estate and delivery posture data.
 6. External-link sync loop
-   - Periodically refreshes Jira issue, Confluence page, Refiner job/workspace, and Tracey runtime state when the relevant credentials or base URLs are configured.
-   - Keeps persisted traceability links aligned with upstream title, status, version, URL, rollout, rollback, and incident metadata changes.
+   - Periodically refreshes Jira issue, Confluence page, Refiner job/workspace, Tracey local runtime state, and Continuum-backed Tracey swarm state when the relevant credentials or base URLs are configured.
+   - Keeps persisted traceability links aligned with upstream title, status, version, URL, rollout, rollback, incident, fleet, agent, compromise, and deep-dive metadata changes.
 7. Estate traceability graph loop
    - Materialises a graph view from persisted services, repositories, findings, work items, executions, and traceability links.
    - Exposes the change path from finding to governed work to execution to rollout / incident evidence without introducing a second persistence model.
@@ -90,7 +90,7 @@ Conductor stores eleven primary entities:
 - `improvement_cycles`
 - `conductor_events`
 
-The `traceability_links` table extends that audit trail across Jira, Confluence, Refiner build/workspace/requirements records, Tracey runtime and rollback signals, incidents, and rollout records without conflating live topology with queued work.
+The `traceability_links` table extends that audit trail across Jira, Confluence, Refiner build/workspace/requirements records, Tracey runtime and rollback signals, Continuum-backed fleet and per-agent state, incidents, compromise posture, deep-dive state, and rollout records without conflating live topology with queued work.
 
 The estate traceability graph is intentionally derived from the existing persistence model at read time. Conductor does not maintain a second graph-specific table for the same correlations.
 
@@ -122,15 +122,15 @@ Used as the AI gateway and optional planning advisor. Conductor probes health an
 
 ### Tracey
 
-Used for resource and pressure insight. Conductor expects Tracey to surface health and status signals that can influence prioritization, runtime rollout correlation, rollback warnings, and incident-style evidence.
+Used for local runtime and rollout detail. Conductor reuses Tracey `/status` and `/loader/status` for node-local runtime posture, loader threat state, rollback posture, and deep-dive indicators.
 
 ### Continuum
 
-Represents the broader control plane. Conductor inspects cluster and adaptive-loop surfaces to understand orchestration reach and integration health.
+Represents the broader control plane and the estate view of the Tracey swarm. Conductor now reuses Continuum health, Tracey fleet, agent, analytics, and assessment surfaces so swarm-level Tracey evidence is sourced from the existing monitoring plane instead of being reimplemented inside Conductor.
 
 ### Refiner
 
-Treated as the code-generation and workflow execution target. Conductor now uses Refiner as the governed execution surface for approved work items while keeping repository mutation inside Refiner's workflow boundary, and also reuses Refiner's job, requirements, and workspace APIs to enrich traceability with execution-native evidence.
+Treated as the code-generation and workflow execution target. Conductor now uses Refiner as the governed execution surface for approved work items while keeping repository mutation inside Refiner's workflow boundary, reuses Refiner's job, requirements, and workspace APIs to enrich traceability with execution-native evidence, and prefers the dedicated `refiner.neuralmimicry.ai` public edge when it is available while safely falling back to the shared API edge or discovered internal service URL.
 
 ### AARNN
 

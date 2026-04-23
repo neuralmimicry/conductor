@@ -10,6 +10,7 @@ use crate::{
 };
 
 pub mod atlassian;
+pub mod continuum;
 pub mod refiner;
 pub mod tracey;
 
@@ -143,12 +144,25 @@ async fn probe_tracey(
         external.bearer_token.as_deref(),
     )
     .await?;
+    let loader_status = get_json(
+        client,
+        &base_url,
+        "/loader/status",
+        external.bearer_token.as_deref(),
+    )
+    .await
+    .ok();
     Ok(ProbeResult {
         endpoint: Some(base_url),
-        summary: "Tracey health and status surface retrieved".to_string(),
+        summary: if loader_status.is_some() {
+            "Tracey health, runtime, and loader surfaces retrieved".to_string()
+        } else {
+            "Tracey health and runtime surfaces retrieved".to_string()
+        },
         metrics: json!({
             "health": health,
             "status": status,
+            "loader_status": loader_status,
             "continuum_loop": status.get("continuum_loop").cloned(),
             "resource_forecast": status.get("resource_forecast").cloned(),
         }),
@@ -162,7 +176,8 @@ async fn probe_continuum(
     service: &ServiceSnapshot,
 ) -> Result<ProbeResult> {
     let external = &config.integrations.continuum;
-    let base_url = resolve_base_url(service, external)
+    let base_url = continuum::select_live_base_url(client, external, Some(service))
+        .await?
         .ok_or_else(|| anyhow!("no Continuum base URL available"))?;
     let health = get_json(
         client,
@@ -183,6 +198,30 @@ async fn probe_continuum(
         client,
         &base_url,
         "/tracey/agents",
+        external.bearer_token.as_deref(),
+    )
+    .await
+    .ok();
+    let fleet = get_json(
+        client,
+        &base_url,
+        "/tracey/fleet",
+        external.bearer_token.as_deref(),
+    )
+    .await
+    .ok();
+    let analytics = get_json(
+        client,
+        &base_url,
+        "/tracey/analytics?window_seconds=7200&bucket_seconds=120&log_limit=25",
+        external.bearer_token.as_deref(),
+    )
+    .await
+    .ok();
+    let assessment = get_json(
+        client,
+        &base_url,
+        "/tracey/assessment/fleet",
         external.bearer_token.as_deref(),
     )
     .await
@@ -210,6 +249,9 @@ async fn probe_continuum(
             "health": health,
             "tracey_adaptive": adaptive,
             "tracey_agents": agents,
+            "tracey_fleet": fleet,
+            "tracey_analytics": analytics,
+            "tracey_assessment_fleet": assessment,
             "k8s_clusters": clusters,
             "refiner": refiner,
         }),
