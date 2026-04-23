@@ -359,13 +359,13 @@ Status meanings used below:
 | REQ-089 to REQ-095 | Multi-user and distributed systems | Partial | limited dependency graph only; no tenant/session/distributed contract analysis |
 | REQ-096 to REQ-101 | Research | Missing | no dedicated provenance-aware research pipeline in `conductor` |
 | REQ-102 to REQ-116 | LLM and AARNN utilisation | Partial | Gail advisory planning exists; staged role/trust/provenance model is absent |
-| REQ-117 to REQ-125 | Atlassian integration | Missing | no Jira or Confluence adapter in `conductor` yet |
+| REQ-117 to REQ-125 | Atlassian integration | Partial | `conductor` now stores and exposes Jira/Confluence correlation links, reuses Refiner/Tracey runtime evidence in that same substrate, and has native Jira/Confluence lifecycle adapters, but broader lifecycle automation and ownership-aware clustering are still incomplete |
 | REQ-126 to REQ-132 | Recommendation and planning | Partial | prioritised heuristic work items exist, but not dependency-aware implementation plans at programme level |
 | REQ-133 to REQ-139 | Change generation | Partial | Refiner execution exists, but branch/PR/documentation generation is indirect and weakly modelled |
 | REQ-140 to REQ-146 | Validation | Partial | execution now runs bounded repository-native validation commands and records independent results, but contract, resilience, and performance validation modes are still incomplete |
 | REQ-147 to REQ-157 | Governance, safety, trust | Partial | approval, dry-run, emergency-stop, stage progression, and rollout gates now exist, but permission separation and risk tiers are still under-specified |
-| REQ-158 to REQ-163 | Observability | Partial | stored runs, persistent events, stage/rollout summaries, DORA aggregates, and per-work-item traceability now exist, but self-metrics and estate-wide ticket/build correlation are still missing |
-| REQ-164 to REQ-168 | Knowledge model | Partial | findings, evidence, provenance, repositories, services, and runs are now modelled explicitly, but there is still no richer cross-repository graph or long-horizon temporal knowledge model |
+| REQ-158 to REQ-163 | Observability | Partial | stored runs, persistent events, stage/rollout summaries, external reference totals, DORA aggregates, per-work-item traceability, and an estate-wide traceability graph now exist, but self-metrics and broader telemetry ingestion are still missing |
+| REQ-164 to REQ-168 | Knowledge model | Partial | findings, evidence, provenance, repositories, services, work items, executions, links, and an estate traceability graph are now modelled explicitly, but long-horizon temporal knowledge and richer ownership/programme semantics are still incomplete |
 | REQ-169 to REQ-175 | Non-functional requirements | Partial | some modularity and resilience exist; scaling, incremental analysis, and secret protection need more work |
 | REQ-176 to REQ-185 | Acceptance and implementation principles | Partial | evidence-first staging is now materially stronger because work can be traced back to explicit findings, but maturity targets are still not met |
 
@@ -526,19 +526,20 @@ LLM and AARNN usage is present only as a hint, not as a governed pipeline.
 
 What exists:
 
-- none inside `conductor` itself
+- persistent external traceability links stored directly inside `conductor`
+- work-item APIs for attaching Jira, Confluence, build, incident, and rollout references
+- reused `rag_demo` Atlassian write tooling remains usable for comments and documentation updates
 
 Main gaps:
 
-- no Jira adapter
-- no Confluence adapter
-- no work-item creation or dedupe against Jira
-- no Confluence publication of findings, requirements, architecture, or progress
-- no link model between work items, PRs, builds, incidents, and tickets
+- no automatic creation of epics / story hierarchies or richer Jira ownership mapping yet
+- no automatic publication of broader architecture and requirements documents into Confluence from inside `conductor`
+- no automatic publication of findings, requirements, architecture, or progress from `conductor` without reused external tooling
+- build, rollout, and incident links are now modelled, but they are still attached manually or by external helpers rather than auto-correlated
 
 Implication:
 
-This is one of the clearest missing capability areas, and it can be addressed mostly by reusing existing `rag_demo` and `jirastats` logic.
+This is no longer a blank area. `conductor` now has a correlation substrate plus native Jira/Confluence create, dedupe, publish, and sync adapters on top of that substrate, but it still needs broader programme automation and cross-system correlation.
 
 ## 8.9 Validation gaps
 
@@ -605,7 +606,7 @@ What exists:
 Main gaps:
 
 - no metrics about `conductor`'s own loop latency, queue depth, throughput, or failures
-- no estate-wide traceability graph from finding to change to validation to ticket/build/incident
+- no fully interactive estate-wide traceability graph from finding to change to validation to ticket/build/incident; the new read-model graph is present, but graph-specific operator workflows are still thin
 - no cross-repository knowledge model
 - no temporal relationship history beyond a few row timestamps
 
@@ -649,21 +650,21 @@ Practical effect:
 
 ## 9.4 Observability is still control-room oriented rather than analytical
 
-Conductor now stores events, computes stage/DORA summaries, and exposes per-work-item traceability, but it still lacks first-class self-metrics and estate-wide traceability graphs.
+Conductor now stores events, computes stage/DORA summaries, exposes per-work-item traceability, and persists external references, but it still lacks first-class self-metrics and estate-wide automatic traceability graphs.
 
 Practical effect:
 
 - operators can see the current state, but cannot yet analyse queue latency, claim contention, or loop throughput rigorously
-- the system can now trace a work item back to its finding and latest validation outcome, but it still cannot correlate that chain to tickets, builds, and incidents within one model
+- the system can now trace a work item back to its finding, latest validation outcome, and linked tickets/builds/incidents, but it still cannot automatically correlate that chain across the whole estate
 
 ## 9.5 DORA coverage is local to Conductor execution history
 
-DORA metrics are now calculated from persisted production-stage executions, but they are not yet correlated with incident systems, bug flow, or runtime rollout telemetry.
+DORA metrics are now calculated from persisted production-stage executions and can be correlated with attached bug and incident references, but they are not yet automatically synced from incident systems or rollout telemetry.
 
 Practical effect:
 
 - DORA is useful for Conductor-controlled work, but it is not yet a complete estate-wide release performance model
-- change failure and restore signals can miss incidents that are tracked outside Conductor
+- change failure and restore signals can still miss incidents that are tracked outside Conductor unless links are attached or synchronised
 - rollout safety decisions still rely on limited operational evidence
 
 ## 10. Enhancement Roadmap
@@ -1048,6 +1049,78 @@ Residual Phase 2c work still worth doing:
 - expose traceability and validation summaries directly in the dashboard UI
 
 This means REQ-140 to REQ-146 and REQ-158 to REQ-168 are now better covered in execution and API shape, but still remain partial because validation breadth, ticket correlation, and estate-wide knowledge modelling are incomplete.
+
+## 18d. Progress Update: Phase 2d External Reference Correlation and DORA Signals
+
+Status as of 2026-04-23:
+
+Phase 2d has now started in the `conductor` repository and is partially delivered.
+
+Delivered in this pass:
+
+- `conductor` now stores persistent `traceability_links` records for Jira issues, Confluence pages, builds, incidents, rollout records, and analogous external references
+- new `GET /api/v1/work-items/{id}/links` and `POST /api/v1/work-items/{id}/links` routes allow external systems or operators to attach those references directly to governed work items
+- per-work-item traceability responses now include those external references alongside findings, evidence, provenance, executions, and validation
+- dashboard summary responses now expose `external_reference_totals`
+- DORA metrics now include bug and incident correlation signals through `correlated_change_failure_rate_pct`, `bug_linked_production_deployments`, and `incident_linked_production_deployments`
+- live verification against a temporary Postgres instance confirmed the new migration, link API, traceability API, and summary fields
+
+Residual Phase 2d work still worth doing:
+
+- correlate build, rollout, and incident references from Refiner, Tracey, and deployment telemetry without manual attachment
+- expand native Jira generation from single issues into richer epic / story / bug programmes and ownership-aware dedupe
+- publish broader architecture, requirements, and progress artefacts into Confluence from inside `conductor`
+- extend the traceability graph beyond per-work-item scope into estate-wide impact views
+
+This means REQ-117 to REQ-125 and REQ-158 to REQ-163 are now better covered in the traceability model and native Atlassian lifecycle surface, but still remain partial because cross-system auto-correlation and broader programme automation are incomplete.
+
+## 18e. Progress Update: Phase 2e Native Atlassian Lifecycle and Sync
+
+Status as of 2026-04-23:
+
+Phase 2e has now started in the `conductor` repository and is partially delivered.
+
+Delivered in this pass:
+
+- `conductor` now contains a native `src/integrations/atlassian.rs` module for Jira and Confluence read, create, update, dedupe, transition, and sync operations
+- new `POST /api/v1/work-items/{id}/links/jira` and `POST /api/v1/work-items/{id}/links/confluence` routes can create or reuse Jira issues and Confluence pages directly from a governed work item
+- new `POST /api/v1/work-items/{id}/links/sync` and `POST /api/v1/links/sync` routes can refresh Jira and Confluence state back into persisted `traceability_links`
+- background loops now include optional Atlassian sync when credentials are configured and `sync_interval_seconds` is non-zero
+- the dashboard now shows external reference totals, correlated DORA signals, selected-work-item traceability, and one-click Jira / Confluence / sync actions
+- test coverage now includes a local mock Atlassian server that exercises native Jira creation, native Confluence publication, and sync-back into traceability
+
+Residual Phase 2e work still worth doing:
+
+- correlate build, rollout, and incident references automatically from Refiner, Tracey, and runtime telemetry
+- expand native Jira lifecycle support into epic/story hierarchy generation and ownership-aware ticket clustering
+- publish broader requirements, architecture, and progress pages directly from `conductor` without falling back to estate tooling
+- add graph-specific operator workflows, filtering, and ownership views on top of the new estate-wide traceability graph
+
+This means REQ-117 to REQ-125, REQ-158 to REQ-163, and parts of REQ-164 to REQ-168 are now better covered in the native control plane, but still remain partial because automated runtime correlation and broader knowledge modelling are incomplete.
+
+## 18f. Progress Update: Phase 2f Refiner/Tracey Correlation and Estate Graph
+
+Status as of 2026-04-23:
+
+Phase 2f has now started in the `conductor` repository and is partially delivered.
+
+Delivered in this pass:
+
+- `conductor` now reuses Refiner job, requirements, and workspace APIs to auto-correlate `job`, `build`, `requirements`, `workspace`, and `rollout` records into persisted `traceability_links`
+- `conductor` now reuses Tracey `/status` and `/loader/status` signals to auto-correlate `runtime`, `rollout`, `loader_threat`, `rollback`, and `incident` style references into that same traceability substrate
+- background loops now include optional Refiner and Tracey sync intervals so the graph and DORA correlation can refresh without manual operator attachment
+- a new `GET /api/v1/traceability/graph` route materialises an estate-wide graph view across services, repositories, findings, work items, executions, and external references
+- the dashboard now surfaces estate graph totals alongside the existing per-work-item traceability view, keeping the UI consistent while broadening scope
+- test coverage now includes a mock Refiner + Tracey sync round-trip and an estate-graph API round-trip
+
+Residual Phase 2f work still worth doing:
+
+- add graph filtering, impact slicing, and ownership overlays rather than only a whole-estate view
+- correlate more runtime surfaces such as Prometheus, Grafana, and service-native health telemetry into the same traceability graph
+- persist Conductor self-metrics so graph gaps can be distinguished from telemetry absence
+- publish graph-backed programme summaries directly into Confluence and Jira instead of relying only on local docs plus manual status updates
+
+This means REQ-039 to REQ-049, REQ-117 to REQ-125, REQ-158 to REQ-168, and parts of REQ-176 to REQ-179 are now better covered through reused estate capabilities rather than duplicated Conductor-only logic, but they still remain partial because self-observability, broader runtime evidence, and ownership-aware automation are incomplete.
 
 ## 19. Final Conclusion
 

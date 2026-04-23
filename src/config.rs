@@ -95,6 +95,7 @@ pub struct IntegrationsConfig {
     pub refiner: ExternalServiceConfig,
     pub aarnn: ExternalServiceConfig,
     pub ollama: ExternalServiceConfig,
+    pub atlassian: AtlassianConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -126,6 +127,22 @@ pub struct ExternalServiceConfig {
     pub username: Option<String>,
     pub password: Option<String>,
     pub timeout_seconds: u64,
+    pub sync_interval_seconds: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AtlassianConfig {
+    pub enabled: bool,
+    pub base_url: Option<String>,
+    pub username: Option<String>,
+    pub api_token: Option<String>,
+    pub timeout_seconds: u64,
+    pub sync_interval_seconds: u64,
+    pub jira_project_key: Option<String>,
+    pub jira_issue_type: String,
+    pub confluence_space_key: Option<String>,
+    pub confluence_parent_page_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -274,6 +291,7 @@ impl Default for IntegrationsConfig {
             refiner: ExternalServiceConfig::default(),
             aarnn: ExternalServiceConfig::default(),
             ollama: ExternalServiceConfig::default(),
+            atlassian: AtlassianConfig::default(),
         }
     }
 }
@@ -298,6 +316,24 @@ impl Default for ExternalServiceConfig {
             username: None,
             password: None,
             timeout_seconds: 5,
+            sync_interval_seconds: 0,
+        }
+    }
+}
+
+impl Default for AtlassianConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base_url: None,
+            username: None,
+            api_token: None,
+            timeout_seconds: 15,
+            sync_interval_seconds: 600,
+            jira_project_key: None,
+            jira_issue_type: "Task".to_string(),
+            confluence_space_key: None,
+            confluence_parent_page_id: None,
         }
     }
 }
@@ -481,6 +517,7 @@ impl ConductorConfig {
         normalize_external_service(&mut self.integrations.refiner);
         normalize_external_service(&mut self.integrations.aarnn);
         normalize_external_service(&mut self.integrations.ollama);
+        normalize_atlassian(&mut self.integrations.atlassian);
         normalize_unique_strings(&mut self.policy.protected_services);
         normalize_unique_strings(&mut self.policy.blocked_action_keywords);
         normalize_paths(&mut self.policy.protected_repo_roots);
@@ -518,6 +555,32 @@ fn normalize_external_service(config: &mut ExternalServiceConfig) {
     }
     if config.timeout_seconds == 0 {
         config.timeout_seconds = 5;
+    }
+    if config.sync_interval_seconds > 0 {
+        config.sync_interval_seconds = config.sync_interval_seconds.max(60);
+    }
+}
+
+fn normalize_atlassian(config: &mut AtlassianConfig) {
+    normalize_optional_string(&mut config.base_url);
+    normalize_optional_string(&mut config.username);
+    normalize_optional_string(&mut config.api_token);
+    normalize_optional_string(&mut config.jira_project_key);
+    normalize_optional_string(&mut config.confluence_space_key);
+    normalize_optional_string(&mut config.confluence_parent_page_id);
+    if let Some(base_url) = &mut config.base_url {
+        *base_url = base_url.trim_end_matches('/').to_string();
+    }
+    if config.timeout_seconds == 0 {
+        config.timeout_seconds = 15;
+    }
+    if config.sync_interval_seconds > 0 {
+        config.sync_interval_seconds = config.sync_interval_seconds.max(60);
+    }
+    if config.jira_issue_type.trim().is_empty() {
+        config.jira_issue_type = "Task".to_string();
+    } else {
+        config.jira_issue_type = config.jira_issue_type.trim().to_string();
     }
 }
 

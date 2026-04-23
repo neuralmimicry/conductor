@@ -30,8 +30,14 @@ The main loops are:
    - Submits approved work into Refiner's planning and job APIs.
    - Polls execution status, runs bounded project-native validation commands where possible, stores verification results, and can auto-promote the work item after successful validation.
 5. Summary loop
-   - Aggregates stage totals, rollout totals, and DORA metrics from persisted work-item and production-execution history.
+   - Aggregates stage totals, rollout totals, external reference totals, and DORA metrics from persisted work-item, traceability-link, and production-execution history.
    - Feeds the dashboard and summary API with current estate and delivery posture data.
+6. External-link sync loop
+   - Periodically refreshes Jira issue, Confluence page, Refiner job/workspace, and Tracey runtime state when the relevant credentials or base URLs are configured.
+   - Keeps persisted traceability links aligned with upstream title, status, version, URL, rollout, rollback, and incident metadata changes.
+7. Estate traceability graph loop
+   - Materialises a graph view from persisted services, repositories, findings, work items, executions, and traceability links.
+   - Exposes the change path from finding to governed work to execution to rollout / incident evidence without introducing a second persistence model.
 
 ## Core Modules
 
@@ -44,6 +50,8 @@ The main loops are:
   - HTTP client construction.
   - Service-specific probes for Gail, Tracey, Continuum, Refiner, and AARNN.
   - Gail advisory integration for planning cycles.
+- `src/integrations/atlassian.rs`
+  - Native Jira and Confluence create/read/update/sync support built on the existing traceability-link model.
 - `src/findings.rs`
   - Converts repository inventory, service topology, runtime probes, and trend summaries into typed findings.
   - Attaches evidence and provenance records that keep deterministic reasoning visible.
@@ -60,9 +68,9 @@ The main loops are:
   - Discovers bounded project-native verification commands.
   - Executes local validation commands with timeout, output truncation, and missing-tooling tolerance.
 - `src/service.rs`
-  - Orchestration layer for repository access, auth behavior, DORA-aware summary generation, traceability assembly, and background loops.
+  - Orchestration layer for repository access, auth behavior, DORA-aware summary generation, traceability-link persistence, Refiner/Tracey/Atlassian lifecycle operations, estate traceability graph assembly, and background loops.
 - `src/app.rs`
-  - Axum routes for dashboard, task graph, traceability, and execution/admin API.
+  - Axum routes for dashboard, task graph, per-work-item traceability, estate traceability graph, Atlassian-linked external-reference management, and execution/admin API.
 - `src/storage/postgres.rs`
   - Postgres-backed persistence and migration execution.
 
@@ -82,7 +90,9 @@ Conductor stores eleven primary entities:
 - `improvement_cycles`
 - `conductor_events`
 
-This design gives a stable audit trail without conflating live topology with queued work.
+The `traceability_links` table extends that audit trail across Jira, Confluence, Refiner build/workspace/requirements records, Tracey runtime and rollback signals, incidents, and rollout records without conflating live topology with queued work.
+
+The estate traceability graph is intentionally derived from the existing persistence model at read time. Conductor does not maintain a second graph-specific table for the same correlations.
 
 ## Delivery Model
 
@@ -112,7 +122,7 @@ Used as the AI gateway and optional planning advisor. Conductor probes health an
 
 ### Tracey
 
-Used for resource and pressure insight. Conductor expects Tracey to surface health and status signals that can influence prioritization.
+Used for resource and pressure insight. Conductor expects Tracey to surface health and status signals that can influence prioritization, runtime rollout correlation, rollback warnings, and incident-style evidence.
 
 ### Continuum
 
@@ -120,11 +130,15 @@ Represents the broader control plane. Conductor inspects cluster and adaptive-lo
 
 ### Refiner
 
-Treated as the code-generation and workflow execution target. Conductor now uses Refiner as the governed execution surface for approved work items while keeping repository mutation inside Refiner's workflow boundary.
+Treated as the code-generation and workflow execution target. Conductor now uses Refiner as the governed execution surface for approved work items while keeping repository mutation inside Refiner's workflow boundary, and also reuses Refiner's job, requirements, and workspace APIs to enrich traceability with execution-native evidence.
 
 ### AARNN
 
 Treated as both a runtime surface and a future self-improvement substrate. Current Conductor tracks it as a first-class service and raises scaling / coordination recommendations when the topology suggests bottlenecks.
+
+### Atlassian
+
+Treated as the programme-management and documentation surface. Conductor can now create or dedupe Jira issues, publish or refresh Confluence pages, persist the resulting references as traceability links, and periodically sync upstream state back into the control plane.
 
 ## Security Model
 
@@ -132,10 +146,11 @@ Treated as both a runtime surface and a future self-improvement substrate. Curre
 - Mutating APIs and manual loop triggers require the admin bearer token when configured.
 - Release gates are stage-aware: UAT and production require explicit approval when policy is enabled, and production requires a controlled rollout strategy.
 - Upstream bearer tokens are per-integration and remain out of source control.
+- Atlassian operations require explicit credentials and stay within the same admin-token boundary as other mutating Conductor APIs.
 
 ## Next Iterations
 
 - Extend the task graph beyond `depends_on` into richer dependency/board views.
-- Persist more Refiner control-plane state in Postgres while keeping artifacts on NFS.
+- Persist more Refiner and Tracey control-plane state in Postgres only where it adds governance value while keeping large artifacts on their native stores.
 - Add evented execution updates and richer dashboard visibility.
 - Add streaming Gail/Refiner execution surfaces where it materially improves operator feedback.

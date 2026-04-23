@@ -3,8 +3,8 @@ use chrono::{DateTime, Utc};
 
 use crate::models::{
     ConductorEvent, DiscoveryRun, FindingEvidence, FindingProvenance, FindingRecord,
-    ImprovementCycle, RepositorySnapshot, ServiceMetricSample, ServiceSnapshot, WorkExecution,
-    WorkItem, WorkItemPatch,
+    ImprovementCycle, RepositorySnapshot, ServiceMetricSample, ServiceSnapshot, TraceabilityLink,
+    WorkExecution, WorkItem, WorkItemPatch,
 };
 
 #[async_trait]
@@ -32,6 +32,14 @@ pub trait ConductorRepository: Send + Sync {
         &self,
         finding_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<FindingProvenance>>;
+    async fn upsert_traceability_link(&self, link: &TraceabilityLink) -> anyhow::Result<()>;
+    async fn list_traceability_links(
+        &self,
+        work_item_id: Option<uuid::Uuid>,
+        execution_id: Option<uuid::Uuid>,
+        finding_key: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TraceabilityLink>>;
 
     async fn insert_discovery_run(&self, run: &DiscoveryRun) -> anyhow::Result<()>;
     async fn list_discovery_runs(&self, limit: usize) -> anyhow::Result<Vec<DiscoveryRun>>;

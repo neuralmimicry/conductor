@@ -24,6 +24,12 @@ Important environment variables:
 - `REFINER_BASE_URL`
 - `AARNN_BASE_URL`
 - Optional bearer token variables for each upstream
+- `ATLASSIAN_BASE_URL`
+- `ATLASSIAN_USERNAME`
+- `ATLASSIAN_API_TOKEN`
+- `ATLASSIAN_JIRA_PROJECT_KEY`
+- `ATLASSIAN_CONFLUENCE_SPACE_KEY`
+- `ATLASSIAN_CONFLUENCE_PARENT_PAGE_ID`
 
 Empty environment variables are normalized away, so leaving a variable unset does not create a broken empty-string URL.
 
@@ -56,6 +62,21 @@ Important validation controls in `config/conductor.yaml`:
 - `validation.timeout_seconds`: per-command timeout for local validation commands.
 - `validation.max_commands`: upper bound on discovered project-native validation commands per execution.
 
+Important Atlassian controls in `config/conductor.yaml`:
+
+- `integrations.atlassian.enabled`: enables native Jira/Confluence lifecycle operations and periodic sync.
+- `integrations.atlassian.timeout_seconds`: request timeout for Jira and Confluence API calls.
+- `integrations.atlassian.sync_interval_seconds`: background refresh cadence for Atlassian-backed traceability links. Set to `0` to disable background sync.
+- `integrations.atlassian.jira_project_key`: default Jira project used when the Jira link API is called without an explicit project.
+- `integrations.atlassian.jira_issue_type`: default Jira issue type for native issue creation.
+- `integrations.atlassian.confluence_space_key`: default Confluence space used for native page publication.
+- `integrations.atlassian.confluence_parent_page_id`: optional parent page used when Confluence pages are created.
+
+Important Refiner and Tracey sync controls in `config/conductor.yaml`:
+
+- `integrations.refiner.sync_interval_seconds`: background cadence for Refiner-backed traceability enrichment. Set to `0` to disable job/workspace/requirements sync.
+- `integrations.tracey.sync_interval_seconds`: background cadence for Tracey-backed runtime, rollout, rollback, and incident-signal sync. Set to `0` to disable runtime correlation refresh.
+
 ## Running Locally
 
 ```bash
@@ -85,6 +106,11 @@ docker run --rm -p 8091:8091 \
 8. Promote work through `development`, `testing`, `integration`, `integration_testing`, `uat`, and `production` instead of treating execution as a single undifferentiated step.
 9. Keep production work on `canary` or `red_green`; `direct` production rollout is blocked by policy.
 10. Use `GET /api/v1/work-items/{id}/traceability` when you need the finding, evidence, execution, and validation chain in one response.
+11. Use `POST /api/v1/work-items/{id}/links` to persist manual Jira, Confluence, build, incident, or rollout references back into Conductor once external systems have been updated.
+12. Use `POST /api/v1/work-items/{id}/links/jira` to create or dedupe a Jira issue natively from the selected work item.
+13. Use `POST /api/v1/work-items/{id}/links/confluence` to publish or refresh a Confluence page natively from the selected work item.
+14. Use `POST /api/v1/work-items/{id}/links/sync` or `POST /api/v1/links/sync` to refresh Refiner, Tracey, Jira, and Confluence state back into persisted traceability links.
+15. Use `GET /api/v1/traceability/graph` when you need the estate-level evidence path from service/repository finding through work item, execution, rollout, and external references.
 
 ## Failure Modes
 
@@ -109,7 +135,7 @@ For a live local verification after startup:
 
 ```bash
 curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
-  http://127.0.0.1:8091/api/v1/summary | jq '.delivery_stage_totals, .rollout_strategy_totals, .dora_metrics'
+  http://127.0.0.1:8091/api/v1/summary | jq '.delivery_stage_totals, .rollout_strategy_totals, .external_reference_totals, .dora_metrics'
 
 curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
   http://127.0.0.1:8091/api/v1/services | jq '.services[] | {service_key, deployment_environment, health}'
@@ -119,6 +145,29 @@ curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
 
 curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
   http://127.0.0.1:8091/api/v1/work-items/${WORK_ITEM_ID}/traceability | jq '.traceability | {work_item: .work_item.title, finding: .finding.finding_key, independent_validation: .independent_validation}'
+
+curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
+  -H "content-type: application/json" \
+  -d '{"system":"jira","reference_type":"bug","reference_key":"KAN-5","status":"To Do"}' \
+  http://127.0.0.1:8091/api/v1/work-items/${WORK_ITEM_ID}/links | jq '.link'
+
+curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
+  -H "content-type: application/json" \
+  -d '{"issue_type":"Bug"}' \
+  http://127.0.0.1:8091/api/v1/work-items/${WORK_ITEM_ID}/links/jira | jq '.result | {upstream_action, reference_key: .link.reference_key, status: .link.status}'
+
+curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
+  -H "content-type: application/json" \
+  -d '{}' \
+  http://127.0.0.1:8091/api/v1/work-items/${WORK_ITEM_ID}/links/confluence | jq '.result | {upstream_action, page_id: .link.reference_key, title: .link.title}'
+
+curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
+  -H "content-type: application/json" \
+  -d '{"systems":["refiner","tracey","jira","confluence"]}' \
+  http://127.0.0.1:8091/api/v1/work-items/${WORK_ITEM_ID}/links/sync | jq '.sync | {synced_systems, errors, links}'
+
+curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
+  http://127.0.0.1:8091/api/v1/traceability/graph | jq '.graph | {node_totals, relationship_totals, edges: (.edges | length)}'
 ```
 
 ## Safe Extension Path

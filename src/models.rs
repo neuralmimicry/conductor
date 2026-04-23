@@ -795,6 +795,7 @@ pub struct DashboardSummary {
     pub work_by_status: BTreeMap<String, usize>,
     pub delivery_stage_totals: BTreeMap<String, usize>,
     pub rollout_strategy_totals: BTreeMap<String, usize>,
+    pub external_reference_totals: BTreeMap<String, usize>,
     pub cycles_total: usize,
     pub executions_total: usize,
     pub executions_running: usize,
@@ -890,10 +891,219 @@ pub struct WorkItemTraceability {
     pub target_repository: Option<RepositorySnapshot>,
     pub evidence: Vec<FindingEvidence>,
     pub provenance: Vec<FindingProvenance>,
+    pub links: Vec<TraceabilityLink>,
     pub executions: Vec<WorkExecution>,
     pub latest_execution: Option<WorkExecution>,
     pub latest_verification: Value,
     pub independent_validation: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TraceabilityGraphNode {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub summary: Option<String>,
+    pub status: Option<String>,
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TraceabilityGraphEdge {
+    pub from: String,
+    pub to: String,
+    pub relationship: String,
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TraceabilityGraph {
+    pub generated_at: DateTime<Utc>,
+    pub node_totals: BTreeMap<String, usize>,
+    pub relationship_totals: BTreeMap<String, usize>,
+    pub nodes: Vec<TraceabilityGraphNode>,
+    pub edges: Vec<TraceabilityGraphEdge>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NewTraceabilityLink {
+    pub execution_id: Option<Uuid>,
+    pub finding_key: Option<String>,
+    pub system: String,
+    pub reference_type: String,
+    pub reference_key: String,
+    pub title: Option<String>,
+    pub status: Option<String>,
+    pub url: Option<String>,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct JiraIssueLinkRequest {
+    pub execution_id: Option<Uuid>,
+    pub finding_key: Option<String>,
+    pub issue_key: Option<String>,
+    pub project_key: Option<String>,
+    pub issue_type: Option<String>,
+    pub reference_type: Option<String>,
+    pub summary: Option<String>,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub update_existing: bool,
+    pub transition_name: Option<String>,
+    #[serde(default)]
+    pub fields: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConfluencePageLinkRequest {
+    pub execution_id: Option<Uuid>,
+    pub finding_key: Option<String>,
+    pub page_id: Option<String>,
+    pub space_key: Option<String>,
+    pub title: Option<String>,
+    pub body_storage: Option<String>,
+    pub parent_page_id: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub update_existing: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TraceabilitySyncRequest {
+    #[serde(default)]
+    pub systems: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TraceabilityLink {
+    pub id: Uuid,
+    pub link_key: String,
+    pub work_item_id: Option<Uuid>,
+    pub execution_id: Option<Uuid>,
+    pub finding_key: Option<String>,
+    pub system: String,
+    pub reference_type: String,
+    pub reference_key: String,
+    pub title: Option<String>,
+    pub status: Option<String>,
+    pub url: Option<String>,
+    pub metadata: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExternalLinkOperationResult {
+    pub link: TraceabilityLink,
+    pub upstream_action: String,
+    pub upstream: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TraceabilitySyncResult {
+    pub work_item_id: Option<Uuid>,
+    pub requested_systems: Vec<String>,
+    pub synced_systems: Vec<String>,
+    pub unsupported_systems: Vec<String>,
+    pub errors: Vec<String>,
+    pub links: Vec<TraceabilityLink>,
+}
+
+impl TraceabilityLink {
+    pub fn from_new(work_item_id: Option<Uuid>, input: NewTraceabilityLink) -> Self {
+        let now = now_utc();
+        let finding_key = input
+            .finding_key
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let system = input.system.trim().to_string();
+        let reference_type = input.reference_type.trim().to_string();
+        let reference_key = input.reference_key.trim().to_string();
+        Self {
+            id: Uuid::new_v4(),
+            link_key: traceability_link_key(
+                work_item_id,
+                input.execution_id,
+                finding_key.as_deref(),
+                &system,
+                &reference_type,
+                &reference_key,
+            ),
+            work_item_id,
+            execution_id: input.execution_id,
+            finding_key,
+            system,
+            reference_type,
+            reference_key,
+            title: input
+                .title
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            status: input
+                .status
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            url: input
+                .url
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            metadata: input.metadata,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    pub fn apply_update(&mut self, input: NewTraceabilityLink) {
+        self.execution_id = input.execution_id;
+        self.finding_key = input
+            .finding_key
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.system = input.system.trim().to_string();
+        self.reference_type = input.reference_type.trim().to_string();
+        self.reference_key = input.reference_key.trim().to_string();
+        self.title = input
+            .title
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.status = input
+            .status
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.url = input
+            .url
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.metadata = input.metadata;
+        self.link_key = traceability_link_key(
+            self.work_item_id,
+            self.execution_id,
+            self.finding_key.as_deref(),
+            &self.system,
+            &self.reference_type,
+            &self.reference_key,
+        );
+        self.updated_at = now_utc();
+    }
+
+    pub fn bucket(&self) -> String {
+        format!("{}:{}", self.system, self.reference_type)
+    }
+
+    pub fn is_incident_signal(&self) -> bool {
+        self.reference_type.eq_ignore_ascii_case("incident")
+            && !reference_status_is_closed(self.status.as_deref())
+    }
+
+    pub fn is_bug_signal(&self) -> bool {
+        self.reference_type.eq_ignore_ascii_case("bug")
+            && !reference_status_is_closed(self.status.as_deref())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -975,7 +1185,42 @@ pub struct DoraMetricsSummary {
     pub lead_time_hours_average: Option<f64>,
     pub lead_time_hours_median: Option<f64>,
     pub change_failure_rate_pct: f64,
+    pub correlated_change_failure_rate_pct: f64,
+    pub incident_linked_production_deployments: usize,
+    pub bug_linked_production_deployments: usize,
     pub mean_time_to_restore_hours: Option<f64>,
+}
+
+pub fn traceability_link_key(
+    work_item_id: Option<Uuid>,
+    execution_id: Option<Uuid>,
+    finding_key: Option<&str>,
+    system: &str,
+    reference_type: &str,
+    reference_key: &str,
+) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        work_item_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        execution_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        finding_key.unwrap_or("-").trim(),
+        system.trim().to_ascii_lowercase(),
+        reference_type.trim().to_ascii_lowercase(),
+        reference_key.trim()
+    )
+}
+
+fn reference_status_is_closed(status: Option<&str>) -> bool {
+    status.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "done" | "closed" | "resolved" | "cancelled" | "canceled" | "complete" | "completed"
+        )
+    })
 }
 
 pub fn unique_strings(values: Vec<String>) -> Vec<String> {

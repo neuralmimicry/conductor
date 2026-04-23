@@ -15,7 +15,7 @@ use crate::{
         ConductorEvent, DeliveryStage, DiscoveryRun, ExecutionStatus, FindingEvidence,
         FindingProvenance, FindingRecord, FindingSeverity, FindingStatus, ImprovementCycle,
         RepositorySnapshot, RolloutStrategy, RunStatus, ServiceHealth, ServiceMetricSample,
-        ServiceSnapshot, WorkExecution, WorkItem, WorkItemPatch, WorkStatus,
+        ServiceSnapshot, TraceabilityLink, WorkExecution, WorkItem, WorkItemPatch, WorkStatus,
     },
     repository::ConductorRepository,
 };
@@ -324,6 +324,80 @@ impl ConductorRepository for PostgresRepository {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(map_finding_provenance).collect()
+    }
+
+    async fn upsert_traceability_link(&self, link: &TraceabilityLink) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO traceability_links (
+                id, link_key, work_item_id, execution_id, finding_key, system,
+                reference_type, reference_key, title, status, url, metadata,
+                created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6,
+                $7, $8, $9, $10, $11, $12,
+                $13, $14
+            )
+            ON CONFLICT (link_key) DO UPDATE SET
+                work_item_id = EXCLUDED.work_item_id,
+                execution_id = EXCLUDED.execution_id,
+                finding_key = EXCLUDED.finding_key,
+                system = EXCLUDED.system,
+                reference_type = EXCLUDED.reference_type,
+                reference_key = EXCLUDED.reference_key,
+                title = EXCLUDED.title,
+                status = EXCLUDED.status,
+                url = EXCLUDED.url,
+                metadata = EXCLUDED.metadata,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(link.id)
+        .bind(&link.link_key)
+        .bind(link.work_item_id)
+        .bind(link.execution_id)
+        .bind(&link.finding_key)
+        .bind(&link.system)
+        .bind(&link.reference_type)
+        .bind(&link.reference_key)
+        .bind(&link.title)
+        .bind(&link.status)
+        .bind(&link.url)
+        .bind(Json(link.metadata.clone()))
+        .bind(link.created_at)
+        .bind(link.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_traceability_links(
+        &self,
+        work_item_id: Option<Uuid>,
+        execution_id: Option<Uuid>,
+        finding_key: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<TraceabilityLink>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM traceability_links
+            WHERE ($1::uuid IS NULL OR work_item_id = $1)
+              AND ($2::uuid IS NULL OR execution_id = $2)
+              AND ($3::text IS NULL OR finding_key = $3)
+            ORDER BY updated_at DESC, link_key ASC
+            LIMIT $4
+            "#,
+        )
+        .bind(work_item_id)
+        .bind(execution_id)
+        .bind(finding_key.map(str::trim).filter(|value| !value.is_empty()))
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(map_traceability_link).collect()
     }
 
     async fn insert_discovery_run(&self, run: &DiscoveryRun) -> Result<()> {
@@ -1039,6 +1113,25 @@ fn map_finding_provenance(row: PgRow) -> Result<FindingProvenance> {
         confidence_score: row.try_get("confidence_score")?,
         payload: row.try_get::<Json<serde_json::Value>, _>("payload")?.0,
         recorded_at: row.try_get("recorded_at")?,
+    })
+}
+
+fn map_traceability_link(row: PgRow) -> Result<TraceabilityLink> {
+    Ok(TraceabilityLink {
+        id: row.try_get("id")?,
+        link_key: row.try_get("link_key")?,
+        work_item_id: row.try_get("work_item_id")?,
+        execution_id: row.try_get("execution_id")?,
+        finding_key: row.try_get("finding_key")?,
+        system: row.try_get("system")?,
+        reference_type: row.try_get("reference_type")?,
+        reference_key: row.try_get("reference_key")?,
+        title: row.try_get("title")?,
+        status: row.try_get("status")?,
+        url: row.try_get("url")?,
+        metadata: row.try_get::<Json<serde_json::Value>, _>("metadata")?.0,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
     })
 }
 

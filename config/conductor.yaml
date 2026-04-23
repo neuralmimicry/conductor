@@ -61,6 +61,7 @@ integrations:
     base_url: "${TRACEY_BASE_URL}"
     bearer_token: "${TRACEY_BEARER_TOKEN}"
     timeout_seconds: 5
+    sync_interval_seconds: 300
   continuum:
     enabled: true
     base_url: "${CONTINUUM_BASE_URL}"
@@ -73,11 +74,23 @@ integrations:
     username: "${REFINER_USERNAME}"
     password: "${REFINER_PASSWORD}"
     timeout_seconds: 10
+    sync_interval_seconds: 300
   aarnn:
     enabled: true
     base_url: "${AARNN_BASE_URL}"
     bearer_token: "${AARNN_BEARER_TOKEN}"
     timeout_seconds: 10
+  atlassian:
+    enabled: true
+    base_url: "${ATLASSIAN_BASE_URL}"
+    username: "${ATLASSIAN_USERNAME}"
+    api_token: "${ATLASSIAN_API_TOKEN}"
+    timeout_seconds: 20
+    sync_interval_seconds: 600
+    jira_project_key: "${ATLASSIAN_JIRA_PROJECT_KEY}"
+    jira_issue_type: "Task"
+    confluence_space_key: "${ATLASSIAN_CONFLUENCE_SPACE_KEY}"
+    confluence_parent_page_id: "${ATLASSIAN_CONFLUENCE_PARENT_PAGE_ID}"
 
 planning:
   refresh_interval_seconds: 240

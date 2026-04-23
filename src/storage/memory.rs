@@ -9,8 +9,8 @@ use uuid::Uuid;
 use crate::{
     models::{
         ConductorEvent, DiscoveryRun, FindingEvidence, FindingProvenance, FindingRecord,
-        ImprovementCycle, RepositorySnapshot, ServiceMetricSample, ServiceSnapshot, WorkExecution,
-        WorkItem, WorkItemPatch,
+        ImprovementCycle, RepositorySnapshot, ServiceMetricSample, ServiceSnapshot,
+        TraceabilityLink, WorkExecution, WorkItem, WorkItemPatch,
     },
     repository::ConductorRepository,
 };
@@ -22,6 +22,7 @@ pub struct MemoryRepository {
     findings: RwLock<HashMap<Uuid, FindingRecord>>,
     finding_evidence: RwLock<Vec<FindingEvidence>>,
     finding_provenance: RwLock<Vec<FindingProvenance>>,
+    traceability_links: RwLock<HashMap<String, TraceabilityLink>>,
     discoveries: RwLock<Vec<DiscoveryRun>>,
     metric_samples: RwLock<Vec<ServiceMetricSample>>,
     work_items: RwLock<HashMap<Uuid, WorkItem>>,
@@ -119,6 +120,50 @@ impl ConductorRepository for MemoryRepository {
             .collect();
         provenance.sort_by(|left, right| left.recorded_at.cmp(&right.recorded_at));
         Ok(provenance)
+    }
+
+    async fn upsert_traceability_link(&self, link: &TraceabilityLink) -> Result<()> {
+        let mut guard = self.traceability_links.write().await;
+        if let Some(existing) = guard.get_mut(&link.link_key) {
+            let created_at = existing.created_at;
+            let id = existing.id;
+            *existing = link.clone();
+            existing.created_at = created_at;
+            existing.id = id;
+            return Ok(());
+        }
+        guard.insert(link.link_key.clone(), link.clone());
+        Ok(())
+    }
+
+    async fn list_traceability_links(
+        &self,
+        work_item_id: Option<Uuid>,
+        execution_id: Option<Uuid>,
+        finding_key: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<TraceabilityLink>> {
+        let finding_key = finding_key.map(str::trim).filter(|value| !value.is_empty());
+        let mut links: Vec<_> = self
+            .traceability_links
+            .read()
+            .await
+            .values()
+            .filter(|link| work_item_id.is_none_or(|value| link.work_item_id == Some(value)))
+            .filter(|link| execution_id.is_none_or(|value| link.execution_id == Some(value)))
+            .filter(|link| {
+                finding_key.is_none_or(|value| link.finding_key.as_deref() == Some(value))
+            })
+            .cloned()
+            .collect();
+        links.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.link_key.cmp(&right.link_key))
+        });
+        links.truncate(limit);
+        Ok(links)
     }
 
     async fn insert_discovery_run(&self, run: &DiscoveryRun) -> Result<()> {

@@ -79,6 +79,14 @@
     .cycle { padding: 14px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
     .cycle:last-child { border-bottom: 0; }
     .stack { display: grid; gap: 6px; }
+    .detail-card { display: grid; gap: 12px; }
+    .detail-block { padding: 14px; border-radius: 16px; border: 1px solid var(--line); background: rgba(255,255,255,0.03); }
+    .detail-block h3 { margin: 0 0 10px; font-size: 1rem; }
+    .detail-block pre { margin: 0; white-space: pre-wrap; }
+    .selected-row { outline: 1px solid rgba(217, 164, 65, 0.5); background: rgba(217, 164, 65, 0.08); }
+    .link-list { display: grid; gap: 10px; }
+    .link-item { padding: 12px; border-radius: 14px; border: 1px solid var(--line); background: rgba(255,255,255,0.03); }
+    .summary-lines { display: grid; gap: 10px; }
     @media (max-width: 1100px) { .hero, .grid, .cards { grid-template-columns: 1fr; } }
   </style>
 </head>
@@ -136,9 +144,30 @@
       </table>
     </div>
   </section>
+  <section class="grid">
+    <div class="panel">
+      <div class="section-head">
+        <h2 class="section-title">Traceability</h2>
+        <div class="actions">
+          <button class="secondary" id="sync-selected">Sync Links</button>
+          <button id="create-jira">Create Jira</button>
+          <button id="publish-confluence">Publish Confluence</button>
+        </div>
+      </div>
+      <div id="traceability-detail" class="detail-card muted">Select a work item to inspect findings, executions, validation, and linked estate references from Refiner, Tracey, Jira, and Confluence.</div>
+    </div>
+    <div class="panel">
+      <div class="section-head"><h2 class="section-title">External Signals</h2></div>
+      <div id="external-reference-summary" class="summary-lines"></div>
+      <div id="estate-graph-summary" class="summary-lines" style="margin-top: 14px;"></div>
+    </div>
+  </section>
 </div>
 <script>
-const state = { token: localStorage.getItem('conductor_admin_token') || '' };
+const state = {
+  token: localStorage.getItem('conductor_admin_token') || '',
+  selectedWorkItemId: localStorage.getItem('conductor_selected_work_item') || '',
+};
 let eventSource = null;
 let eventRetryTimer = null;
 let reloadTimer = null;
@@ -147,6 +176,9 @@ const els = {
   authStatus: document.getElementById('auth-status'), summaryCards: document.getElementById('summary-cards'), workItems: document.getElementById('work-items'),
   eventStatus: document.getElementById('event-status'), services: document.getElementById('services'), cycles: document.getElementById('cycles'), refresh: document.getElementById('refresh'),
   runDiscovery: document.getElementById('run-discovery'), runPlanning: document.getElementById('run-planning'), runExecution: document.getElementById('run-execution'),
+  traceabilityDetail: document.getElementById('traceability-detail'), externalReferenceSummary: document.getElementById('external-reference-summary'),
+  estateGraphSummary: document.getElementById('estate-graph-summary'),
+  syncSelected: document.getElementById('sync-selected'), createJira: document.getElementById('create-jira'), publishConfluence: document.getElementById('publish-confluence'),
 };
 els.token.value = state.token; updateAuthBadge();
 function updateAuthBadge(message) {
@@ -214,26 +246,79 @@ function toneForHealth(health) { if (health === 'healthy') return 'var(--ok)'; i
 function formatCounts(map) {
   return Object.entries(map || {}).filter(([, value]) => value > 0).map(([key, value]) => `${key}: ${value}`).join(' · ') || 'none';
 }
+function formatTopCounts(map, limit = 6) {
+  return Object.entries(map || {})
+    .filter(([, value]) => value > 0)
+    .sort((left, right) => Number(right[1] || 0) - Number(left[1] || 0))
+    .slice(0, limit)
+    .map(([key, value]) => `${key}: ${value}`)
+    .join(' · ') || 'none';
+}
 function formatHours(value) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return 'n/a';
   return `${Number(value).toFixed(1)}h`;
+}
+function formatDateTime(value) {
+  if (!value) return 'n/a';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
+}
+function totalCount(map) {
+  return Object.values(map || {}).reduce((total, value) => total + Number(value || 0), 0);
 }
 function renderSummary(summary) {
   const dora = summary.dora_metrics || {};
   const criticalFindings = (summary.findings_by_severity?.critical || 0) + (summary.findings_by_severity?.high || 0);
   const stagedItems = Object.values(summary.delivery_stage_totals || {}).reduce((total, value) => total + value, 0);
+  const externalRefs = totalCount(summary.external_reference_totals);
   const cards = [
     ['Services', summary.services_total, `${summary.services_healthy} healthy · ${summary.services_unreachable} unreachable`],
     ['Findings', summary.findings_total, `${criticalFindings} high/critical · ${formatCounts(summary.findings_by_severity)}`],
     ['Queue', summary.work_items_total, `${summary.approvals_waiting} approvals waiting · ${summary.executions_running} running`],
     ['Promotions', stagedItems, `${formatCounts(summary.delivery_stage_totals)} · ${formatCounts(summary.rollout_strategy_totals)}`],
+    ['External Refs', externalRefs, formatCounts(summary.external_reference_totals)],
     ['Prod Deploys', dora.successful_production_deployments ?? 0, `${dora.attempted_production_deployments ?? 0} attempts in ${dora.window_days ?? 0}d`],
     ['Deploy Freq', (dora.deployment_frequency_per_day ?? 0).toFixed(2), 'successful prod deploys / day'],
     ['Lead Time', formatHours(dora.lead_time_hours_median ?? dora.lead_time_hours_average), `median · avg ${formatHours(dora.lead_time_hours_average)}`],
     ['Change Failure', `${(dora.change_failure_rate_pct ?? 0).toFixed(1)}%`, `MTTR ${formatHours(dora.mean_time_to_restore_hours)}`],
+    ['Correlated CFR', `${(dora.correlated_change_failure_rate_pct ?? 0).toFixed(1)}%`, `${dora.bug_linked_production_deployments ?? 0} bug-linked · ${dora.incident_linked_production_deployments ?? 0} incident-linked`],
     ['Cycles', summary.cycles_total, summary.latest_cycle ? summary.latest_cycle.summary : 'no cycles yet'],
   ];
   els.summaryCards.innerHTML = cards.map(([label, metric, detail]) => `<article class="card"><div class="label">${label}</div><div class="metric">${metric}</div><div class="muted">${detail}</div></article>`).join('');
+}
+function renderExternalSummary(summary, graph) {
+  const dora = summary.dora_metrics || {};
+  const externalReferenceTotals = Object.entries(summary.external_reference_totals || {});
+  els.externalReferenceSummary.innerHTML = `
+    <div class="detail-block">
+      <h3>Reference Totals</h3>
+      <div><strong>${totalCount(summary.external_reference_totals)}</strong> persisted external references</div>
+      <div class="muted">${externalReferenceTotals.length ? formatCounts(summary.external_reference_totals) : 'No external references linked yet.'}</div>
+    </div>
+    <div class="detail-block">
+      <h3>DORA Correlation</h3>
+      <div><strong>${(dora.correlated_change_failure_rate_pct ?? 0).toFixed(1)}%</strong> correlated change failure rate</div>
+      <div class="muted">${dora.bug_linked_production_deployments ?? 0} bug-linked deployments · ${dora.incident_linked_production_deployments ?? 0} incident-linked deployments</div>
+    </div>
+    <div class="detail-block">
+      <h3>Latest Discovery</h3>
+      <div>${summary.latest_discovery ? `${summary.latest_discovery.services_count} services · ${summary.latest_discovery.repositories_count} repositories` : 'No discovery run recorded yet.'}</div>
+      <div class="muted">${summary.latest_discovery ? formatDateTime(summary.latest_discovery.finished_at) : ''}</div>
+    </div>
+  `;
+  const nodeTotals = graph?.node_totals || {};
+  const relationshipTotals = graph?.relationship_totals || {};
+  const totalNodes = totalCount(nodeTotals);
+  const totalEdges = Array.isArray(graph?.edges) ? graph.edges.length : 0;
+  els.estateGraphSummary.innerHTML = `
+    <div class="detail-block">
+      <h3>Estate Graph</h3>
+      <div><strong>${totalNodes}</strong> nodes · <strong>${totalEdges}</strong> edges</div>
+      <div class="muted">${formatCounts(nodeTotals)}</div>
+      <div class="muted">Top relationships: ${formatTopCounts(relationshipTotals)}</div>
+    </div>
+  `;
 }
 function renderServices(services) {
   els.services.innerHTML = services.map((service) => `<tr><td><strong>${service.display_name}</strong><br><span class="muted">${service.kind}</span><br><span class="mono">${service.role_name}</span></td><td><span class="pill" style="color:${toneForHealth(service.health)}; border-color:${toneForHealth(service.health)}33; background:${toneForHealth(service.health)}18;">${service.health}</span></td><td>${service.deployment_environment ? `<span class="pill">${service.deployment_environment}</span>` : '<span class="muted">unknown</span>'}</td><td class="mono">${service.public_url ? `public: ${service.public_url}<br>` : ''}${service.internal_url ? `internal: ${service.internal_url}<br>` : ''}${service.repo_path ? `repo: ${service.repo_path}` : '<span class="muted">no repo hint</span>'}</td><td>${(service.dependencies || []).map((item) => `<span class="pill">${item}</span>`).join('') || '<span class="muted">none</span>'}</td><td>${(service.capabilities || []).map((item) => `<span class="pill">${item}</span>`).join('')}</td></tr>`).join('');
@@ -252,7 +337,7 @@ function renderWorkItems(items) {
   const statuses = ['planned', 'scheduled', 'in_operation', 'success', 'failure', 'aborted', 'on_hold'];
   const stages = ['development', 'testing', 'integration', 'integration_testing', 'uat', 'production'];
   const rolloutStrategies = ['direct', 'canary', 'red_green'];
-  els.workItems.innerHTML = items.map((item) => `<tr><td><strong>${item.title}</strong><br><div class="muted">${item.summary}</div><div>${(item.tags || []).map((tag) => `<span class="pill">${tag}</span>`).join('')}</div><div>${(item.validated_stages || []).map((stage) => `<span class="pill">${stage}</span>`).join('') || '<span class="muted">no validated stages yet</span>'}</div>${(item.depends_on || []).length ? `<div class="muted mono">depends_on: ${(item.depends_on || []).join(', ')}</div>` : ''}</td><td><select data-field="status" data-id="${item.id}">${statuses.map((status) => `<option value="${status}" ${status === item.status ? 'selected' : ''}>${status}</option>`).join('')}</select></td><td><div class="stack"><select data-field="delivery_stage" data-id="${item.id}">${stages.map((stage) => `<option value="${stage}" ${stage === item.delivery_stage ? 'selected' : ''}>${stage}</option>`).join('')}</select><div class="muted">validated ${(item.validated_stages || []).length}/${stages.length}</div></div></td><td><select data-field="rollout_strategy" data-id="${item.id}">${rolloutStrategies.map((strategy) => `<option value="${strategy}" ${strategy === item.rollout_strategy ? 'selected' : ''}>${strategy}</option>`).join('')}</select></td><td><input type="number" data-field="priority" data-id="${item.id}" value="${item.priority}" /></td><td><input type="number" data-field="progress_pct" data-id="${item.id}" min="0" max="100" value="${item.progress_pct}" /></td><td><input type="datetime-local" data-field="scheduled_for" data-id="${item.id}" value="${toDateTimeLocal(item.scheduled_for)}" /></td><td>${item.target_service || '<span class="muted">none</span>'}</td><td><div class="row-actions"><label><input type="checkbox" data-field="execution_approved" data-id="${item.id}" ${item.execution_approved ? 'checked' : ''} /> execution approved</label><label><input type="checkbox" data-field="verification_required" data-id="${item.id}" ${item.verification_required ? 'checked' : ''} /> verification required</label><input data-field="depends_on" data-id="${item.id}" value="${(item.depends_on || []).join(', ')}" placeholder="comma-separated dependency ids or dedupe keys" />${item.last_execution_id ? `<div class="muted mono">last execution: ${item.last_execution_id}</div>` : '<div class="muted">no execution yet</div>'}<button class="secondary" data-action="execute" data-id="${item.id}">Execute</button></div></td><td><div class="row-actions"><label><input type="checkbox" data-field="admin_override" data-id="${item.id}" ${item.admin_override ? 'checked' : ''} /> admin override</label><textarea data-field="note" data-id="${item.id}" placeholder="append note"></textarea><button class="secondary" data-action="save" data-id="${item.id}">Save</button></div></td></tr>`).join('');
+  els.workItems.innerHTML = items.map((item) => `<tr class="${state.selectedWorkItemId === item.id ? 'selected-row' : ''}"><td><strong>${item.title}</strong><br><div class="muted">${item.summary}</div><div>${(item.tags || []).map((tag) => `<span class="pill">${tag}</span>`).join('')}</div><div>${(item.validated_stages || []).map((stage) => `<span class="pill">${stage}</span>`).join('') || '<span class="muted">no validated stages yet</span>'}</div>${(item.depends_on || []).length ? `<div class="muted mono">depends_on: ${(item.depends_on || []).join(', ')}</div>` : ''}</td><td><select data-field="status" data-id="${item.id}">${statuses.map((status) => `<option value="${status}" ${status === item.status ? 'selected' : ''}>${status}</option>`).join('')}</select></td><td><div class="stack"><select data-field="delivery_stage" data-id="${item.id}">${stages.map((stage) => `<option value="${stage}" ${stage === item.delivery_stage ? 'selected' : ''}>${stage}</option>`).join('')}</select><div class="muted">validated ${(item.validated_stages || []).length}/${stages.length}</div></div></td><td><select data-field="rollout_strategy" data-id="${item.id}">${rolloutStrategies.map((strategy) => `<option value="${strategy}" ${strategy === item.rollout_strategy ? 'selected' : ''}>${strategy}</option>`).join('')}</select></td><td><input type="number" data-field="priority" data-id="${item.id}" value="${item.priority}" /></td><td><input type="number" data-field="progress_pct" data-id="${item.id}" min="0" max="100" value="${item.progress_pct}" /></td><td><input type="datetime-local" data-field="scheduled_for" data-id="${item.id}" value="${toDateTimeLocal(item.scheduled_for)}" /></td><td>${item.target_service || '<span class="muted">none</span>'}</td><td><div class="row-actions"><label><input type="checkbox" data-field="execution_approved" data-id="${item.id}" ${item.execution_approved ? 'checked' : ''} /> execution approved</label><label><input type="checkbox" data-field="verification_required" data-id="${item.id}" ${item.verification_required ? 'checked' : ''} /> verification required</label><input data-field="depends_on" data-id="${item.id}" value="${(item.depends_on || []).join(', ')}" placeholder="comma-separated dependency ids or dedupe keys" />${item.last_execution_id ? `<div class="muted mono">last execution: ${item.last_execution_id}</div>` : '<div class="muted">no execution yet</div>'}<button class="secondary" data-action="execute" data-id="${item.id}">Execute</button><button class="secondary" data-action="traceability" data-id="${item.id}">${state.selectedWorkItemId === item.id ? 'Selected' : 'Traceability'}</button></div></td><td><div class="row-actions"><label><input type="checkbox" data-field="admin_override" data-id="${item.id}" ${item.admin_override ? 'checked' : ''} /> admin override</label><textarea data-field="note" data-id="${item.id}" placeholder="append note"></textarea><button class="secondary" data-action="save" data-id="${item.id}">Save</button></div></td></tr>`).join('');
   els.workItems.querySelectorAll('button[data-action="save"]').forEach((button) => {
     button.addEventListener('click', async () => {
       const id = button.dataset.id; const values = {};
@@ -280,11 +365,102 @@ function renderWorkItems(items) {
       } catch (error) { updateAuthBadge(error.message); }
     });
   });
+  els.workItems.querySelectorAll('button[data-action="traceability"]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      state.selectedWorkItemId = button.dataset.id;
+      localStorage.setItem('conductor_selected_work_item', state.selectedWorkItemId);
+      await load();
+    });
+  });
+}
+function setTraceabilityActionState(enabled) {
+  [els.syncSelected, els.createJira, els.publishConfluence].forEach((button) => {
+    if (!button) return;
+    button.disabled = !enabled;
+    button.style.opacity = enabled ? '1' : '0.5';
+    button.style.pointerEvents = enabled ? 'auto' : 'none';
+  });
+}
+function renderTraceability(traceability, errorMessage) {
+  if (errorMessage) {
+    els.traceabilityDetail.innerHTML = `<div class="detail-block"><strong>Traceability unavailable</strong><div class="muted">${errorMessage}</div></div>`;
+    setTraceabilityActionState(Boolean(state.selectedWorkItemId));
+    return;
+  }
+  if (!traceability) {
+    els.traceabilityDetail.innerHTML = '<div class="detail-block"><strong>No work item selected</strong><div class="muted">Choose a work item from the queue to inspect traceability and external links.</div></div>';
+    setTraceabilityActionState(false);
+    return;
+  }
+  const work = traceability.work_item || {};
+  const finding = traceability.finding;
+  const links = traceability.links || [];
+  const executions = traceability.executions || [];
+  const validation = traceability.independent_validation || {};
+  const validationSummary = validation.summary || JSON.stringify(validation);
+  els.traceabilityDetail.innerHTML = `
+    <div class="detail-block">
+      <h3>${work.title || 'Work Item'}</h3>
+      <div class="muted">${work.summary || ''}</div>
+      <div>
+        <span class="pill">${work.status || 'planned'}</span>
+        <span class="pill">${work.delivery_stage || 'development'}</span>
+        <span class="pill">${work.rollout_strategy || 'direct'}</span>
+      </div>
+      <div class="muted">Updated ${formatDateTime(work.updated_at)}</div>
+    </div>
+    <div class="detail-block">
+      <h3>Finding</h3>
+      ${finding ? `<div><strong>${finding.title}</strong></div><div class="muted">${finding.summary || ''}</div><div><span class="pill">${finding.severity}</span><span class="pill">${finding.category}</span><span class="pill">${finding.finding_key}</span></div>` : '<div class="muted">No finding linked to this work item.</div>'}
+    </div>
+    <div class="detail-block">
+      <h3>External Links</h3>
+      <div class="link-list">
+        ${links.length ? links.map((link) => `<div class="link-item"><div><strong>${link.system}</strong> ${link.reference_type}</div><div class="mono">${link.reference_key}</div><div class="muted">${link.title || ''}</div><div>${link.status ? `<span class="pill">${link.status}</span>` : ''}${link.url ? `<span class="pill">${link.url}</span>` : ''}</div></div>`).join('') : '<div class="muted">No external links linked yet.</div>'}
+      </div>
+    </div>
+    <div class="detail-block">
+      <h3>Executions</h3>
+      ${executions.length ? executions.slice(0, 6).map((execution) => `<div><span class="pill">${execution.delivery_stage}</span><span class="pill">${execution.rollout_strategy}</span><span class="pill">${execution.status}</span><span class="muted">${formatDateTime(execution.updated_at)}</span></div>`).join('') : '<div class="muted">No execution history yet.</div>'}
+    </div>
+    <div class="detail-block">
+      <h3>Independent Validation</h3>
+      <div class="muted">${validationSummary && validationSummary !== '{}' ? validationSummary : 'No independent validation captured yet.'}</div>
+      <pre class="mono">${JSON.stringify(validation, null, 2)}</pre>
+    </div>
+  `;
+  setTraceabilityActionState(true);
+}
+async function runSelectedTraceabilityAction(path, body) {
+  if (!state.selectedWorkItemId) return;
+  try {
+    const payload = await fetchJson(path, { method: 'POST', body: JSON.stringify(body || {}) });
+    const message = payload.result?.upstream_action || payload.sync?.links?.length || 'updated';
+    updateEventBadge(`Traceability action complete: ${message}`, 'ok');
+    await load();
+  } catch (error) {
+    updateAuthBadge(error.message);
+  }
 }
 async function load() {
   try {
-    const [summary, services, workItems, cycles] = await Promise.all([fetchJson('/api/v1/summary'), fetchJson('/api/v1/services'), fetchJson('/api/v1/work-items'), fetchJson('/api/v1/cycles?limit=10')]);
-    renderSummary(summary); renderServices(services.services || services); renderWorkItems(workItems.work_items || workItems); renderCycles(cycles.cycles || cycles); updateAuthBadge();
+    const traceabilityPromise = state.selectedWorkItemId
+      ? fetchJson(`/api/v1/work-items/${state.selectedWorkItemId}/traceability`).catch((error) => ({ __error: error.message }))
+      : Promise.resolve(null);
+    const [summary, services, workItems, cycles, traceability, graph] = await Promise.all([
+      fetchJson('/api/v1/summary'),
+      fetchJson('/api/v1/services'),
+      fetchJson('/api/v1/work-items'),
+      fetchJson('/api/v1/cycles?limit=10'),
+      traceabilityPromise,
+      fetchJson('/api/v1/traceability/graph'),
+    ]);
+    const items = workItems.work_items || workItems;
+    if (state.selectedWorkItemId && !(items || []).some((item) => item.id === state.selectedWorkItemId)) {
+      state.selectedWorkItemId = '';
+      localStorage.removeItem('conductor_selected_work_item');
+    }
+    renderSummary(summary); renderExternalSummary(summary, graph.graph || graph); renderServices(services.services || services); renderWorkItems(items); renderCycles(cycles.cycles || cycles); renderTraceability(traceability?.traceability || null, traceability?.__error); updateAuthBadge();
     connectEventStream();
   } catch (error) {
     closeEventStream();
@@ -298,6 +474,9 @@ els.refresh.addEventListener('click', load);
 els.runDiscovery.addEventListener('click', async () => { try { await fetchJson('/api/v1/discovery/run', { method: 'POST' }); await load(); } catch (error) { updateAuthBadge(error.message); } });
 els.runPlanning.addEventListener('click', async () => { try { await fetchJson('/api/v1/planning/run', { method: 'POST' }); await load(); } catch (error) { updateAuthBadge(error.message); } });
 els.runExecution.addEventListener('click', async () => { try { await fetchJson('/api/v1/execution/run', { method: 'POST' }); await load(); } catch (error) { updateAuthBadge(error.message); } });
+els.syncSelected.addEventListener('click', async () => { await runSelectedTraceabilityAction(`/api/v1/work-items/${state.selectedWorkItemId}/links/sync`, { systems: ['refiner', 'tracey', 'jira', 'confluence'] }); });
+els.createJira.addEventListener('click', async () => { await runSelectedTraceabilityAction(`/api/v1/work-items/${state.selectedWorkItemId}/links/jira`, {}); });
+els.publishConfluence.addEventListener('click', async () => { await runSelectedTraceabilityAction(`/api/v1/work-items/${state.selectedWorkItemId}/links/confluence`, {}); });
 window.addEventListener('beforeunload', closeEventStream);
 load();
 </script>

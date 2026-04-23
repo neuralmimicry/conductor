@@ -9,6 +9,10 @@ use crate::{
     models::{ProbeResult, ServiceHealth, ServiceSnapshot},
 };
 
+pub mod atlassian;
+pub mod refiner;
+pub mod tracey;
+
 pub fn build_http_client(timeout_seconds: u64) -> Result<Client> {
     Ok(Client::builder()
         .use_rustls_tls()
@@ -54,7 +58,10 @@ fn resolve_external_config<'a>(
     }
 }
 
-fn resolve_base_url(service: &ServiceSnapshot, external: &ExternalServiceConfig) -> Option<String> {
+pub(crate) fn resolve_base_url(
+    service: &ServiceSnapshot,
+    external: &ExternalServiceConfig,
+) -> Option<String> {
     external
         .base_url
         .clone()
@@ -452,7 +459,7 @@ pub async fn gail_plan_summary(
     })))
 }
 
-async fn get_json(
+pub(crate) async fn get_json(
     client: &Client,
     base_url: &str,
     path: &str,
@@ -466,7 +473,7 @@ async fn get_json(
     decode_json(response).await
 }
 
-async fn post_json(
+pub(crate) async fn post_json(
     client: &Client,
     base_url: &str,
     path: &str,
@@ -483,7 +490,7 @@ async fn post_json(
     decode_json(response).await
 }
 
-async fn decode_json(response: reqwest::Response) -> Result<Value> {
+pub(crate) async fn decode_json(response: reqwest::Response) -> Result<Value> {
     let status = response.status();
     let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
     if status.is_success() {
