@@ -28,7 +28,7 @@ The main loops are:
    - Evaluates policy gates, including stage prerequisites and production rollout restrictions.
    - Supports `dry_run` preview mode and `emergency_stop` execution halts.
    - Submits approved work into Refiner's planning and job APIs.
-   - Polls execution status, stores verification results, and can auto-promote the work item after successful validation.
+   - Polls execution status, runs bounded project-native validation commands where possible, stores verification results, and can auto-promote the work item after successful validation.
 5. Summary loop
    - Aggregates stage totals, rollout totals, and DORA metrics from persisted work-item and production-execution history.
    - Feeds the dashboard and summary API with current estate and delivery posture data.
@@ -54,12 +54,15 @@ The main loops are:
 - `src/executor.rs`
   - Converts approved work items into Refiner execution attempts.
   - Uses DB-backed claiming to avoid duplicate execution dispatch.
-  - Persists execution policy, payloads, delivery metadata, status, and verification outcomes.
+  - Persists execution policy, payloads, delivery metadata, status, Refiner verification, and independent validation outcomes.
   - Auto-promotes work items through the staged pipeline when configured to do so.
+- `src/validation.rs`
+  - Discovers bounded project-native verification commands.
+  - Executes local validation commands with timeout, output truncation, and missing-tooling tolerance.
 - `src/service.rs`
-  - Orchestration layer for repository access, auth behavior, DORA-aware summary generation, and background loops.
+  - Orchestration layer for repository access, auth behavior, DORA-aware summary generation, traceability assembly, and background loops.
 - `src/app.rs`
-  - Axum routes for dashboard, task graph, and execution/admin API.
+  - Axum routes for dashboard, task graph, traceability, and execution/admin API.
 - `src/storage/postgres.rs`
   - Postgres-backed persistence and migration execution.
 

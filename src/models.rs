@@ -883,6 +883,20 @@ impl WorkExecution {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkItemTraceability {
+    pub work_item: WorkItem,
+    pub finding: Option<FindingRecord>,
+    pub target_service: Option<ServiceSnapshot>,
+    pub target_repository: Option<RepositorySnapshot>,
+    pub evidence: Vec<FindingEvidence>,
+    pub provenance: Vec<FindingProvenance>,
+    pub executions: Vec<WorkExecution>,
+    pub latest_execution: Option<WorkExecution>,
+    pub latest_verification: Value,
+    pub independent_validation: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConductorEvent {
     pub id: Uuid,
     pub event_type: String,

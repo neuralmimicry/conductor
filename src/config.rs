@@ -16,6 +16,7 @@ pub struct ConductorConfig {
     pub database: DatabaseConfig,
     pub discovery: DiscoveryConfig,
     pub delivery: DeliveryConfig,
+    pub validation: ValidationConfig,
     pub integrations: IntegrationsConfig,
     pub planning: PlanningConfig,
     pub execution: ExecutionConfig,
@@ -107,6 +108,17 @@ pub struct DeliveryConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+pub struct ValidationConfig {
+    pub enabled: bool,
+    pub require_success: bool,
+    pub allow_missing_tooling: bool,
+    pub timeout_seconds: u64,
+    pub max_output_bytes: usize,
+    pub max_commands: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ExternalServiceConfig {
     pub enabled: bool,
     pub base_url: Option<String>,
@@ -167,6 +179,7 @@ impl Default for ConductorConfig {
             database: DatabaseConfig::default(),
             discovery: DiscoveryConfig::default(),
             delivery: DeliveryConfig::default(),
+            validation: ValidationConfig::default(),
             integrations: IntegrationsConfig::default(),
             planning: PlanningConfig::default(),
             execution: ExecutionConfig::default(),
@@ -289,6 +302,19 @@ impl Default for ExternalServiceConfig {
     }
 }
 
+impl Default for ValidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            require_success: true,
+            allow_missing_tooling: true,
+            timeout_seconds: 600,
+            max_output_bytes: 4096,
+            max_commands: 6,
+        }
+    }
+}
+
 impl Default for PlanningConfig {
     fn default() -> Self {
         Self {
@@ -382,6 +408,11 @@ impl ConductorConfig {
         }
         self.delivery.production_canary_percentage =
             self.delivery.production_canary_percentage.clamp(1, 100);
+        if self.validation.timeout_seconds == 0 {
+            self.validation.timeout_seconds = 600;
+        }
+        self.validation.max_output_bytes = self.validation.max_output_bytes.clamp(256, 65_536);
+        self.validation.max_commands = self.validation.max_commands.clamp(1, 20);
         if self.planning.refresh_interval_seconds == 0 {
             self.planning.refresh_interval_seconds = 240;
         }

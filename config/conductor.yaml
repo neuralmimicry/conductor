@@ -42,6 +42,14 @@ delivery:
   require_uat_before_production: true
   production_canary_percentage: 10
 
+validation:
+  enabled: true
+  require_success: true
+  allow_missing_tooling: true
+  timeout_seconds: 600
+  max_output_bytes: 4096
+  max_commands: 6
+
 integrations:
   gail:
     enabled: true

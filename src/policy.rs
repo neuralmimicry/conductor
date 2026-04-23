@@ -234,7 +234,10 @@ fn required_verifications(
     delivery_stage: DeliveryStage,
     rollout_strategy: RolloutStrategy,
 ) -> Vec<String> {
-    let mut commands = project_native_verifications(service);
+    let mut commands = project_native_verification_commands(service);
+    if commands.is_empty() {
+        commands.push("project-native verification commands".to_string());
+    }
     match delivery_stage {
         DeliveryStage::Development => {}
         DeliveryStage::Testing => {
@@ -263,12 +266,14 @@ fn required_verifications(
     commands
 }
 
-fn project_native_verifications(service: Option<&ServiceSnapshot>) -> Vec<String> {
+pub(crate) fn project_native_verification_commands(
+    service: Option<&ServiceSnapshot>,
+) -> Vec<String> {
     let Some(service) = service else {
-        return vec!["project-native verification commands".to_string()];
+        return Vec::new();
     };
     let Some(repo_path) = service.repo_path.as_deref() else {
-        return vec!["project-native verification commands".to_string()];
+        return Vec::new();
     };
     let repo = Path::new(repo_path);
     if repo.join("Cargo.toml").exists() {
@@ -284,7 +289,7 @@ fn project_native_verifications(service: Option<&ServiceSnapshot>) -> Vec<String
     if repo.join("package.json").exists() {
         return vec!["npm test".to_string(), "npm run lint".to_string()];
     }
-    vec!["project-native verification commands".to_string()]
+    Vec::new()
 }
 
 pub fn policy_evaluation_to_value(evaluation: &PolicyEvaluation) -> Value {

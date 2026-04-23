@@ -69,6 +69,10 @@ pub fn build_router(service: ConductorService) -> Router {
             "/api/v1/work-items/{id}/executions",
             get(list_work_item_executions),
         )
+        .route(
+            "/api/v1/work-items/{id}/traceability",
+            get(get_work_item_traceability),
+        )
         .route("/api/v1/work-items/{id}/execute", post(execute_work_item))
         .route("/api/v1/cycles", get(list_cycles))
         .route("/api/v1/discovery/runs", get(list_discovery_runs))
@@ -307,6 +311,19 @@ async fn list_work_item_executions(
     Ok(Json(serde_json::json!({"executions": executions})))
 }
 
+async fn get_work_item_traceability(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    service.authorize_read(&headers)?;
+    let traceability = service
+        .work_item_traceability(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("work item {} not found", id)))?;
+    Ok(Json(serde_json::json!({"traceability": traceability})))
+}
+
 async fn trigger_execution_cycle(
     State(service): State<ConductorService>,
     headers: HeaderMap,
@@ -391,7 +408,8 @@ mod tests {
     use tower::util::ServiceExt;
 
     use crate::models::{
-        FindingRecord, FindingSeverity, FindingStatus, NewWorkItem, WorkExecution, WorkItem,
+        FindingEvidence, FindingProvenance, FindingRecord, FindingSeverity, FindingStatus,
+        NewWorkItem, RepositorySnapshot, ServiceHealth, ServiceSnapshot, WorkExecution, WorkItem,
         now_utc,
     };
     use crate::{
@@ -694,6 +712,203 @@ mod tests {
             payload["executions"]
                 .as_array()
                 .expect("execution list")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn work_item_traceability_endpoint_returns_finding_and_validation() {
+        let service = test_service();
+        let finding = FindingRecord {
+            id: uuid::Uuid::new_v4(),
+            finding_key: "repository_test_baseline:conductor".to_string(),
+            title: "Conductor lacks verification coverage".to_string(),
+            summary: "Independent validation needs to be visible in traceability views."
+                .to_string(),
+            category: "validation".to_string(),
+            severity: FindingSeverity::High,
+            status: FindingStatus::Open,
+            target_service: Some("conductor".to_string()),
+            target_repository: Some("conductor".to_string()),
+            source_run_id: None,
+            confidence_score: 0.92,
+            tags: vec!["validation".to_string()],
+            details: json!({"gap": "traceability"}),
+            first_seen_at: now_utc(),
+            last_seen_at: now_utc(),
+            updated_at: now_utc(),
+        };
+        let evidence = FindingEvidence {
+            id: uuid::Uuid::new_v4(),
+            finding_id: finding.id,
+            evidence_type: "repository_snapshot".to_string(),
+            source_kind: "inventory".to_string(),
+            source_ref: "conductor".to_string(),
+            summary: "Conductor repository inventory".to_string(),
+            payload: json!({"repo_key": "conductor"}),
+            collected_at: now_utc(),
+        };
+        let provenance = FindingProvenance {
+            id: uuid::Uuid::new_v4(),
+            finding_id: finding.id,
+            stage: "planning".to_string(),
+            origin: "deterministic".to_string(),
+            component: "conductor.findings".to_string(),
+            detail: "Finding carried into traceability view".to_string(),
+            confidence_score: Some(0.92),
+            payload: json!({"source": "test"}),
+            recorded_at: now_utc(),
+        };
+        service
+            .repository
+            .replace_findings(&[finding.clone()], &[evidence], &[provenance])
+            .await
+            .expect("findings");
+
+        service
+            .repository
+            .replace_service_snapshots(&[ServiceSnapshot {
+                service_key: "conductor".to_string(),
+                display_name: "Conductor".to_string(),
+                kind: "tenant_service".to_string(),
+                role_name: "continuum_tenant_conductor".to_string(),
+                playbooks: vec![],
+                host_targets: vec![],
+                hosts: vec![],
+                namespace: None,
+                service_name: None,
+                deployment_environment: None,
+                internal_url: None,
+                public_url: None,
+                repo_path: Some("/tmp/conductor".to_string()),
+                repo_url: Some("git@github.com:neuralmimicry/conductor.git".to_string()),
+                repo_branch: Some("main".to_string()),
+                health: ServiceHealth::Healthy,
+                capabilities: vec!["orchestration".to_string()],
+                dependencies: vec![],
+                storage_paths: vec![],
+                raw_defaults: json!({}),
+                probe: json!({}),
+                discovered_at: now_utc(),
+                updated_at: now_utc(),
+            }])
+            .await
+            .expect("services");
+        service
+            .repository
+            .replace_repository_snapshots(&[RepositorySnapshot {
+                repo_key: "conductor".to_string(),
+                name: "conductor".to_string(),
+                owner: Some("neuralmimicry".to_string()),
+                repo_url: Some("git@github.com:neuralmimicry/conductor.git".to_string()),
+                local_path: Some("/tmp/conductor".to_string()),
+                default_branch: Some("main".to_string()),
+                current_branch: Some("main".to_string()),
+                language: Some("Rust".to_string()),
+                frameworks: vec!["axum".to_string()],
+                build_systems: vec!["cargo".to_string()],
+                package_managers: vec!["cargo".to_string()],
+                runtime_type: Some("service".to_string()),
+                deployment_type: Some("container".to_string()),
+                purpose: Some("control_plane".to_string()),
+                criticality: "high".to_string(),
+                visibility: Some("private".to_string()),
+                archived: false,
+                linked_services: vec!["conductor".to_string()],
+                dependencies: vec![],
+                capabilities: vec!["orchestration".to_string()],
+                inventory_sources: vec!["local".to_string()],
+                metadata: json!({}),
+                discovered_at: now_utc(),
+                updated_at: now_utc(),
+            }])
+            .await
+            .expect("repositories");
+
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("traceability:conductor".to_string()),
+            title: "Expose validation traceability".to_string(),
+            summary: "Surface evidence, execution, and validation from one endpoint.".to_string(),
+            target_service: Some("conductor".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
+            status: None,
+            priority: None,
+            progress_pct: None,
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec!["traceability".to_string()],
+            plan: json!({
+                "action": "expose_traceability",
+                "finding_id": finding.id.to_string(),
+                "finding_key": finding.finding_key.clone(),
+            }),
+            depends_on: vec![],
+            source: Some("planner".to_string()),
+            scheduled_for: None,
+        });
+        service
+            .repository
+            .upsert_work_item(&item)
+            .await
+            .expect("work item");
+
+        let mut execution = WorkExecution::new(
+            item.id,
+            item.target_service.clone(),
+            item.delivery_stage,
+            item.rollout_strategy,
+        );
+        execution.verification = json!({
+            "passed": true,
+            "independent_validation": {
+                "passed": true,
+                "completeness": "full",
+                "summary": "independent validation passed"
+            }
+        });
+        service
+            .repository
+            .upsert_work_execution(&execution)
+            .await
+            .expect("execution");
+
+        let app = build_router(service);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/work-items/{}/traceability", item.id))
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let finding_id = finding.id.to_string();
+        assert_eq!(
+            payload["traceability"]["finding"]["id"].as_str(),
+            Some(finding_id.as_str())
+        );
+        assert_eq!(
+            payload["traceability"]["target_repository"]["repo_key"].as_str(),
+            Some("conductor")
+        );
+        assert_eq!(
+            payload["traceability"]["independent_validation"]["completeness"].as_str(),
+            Some("full")
+        );
+        assert_eq!(
+            payload["traceability"]["executions"]
+                .as_array()
+                .expect("executions")
                 .len(),
             1
         );

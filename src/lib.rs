@@ -13,3 +13,4 @@ pub mod repository;
 pub mod service;
 pub mod storage;
 pub mod trends;
+pub mod validation;

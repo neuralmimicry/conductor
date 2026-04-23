@@ -362,9 +362,9 @@ Status meanings used below:
 | REQ-117 to REQ-125 | Atlassian integration | Missing | no Jira or Confluence adapter in `conductor` yet |
 | REQ-126 to REQ-132 | Recommendation and planning | Partial | prioritised heuristic work items exist, but not dependency-aware implementation plans at programme level |
 | REQ-133 to REQ-139 | Change generation | Partial | Refiner execution exists, but branch/PR/documentation generation is indirect and weakly modelled |
-| REQ-140 to REQ-146 | Validation | Partial | verification exists and findings now carry explicit evidence/provenance, but independent multi-mode validation is still incomplete |
+| REQ-140 to REQ-146 | Validation | Partial | execution now runs bounded repository-native validation commands and records independent results, but contract, resilience, and performance validation modes are still incomplete |
 | REQ-147 to REQ-157 | Governance, safety, trust | Partial | approval, dry-run, emergency-stop, stage progression, and rollout gates now exist, but permission separation and risk tiers are still under-specified |
-| REQ-158 to REQ-163 | Observability | Partial | stored runs, persistent events, stage/rollout summaries, and DORA aggregates now exist, but self-metrics and end-to-end traceability are still missing |
+| REQ-158 to REQ-163 | Observability | Partial | stored runs, persistent events, stage/rollout summaries, DORA aggregates, and per-work-item traceability now exist, but self-metrics and estate-wide ticket/build correlation are still missing |
 | REQ-164 to REQ-168 | Knowledge model | Partial | findings, evidence, provenance, repositories, services, and runs are now modelled explicitly, but there is still no richer cross-repository graph or long-horizon temporal knowledge model |
 | REQ-169 to REQ-175 | Non-functional requirements | Partial | some modularity and resilience exist; scaling, incremental analysis, and secret protection need more work |
 | REQ-176 to REQ-185 | Acceptance and implementation principles | Partial | evidence-first staging is now materially stronger because work can be traced back to explicit findings, but maturity targets are still not met |
@@ -547,18 +547,19 @@ What exists:
 - Refiner-stage polling
 - simple verification result parsing
 - repo-type-aware suggested verification commands in policy
+- actual execution of bounded repository-native verification commands by `conductor`
+- graceful `unavailable` recording when local runtimes do not contain `cargo`, `python`, or `npm`
 
 Main gaps:
 
-- no actual execution of repository-native verification commands by `conductor`
-- no independent validation separate from the component that proposed the change
 - no contract, resilience, or performance validation mode
 - no benchmark comparison storage
-- no residual-risk recording beyond shallow failure reasons
+- no residual-risk recording beyond command failure reasons and truncated command output
+- no stage-aware validation selection beyond coarse repository-type command discovery
 
 Implication:
 
-`conductor` currently records execution outcomes, but does not yet provide the independent validation model required by the specification.
+`conductor` now has an initial independent validation model, but it is still too narrow to satisfy the full specification for multi-mode, risk-aware validation.
 
 ## 8.10 Governance, safety, and trust gaps
 
@@ -599,29 +600,30 @@ What exists:
 - stored persistent conductor events
 - SSE event stream
 - dashboard stage totals, rollout totals, and DORA summary
+- work-item traceability API linking finding, evidence, provenance, execution history, and latest validation state
 
 Main gaps:
 
 - no metrics about `conductor`'s own loop latency, queue depth, throughput, or failures
-- no traceability graph from finding to change to validation to ticket
+- no estate-wide traceability graph from finding to change to validation to ticket/build/incident
 - no cross-repository knowledge model
 - no temporal relationship history beyond a few row timestamps
 
 Implication:
 
-The current database is an audit log for a narrow workflow, not a knowledge model for estate-wide self-improvement.
+The current database is moving from a narrow audit log toward a usable traceability substrate, but it is not yet a full estate-wide knowledge model.
 
 ## 9. Load-Bearing Risks in the Current Implementation
 
 These are the most important near-term engineering issues observed in the current codebase.
 
-## 9.1 Verification is still not independent
+## 9.1 Verification is only partially independent
 
-Execution verification is still derived mainly from Refiner job result payloads and shallow stage result inspection.
+Execution verification now includes bounded repository-native command execution, but it is still derived mainly from Refiner job result payloads plus a narrow set of local validation commands.
 
 Practical effect:
 
-- the execution chain still proposes, performs, and largely self-reports success
+- the execution chain still relies heavily on the same Refiner result payload that proposed and executed the change
 - changes affecting security, resilience, concurrency, or performance do not yet trigger independent validation modes
 - release promotion remains auditable, but not yet independently trustworthy enough for higher-autonomy modes
 
@@ -647,12 +649,12 @@ Practical effect:
 
 ## 9.4 Observability is still control-room oriented rather than analytical
 
-Conductor now stores events and computes stage/DORA summaries, but it still lacks first-class self-metrics and traceability graphs.
+Conductor now stores events, computes stage/DORA summaries, and exposes per-work-item traceability, but it still lacks first-class self-metrics and estate-wide traceability graphs.
 
 Practical effect:
 
 - operators can see the current state, but cannot yet analyse queue latency, claim contention, or loop throughput rigorously
-- the system still cannot trace an issue cleanly from finding to recommendation to validation to ticket within one model
+- the system can now trace a work item back to its finding and latest validation outcome, but it still cannot correlate that chain to tickets, builds, and incidents within one model
 
 ## 9.5 DORA coverage is local to Conductor execution history
 
@@ -1021,7 +1023,31 @@ Residual Phase 2b work still worth doing:
 - capture rollout-observation evidence from Tracey, Prometheus, and service-native health signals during canary and red/green promotion
 - expose persisted event history, queue latency, and claim contention more directly in the operator UI
 
-This means REQ-066 to REQ-088, REQ-117 to REQ-125, REQ-147 to REQ-163, and REQ-169 to REQ-185 are now better covered in the delivery control plane, but remain partial because independent validation, Atlassian-native lifecycle correlation, and broader runtime evidence are still incomplete.
+This means REQ-066 to REQ-088, REQ-117 to REQ-125, REQ-147 to REQ-163, and REQ-169 to REQ-185 are now better covered in the delivery control plane, but remain partial because advanced validation modes, Atlassian-native lifecycle correlation, and broader runtime evidence are still incomplete.
+
+## 18c. Progress Update: Phase 2c Independent Validation and Traceability
+
+Status as of 2026-04-23:
+
+Phase 2c has now started in the `conductor` repository and is partially delivered.
+
+Delivered in this pass:
+
+- `conductor` now executes bounded repository-native validation commands after Refiner completion when a local repository path and matching toolchain are available
+- missing validation toolchains are recorded as explicit `unavailable` outcomes so slim runtime containers fail gracefully instead of crashing execution
+- validation results are merged into `work_executions.verification` and can fail the execution when `validation.require_success` is enabled
+- dry-run execution previews now show the independent validation plan before any external execution starts
+- real execution payloads now carry independent validation alongside the final Refiner payload for a consistent API shape
+- a new `GET /api/v1/work-items/{id}/traceability` route links planner findings, evidence, provenance, work item state, execution history, and the latest validation outcome
+
+Residual Phase 2c work still worth doing:
+
+- add contract, resilience, security, and performance validation modes rather than relying only on repository-type command discovery
+- correlate traceability records with Jira, Confluence, build, rollout, and incident references
+- store benchmark deltas and residual-risk assessments as first-class validation artefacts
+- expose traceability and validation summaries directly in the dashboard UI
+
+This means REQ-140 to REQ-146 and REQ-158 to REQ-168 are now better covered in execution and API shape, but still remain partial because validation breadth, ticket correlation, and estate-wide knowledge modelling are incomplete.
 
 ## 19. Final Conclusion
 

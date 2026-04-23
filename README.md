@@ -14,6 +14,8 @@ Rust control-plane service for the NeuralMimicry stack. Conductor discovers the 
 - Seeds every new work item into an explicit staged delivery pipeline: `development`, `testing`, `integration`, `integration_testing`, `uat`, then `production`.
 - Uses Gail as an optional planning advisor and stores its response alongside each planning cycle.
 - Carries rollout strategy metadata on work items and executions so release promotion stays explicit and auditable.
+- Runs bounded project-native verification commands after Refiner completes and records missing-toolchain cases as explicit `unavailable` validation outcomes.
+- Exposes a work-item traceability view that joins findings, evidence, provenance, executions, and the latest validation state.
 - Exposes a dashboard for queue visibility, progress updates, approvals, reprioritisation, scheduling, admin overrides, and manual discovery/planning/execution runs.
 - Computes DORA deployment metrics from persisted production-stage execution history and exposes them through the summary API and dashboard.
 - Stores service snapshots, repository snapshots, typed findings, evidence, provenance, discovery runs, metric samples, work items, work executions, planning cycles, and persistent conductor events in Postgres.
@@ -23,6 +25,7 @@ Rust control-plane service for the NeuralMimicry stack. Conductor discovers the 
 - Conductor now executes approved, scheduled, dependency-satisfied work items through Refiner's planning and job APIs.
 - Execution selection now respects `scheduled_for`, uses DB-backed claims to avoid duplicate dispatch, and supports `dry_run` and `emergency_stop` controls.
 - Successful stage verification can auto-promote the work item to the next delivery stage.
+- Independent validation now executes discovered repository-native checks when a local repo path and suitable tooling are available.
 - Production execution is policy-blocked unless the rollout strategy is `canary` or `red_green`.
 - Conductor still does not mutate repositories directly; Refiner remains the only code-change executor.
 - Gail is used as an advisory planner, not as the sole orchestration source of truth.
@@ -68,6 +71,7 @@ Read APIs are protected by default. Set `allow_dashboard_without_token` to `true
 - `PATCH /api/v1/work-items/{id}`
 - `GET /api/v1/executions`
 - `GET /api/v1/work-items/{id}/executions`
+- `GET /api/v1/work-items/{id}/traceability`
 - `POST /api/v1/execution/run`
 - `POST /api/v1/work-items/{id}/execute`
 - `POST /api/v1/discovery/run`

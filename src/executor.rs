@@ -13,6 +13,7 @@ use crate::{
     },
     policy::{evaluate_work_item, policy_evaluation_to_value},
     repository::ConductorRepository,
+    validation::{failure_reasons, preview_independent_validation, run_independent_validation},
 };
 
 pub type ExecutionEventCallback = Arc<dyn Fn(ConductorEvent) + Send + Sync>;
@@ -549,8 +550,40 @@ async fn dispatch_claimed_work_item_inner(
             json!(current_rollout.as_str()),
         );
     }
+    let independent_validation = run_independent_validation(
+        &config.validation,
+        target_service,
+        &policy.required_verifications,
+    )
+    .await;
+    merge_independent_validation(
+        &mut verification,
+        &independent_validation,
+        config.validation.require_success,
+    );
+    item.notes.push(format!(
+        "{} {}",
+        crate::models::now_utc().to_rfc3339(),
+        independent_validation.summary
+    ));
+    emit_execution_event(
+        event_callback,
+        "execution.independent_validation",
+        format!("independent validation completed for {}", item.title),
+        Some(item),
+        Some(&execution),
+        Some(if independent_validation.passed {
+            "success"
+        } else {
+            "failure"
+        }),
+        serde_json::to_value(&independent_validation).unwrap_or_else(|_| json!({})),
+    );
     execution.verification = verification.clone();
-    execution.latest_payload = terminal.clone();
+    execution.latest_payload = attach_independent_validation_payload(
+        terminal.clone(),
+        serde_json::to_value(&independent_validation).unwrap_or_else(|_| json!({})),
+    );
 
     let verification_passed = verification
         .get("passed")
@@ -746,16 +779,23 @@ async fn preview_work_item_execution(
 
     let prompt = build_refiner_prompt(&item, target_service, &policy);
     let preview_payload = build_job_payload(config, &item, target_service, &json!({}))?;
+    let independent_validation = preview_independent_validation(
+        &config.validation,
+        target_service,
+        &policy.required_verifications,
+    );
     execution.request_payload = preview_payload.clone();
     execution.latest_payload = json!({
         "mode": "dry_run",
         "prompt": prompt,
         "job_payload": preview_payload,
+        "independent_validation": independent_validation,
     });
     execution.verification = json!({
         "passed": false,
         "mode": "dry_run",
         "reason": "execution.dry_run is enabled",
+        "independent_validation": execution.latest_payload.get("independent_validation").cloned().unwrap_or_else(|| json!({})),
     });
     execution.mark_status(ExecutionStatus::Cancelled);
     item.notes.push(format!(
@@ -1208,6 +1248,50 @@ fn verify_refiner_result(detail: &Value) -> Value {
     })
 }
 
+fn merge_independent_validation(
+    verification: &mut Value,
+    report: &crate::validation::IndependentValidationReport,
+    require_success: bool,
+) {
+    let payload = serde_json::to_value(report).unwrap_or_else(|_| json!({}));
+    let failure_reasons = failure_reasons(report);
+    if let Some(object) = verification.as_object_mut() {
+        object.insert("independent_validation".to_string(), payload);
+        object.insert(
+            "independent_validation_enforced".to_string(),
+            json!(require_success),
+        );
+        if require_success && !report.passed {
+            object.insert("passed".to_string(), json!(false));
+            let reasons = object
+                .entry("reasons".to_string())
+                .or_insert_with(|| json!([]));
+            if let Some(items) = reasons.as_array_mut() {
+                if failure_reasons.is_empty() {
+                    items.push(json!(report.summary.clone()));
+                } else {
+                    for reason in failure_reasons {
+                        items.push(json!(reason));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn attach_independent_validation_payload(payload: Value, report: Value) -> Value {
+    match payload {
+        Value::Object(mut object) => {
+            object.insert("independent_validation".to_string(), report);
+            Value::Object(object)
+        }
+        other => json!({
+            "refiner_result": other,
+            "independent_validation": report,
+        }),
+    }
+}
+
 fn collect_verification_findings(prefix: String, value: &Value, findings: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
@@ -1308,6 +1392,7 @@ mod tests {
         config::ConductorConfig,
         models::{DeliveryStage, NewWorkItem, ServiceHealth},
         storage::memory::MemoryRepository,
+        validation::{IndependentValidationReport, ValidationCommandResult},
     };
     use chrono::Duration as ChronoDuration;
     use std::sync::Arc;
@@ -1439,6 +1524,54 @@ mod tests {
             ]
         }));
         assert_eq!(report.get("passed").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn merge_independent_validation_marks_verification_failed_when_enforced() {
+        let mut verification = json!({
+            "passed": true,
+            "reasons": [],
+        });
+        let report = IndependentValidationReport {
+            enabled: true,
+            enforced: true,
+            passed: false,
+            completeness: "full".to_string(),
+            repo_path: Some("/tmp/conductor".to_string()),
+            required_checks: vec!["cargo test".to_string()],
+            planned_commands: vec!["cargo test".to_string()],
+            commands: vec![ValidationCommandResult {
+                command: "cargo test".to_string(),
+                status: "failed".to_string(),
+                exit_code: Some(1),
+                duration_ms: 42,
+                stdout_excerpt: None,
+                stderr_excerpt: Some("failure".to_string()),
+                reason: Some("cargo test exited with status 1".to_string()),
+            }],
+            summary: "independent validation failed".to_string(),
+        };
+
+        merge_independent_validation(&mut verification, &report, true);
+
+        assert_eq!(
+            verification.get("passed").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            verification
+                .get("independent_validation_enforced")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            verification
+                .get("reasons")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items
+                    .iter()
+                    .any(|item| item == "cargo test exited with status 1"))
+        );
     }
 
     #[tokio::test]
@@ -1673,6 +1806,18 @@ mod tests {
                 .get("dry_run")
                 .and_then(Value::as_bool),
             Some(true)
+        );
+        assert!(
+            execution
+                .latest_payload
+                .get("independent_validation")
+                .is_some()
+        );
+        assert!(
+            execution
+                .verification
+                .get("independent_validation")
+                .is_some()
         );
     }
 

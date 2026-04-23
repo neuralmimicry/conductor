@@ -48,6 +48,14 @@ Important delivery controls in `config/conductor.yaml`:
 - `delivery.production_canary_percentage`: percentage written into canary rollout payloads sent to Refiner.
 - `delivery.dora_window_days`: rolling window used for DORA metrics in the summary API and dashboard.
 
+Important validation controls in `config/conductor.yaml`:
+
+- `validation.enabled`: turns post-Refiner independent validation on or off.
+- `validation.require_success`: fails the execution when independent validation reports a failed or timed-out command.
+- `validation.allow_missing_tooling`: records missing local toolchains as `unavailable` instead of failing immediately.
+- `validation.timeout_seconds`: per-command timeout for local validation commands.
+- `validation.max_commands`: upper bound on discovered project-native validation commands per execution.
+
 ## Running Locally
 
 ```bash
@@ -76,6 +84,7 @@ docker run --rm -p 8091:8091 \
 7. Use `execution.dry_run` for preview-only validation and `execution.emergency_stop` for immediate execution halt.
 8. Promote work through `development`, `testing`, `integration`, `integration_testing`, `uat`, and `production` instead of treating execution as a single undifferentiated step.
 9. Keep production work on `canary` or `red_green`; `direct` production rollout is blocked by policy.
+10. Use `GET /api/v1/work-items/{id}/traceability` when you need the finding, evidence, execution, and validation chain in one response.
 
 ## Failure Modes
 
@@ -107,6 +116,9 @@ curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
 
 curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
   http://127.0.0.1:8091/api/v1/work-items | jq '.work_items[] | {title, delivery_stage, rollout_strategy, validated_stages, status}'
+
+curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
+  http://127.0.0.1:8091/api/v1/work-items/${WORK_ITEM_ID}/traceability | jq '.traceability | {work_item: .work_item.title, finding: .finding.finding_key, independent_validation: .independent_validation}'
 ```
 
 ## Safe Extension Path

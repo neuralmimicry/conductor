@@ -20,7 +20,8 @@ use crate::{
     models::{
         ConductorEvent, DashboardSummary, DeliveryStage, DiscoveryRun, DoraMetricsSummary,
         FindingEvidence, FindingProvenance, FindingRecord, ImprovementCycle, RepositorySnapshot,
-        WorkExecution, WorkItem, WorkStatus, now_utc, topology_from_services,
+        ServiceSnapshot, WorkExecution, WorkItem, WorkItemTraceability, WorkStatus, now_utc,
+        topology_from_services,
     },
     planner::run_planning_cycle,
     repository::ConductorRepository,
@@ -221,6 +222,61 @@ impl ConductorService {
         self.repository
             .list_work_executions_for_item(work_item_id, limit)
             .await
+    }
+
+    pub async fn work_item_traceability(
+        &self,
+        work_item_id: Uuid,
+    ) -> Result<Option<WorkItemTraceability>> {
+        let Some(work_item) = self.repository.get_work_item(work_item_id).await? else {
+            return Ok(None);
+        };
+        let services = self.repository.list_service_snapshots().await?;
+        let repositories = self.repository.list_repository_snapshots().await?;
+        let findings = self.repository.list_findings().await?;
+        let mut executions = self
+            .repository
+            .list_work_executions_for_item(work_item_id, 100)
+            .await?;
+        executions.sort_by_key(execution_sort_key);
+        executions.reverse();
+
+        let finding = traceability_finding(&work_item, &findings);
+        let evidence = if let Some(finding) = &finding {
+            self.repository.list_finding_evidence(finding.id).await?
+        } else {
+            Vec::new()
+        };
+        let provenance = if let Some(finding) = &finding {
+            self.repository.list_finding_provenance(finding.id).await?
+        } else {
+            Vec::new()
+        };
+        let target_service = traceability_service(&work_item, &services);
+        let target_repository =
+            traceability_repository(&finding, target_service.as_ref(), &repositories);
+        let latest_execution = executions.first().cloned();
+        let latest_verification = latest_execution
+            .as_ref()
+            .map(|execution| execution.verification.clone())
+            .unwrap_or_else(|| json!({}));
+        let independent_validation = latest_execution
+            .as_ref()
+            .and_then(traceability_independent_validation)
+            .unwrap_or_else(|| json!({}));
+
+        Ok(Some(WorkItemTraceability {
+            work_item,
+            finding,
+            target_service,
+            target_repository,
+            evidence,
+            provenance,
+            executions,
+            latest_execution,
+            latest_verification,
+            independent_validation,
+        }))
     }
 
     pub async fn run_execution_cycle(&self) -> Result<Vec<WorkExecution>> {
@@ -594,6 +650,94 @@ pub fn spawn_background_loops(service: ConductorService) {
             }
         }
     });
+}
+
+fn traceability_finding(work_item: &WorkItem, findings: &[FindingRecord]) -> Option<FindingRecord> {
+    let finding_id = work_item
+        .plan
+        .get("finding_id")
+        .and_then(|value| value.as_str())
+        .and_then(|value| Uuid::parse_str(value).ok());
+    let finding_key = work_item
+        .plan
+        .get("finding_key")
+        .and_then(|value| value.as_str());
+
+    findings
+        .iter()
+        .find(|finding| {
+            finding_id.is_some_and(|id| finding.id == id)
+                || finding_key.is_some_and(|key| finding.finding_key == key)
+        })
+        .cloned()
+}
+
+fn traceability_service(
+    work_item: &WorkItem,
+    services: &[ServiceSnapshot],
+) -> Option<ServiceSnapshot> {
+    work_item
+        .target_service
+        .as_deref()
+        .and_then(|target| {
+            services
+                .iter()
+                .find(|service| service.service_key == target)
+        })
+        .cloned()
+}
+
+fn traceability_repository(
+    finding: &Option<FindingRecord>,
+    service: Option<&ServiceSnapshot>,
+    repositories: &[RepositorySnapshot],
+) -> Option<RepositorySnapshot> {
+    if let Some(repository_key) = finding
+        .as_ref()
+        .and_then(|finding| finding.target_repository.as_deref())
+    {
+        if let Some(repository) = repositories
+            .iter()
+            .find(|repository| repository.repo_key == repository_key)
+        {
+            return Some(repository.clone());
+        }
+    }
+
+    let Some(service) = service else {
+        return None;
+    };
+
+    if let Some(repo_path) = service.repo_path.as_deref() {
+        if let Some(repository) = repositories
+            .iter()
+            .find(|repository| repository.local_path.as_deref() == Some(repo_path))
+        {
+            return Some(repository.clone());
+        }
+    }
+
+    repositories
+        .iter()
+        .find(|repository| repository.linked_services.contains(&service.service_key))
+        .cloned()
+}
+
+fn traceability_independent_validation(execution: &WorkExecution) -> Option<serde_json::Value> {
+    execution
+        .verification
+        .get("independent_validation")
+        .cloned()
+        .or_else(|| {
+            execution
+                .latest_payload
+                .get("independent_validation")
+                .cloned()
+        })
+}
+
+fn execution_sort_key(execution: &WorkExecution) -> chrono::DateTime<chrono::Utc> {
+    execution.finished_at.unwrap_or(execution.updated_at)
 }
 
 #[cfg(test)]
