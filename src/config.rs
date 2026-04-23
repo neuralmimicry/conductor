@@ -15,6 +15,7 @@ pub struct ConductorConfig {
     pub storage: StorageConfig,
     pub database: DatabaseConfig,
     pub discovery: DiscoveryConfig,
+    pub delivery: DeliveryConfig,
     pub integrations: IntegrationsConfig,
     pub planning: PlanningConfig,
     pub execution: ExecutionConfig,
@@ -97,6 +98,15 @@ pub struct IntegrationsConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+pub struct DeliveryConfig {
+    pub auto_advance: bool,
+    pub dora_window_days: i64,
+    pub require_uat_before_production: bool,
+    pub production_canary_percentage: u8,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ExternalServiceConfig {
     pub enabled: bool,
     pub base_url: Option<String>,
@@ -156,6 +166,7 @@ impl Default for ConductorConfig {
             storage: StorageConfig::default(),
             database: DatabaseConfig::default(),
             discovery: DiscoveryConfig::default(),
+            delivery: DeliveryConfig::default(),
             integrations: IntegrationsConfig::default(),
             planning: PlanningConfig::default(),
             execution: ExecutionConfig::default(),
@@ -250,6 +261,17 @@ impl Default for IntegrationsConfig {
             refiner: ExternalServiceConfig::default(),
             aarnn: ExternalServiceConfig::default(),
             ollama: ExternalServiceConfig::default(),
+        }
+    }
+}
+
+impl Default for DeliveryConfig {
+    fn default() -> Self {
+        Self {
+            auto_advance: true,
+            dora_window_days: 30,
+            require_uat_before_production: true,
+            production_canary_percentage: 10,
         }
     }
 }
@@ -352,6 +374,14 @@ impl ConductorConfig {
             self.discovery.local_repo_root =
                 PathBuf::from("/home/pbisaacs/Developer/neuralmimicry");
         }
+        if self.delivery.dora_window_days <= 0 {
+            self.delivery.dora_window_days = 30;
+        }
+        if self.delivery.production_canary_percentage == 0 {
+            self.delivery.production_canary_percentage = 10;
+        }
+        self.delivery.production_canary_percentage =
+            self.delivery.production_canary_percentage.clamp(1, 100);
         if self.planning.refresh_interval_seconds == 0 {
             self.planning.refresh_interval_seconds = 240;
         }

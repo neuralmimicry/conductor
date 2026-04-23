@@ -1056,7 +1056,7 @@ fn extract_i64(value: &Value, key: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ServiceHealth, now_utc};
+    use crate::models::{DeliveryStage, ServiceHealth, now_utc};
 
     fn base_service(service_key: &str) -> ServiceSnapshot {
         ServiceSnapshot {
@@ -1069,6 +1069,7 @@ mod tests {
             hosts: vec!["rk1".to_string()],
             namespace: Some(service_key.to_string()),
             service_name: Some(service_key.to_string()),
+            deployment_environment: Some(DeliveryStage::Production),
             internal_url: Some(format!(
                 "http://{}.{}.svc.cluster.local:8080",
                 service_key, service_key

@@ -41,6 +41,13 @@ Important execution controls in `config/conductor.yaml`:
 - `execution.claim_ttl_seconds`: expiry for short-lived dispatch claims used to avoid duplicate multi-instance execution starts.
 - `execution.instance_id`: stable identifier written into dispatch claims and events.
 
+Important delivery controls in `config/conductor.yaml`:
+
+- `delivery.auto_advance`: automatically promotes a successfully verified work item to the next stage.
+- `delivery.require_uat_before_production`: keeps production gated behind validated UAT unless explicitly relaxed.
+- `delivery.production_canary_percentage`: percentage written into canary rollout payloads sent to Refiner.
+- `delivery.dora_window_days`: rolling window used for DORA metrics in the summary API and dashboard.
+
 ## Running Locally
 
 ```bash
@@ -67,6 +74,8 @@ docker run --rm -p 8091:8091 \
 5. Review typed findings through the API before approving or reprioritising downstream work.
 6. Reprioritize, schedule, or override planner-generated work items.
 7. Use `execution.dry_run` for preview-only validation and `execution.emergency_stop` for immediate execution halt.
+8. Promote work through `development`, `testing`, `integration`, `integration_testing`, `uat`, and `production` instead of treating execution as a single undifferentiated step.
+9. Keep production work on `canary` or `red_green`; `direct` production rollout is blocked by policy.
 
 ## Failure Modes
 
@@ -85,6 +94,19 @@ Run these checks before shipping changes:
 cargo fmt
 cargo check
 cargo test
+```
+
+For a live local verification after startup:
+
+```bash
+curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
+  http://127.0.0.1:8091/api/v1/summary | jq '.delivery_stage_totals, .rollout_strategy_totals, .dora_metrics'
+
+curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
+  http://127.0.0.1:8091/api/v1/services | jq '.services[] | {service_key, deployment_environment, health}'
+
+curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
+  http://127.0.0.1:8091/api/v1/work-items | jq '.work_items[] | {title, delivery_stage, rollout_strategy, validated_stages, status}'
 ```
 
 ## Safe Extension Path

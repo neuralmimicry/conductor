@@ -6,7 +6,10 @@ use serde_json::{Value, json};
 use crate::{
     findings::{DetectedFinding, detect_findings},
     integrations::gail_plan_summary,
-    models::{ImprovementCycle, NewWorkItem, RunStatus, WorkItem, WorkStatus, now_utc},
+    models::{
+        DeliveryStage, ImprovementCycle, NewWorkItem, RolloutStrategy, RunStatus, WorkItem,
+        WorkStatus, now_utc,
+    },
     repository::ConductorRepository,
     trends::summarize_trends,
 };
@@ -19,6 +22,8 @@ pub struct ImprovementRecommendation {
     pub title: String,
     pub summary: String,
     pub target_service: Option<String>,
+    pub delivery_stage: DeliveryStage,
+    pub rollout_strategy: RolloutStrategy,
     pub priority: i32,
     pub tags: Vec<String>,
     pub plan: Value,
@@ -177,6 +182,8 @@ fn derive_recommendations(
                 title: item.recommendation.title.clone(),
                 summary: item.recommendation.summary.clone(),
                 target_service: item.recommendation.target_service.clone(),
+                delivery_stage: DeliveryStage::Development,
+                rollout_strategy: RolloutStrategy::default_for_stage(DeliveryStage::Development),
                 priority: item.recommendation.priority,
                 tags: item.recommendation.tags.clone(),
                 plan,
@@ -229,6 +236,8 @@ async fn upsert_recommendation(
                     title: Some(recommendation.title.clone()),
                     summary: Some(recommendation.summary.clone()),
                     target_service: recommendation.target_service.clone(),
+                    delivery_stage: Some(recommendation.delivery_stage),
+                    rollout_strategy: Some(recommendation.rollout_strategy),
                     priority: Some(recommendation.priority),
                     tags: Some(recommendation.tags.clone()),
                     plan: Some(recommendation.plan.clone()),
@@ -246,6 +255,9 @@ async fn upsert_recommendation(
         title: recommendation.title.clone(),
         summary: recommendation.summary.clone(),
         target_service: recommendation.target_service.clone(),
+        delivery_stage: Some(recommendation.delivery_stage),
+        validated_stages: Vec::new(),
+        rollout_strategy: Some(recommendation.rollout_strategy),
         status: Some(WorkStatus::Planned),
         priority: Some(recommendation.priority),
         progress_pct: Some(0),
@@ -269,6 +281,8 @@ fn recommendation_to_value(recommendation: &ImprovementRecommendation) -> Value 
         "title": recommendation.title,
         "summary": recommendation.summary,
         "target_service": recommendation.target_service,
+        "delivery_stage": recommendation.delivery_stage.as_str(),
+        "rollout_strategy": recommendation.rollout_strategy.as_str(),
         "priority": recommendation.priority,
         "tags": recommendation.tags,
         "plan": recommendation.plan,
@@ -291,7 +305,7 @@ mod tests {
     use super::*;
     use crate::{
         findings::detect_findings,
-        models::{ServiceHealth, ServiceSnapshot, ServiceTrendSummary},
+        models::{DeliveryStage, ServiceHealth, ServiceSnapshot, ServiceTrendSummary},
     };
 
     #[test]
@@ -306,6 +320,7 @@ mod tests {
             hosts: vec!["rk1".to_string()],
             namespace: Some("gail".to_string()),
             service_name: Some("gail".to_string()),
+            deployment_environment: Some(DeliveryStage::Production),
             internal_url: Some("http://gail.gail.svc.cluster.local:8080".to_string()),
             public_url: Some("https://gail.neuralmimicry.ai".to_string()),
             repo_path: Some("/tmp/gail".to_string()),
@@ -342,6 +357,7 @@ mod tests {
             hosts: vec!["rk1".to_string()],
             namespace: Some("gail".to_string()),
             service_name: Some("gail".to_string()),
+            deployment_environment: Some(DeliveryStage::Production),
             internal_url: Some("http://gail.gail.svc.cluster.local:8080".to_string()),
             public_url: Some("https://gail.neuralmimicry.ai".to_string()),
             repo_path: None,
@@ -381,6 +397,7 @@ mod tests {
             hosts: vec!["qc01".to_string()],
             namespace: None,
             service_name: None,
+            deployment_environment: Some(DeliveryStage::Production),
             internal_url: None,
             public_url: None,
             repo_path: Some("/tmp/tracey".to_string()),

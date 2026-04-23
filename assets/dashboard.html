@@ -78,6 +78,7 @@
     .row-actions { display: grid; gap: 8px; }
     .cycle { padding: 14px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
     .cycle:last-child { border-bottom: 0; }
+    .stack { display: grid; gap: 6px; }
     @media (max-width: 1100px) { .hero, .grid, .cards { grid-template-columns: 1fr; } }
   </style>
 </head>
@@ -116,7 +117,7 @@
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Work</th><th>Status</th><th>Priority</th><th>Progress</th><th>Schedule</th><th>Target</th><th>Execution</th><th>Admin</th></tr></thead>
+          <thead><tr><th>Work</th><th>Status</th><th>Stage</th><th>Rollout</th><th>Priority</th><th>Progress</th><th>Schedule</th><th>Target</th><th>Execution</th><th>Admin</th></tr></thead>
           <tbody id="work-items"></tbody>
         </table>
       </div>
@@ -130,7 +131,7 @@
     <div class="section-head"><h2 class="section-title">Service Topology</h2></div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Service</th><th>Health</th><th>Endpoints</th><th>Dependencies</th><th>Capabilities</th></tr></thead>
+        <thead><tr><th>Service</th><th>Health</th><th>Environment</th><th>Endpoints</th><th>Dependencies</th><th>Capabilities</th></tr></thead>
         <tbody id="services"></tbody>
       </table>
     </div>
@@ -210,12 +211,32 @@ function connectEventStream() {
   };
 }
 function toneForHealth(health) { if (health === 'healthy') return 'var(--ok)'; if (health === 'degraded') return 'var(--warn)'; if (health === 'unreachable' || health === 'missing') return 'var(--bad)'; return 'var(--muted)'; }
+function formatCounts(map) {
+  return Object.entries(map || {}).filter(([, value]) => value > 0).map(([key, value]) => `${key}: ${value}`).join(' · ') || 'none';
+}
+function formatHours(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return 'n/a';
+  return `${Number(value).toFixed(1)}h`;
+}
 function renderSummary(summary) {
-  const cards = [['Services', summary.services_total, `${summary.services_healthy} healthy`], ['Degraded', summary.services_degraded, `${summary.services_unreachable} unreachable`], ['Queue', summary.work_items_total, `${summary.approvals_waiting} approvals waiting · ${summary.executions_running} running`], ['Cycles', summary.cycles_total, summary.latest_cycle ? summary.latest_cycle.summary : 'no cycles yet']];
+  const dora = summary.dora_metrics || {};
+  const criticalFindings = (summary.findings_by_severity?.critical || 0) + (summary.findings_by_severity?.high || 0);
+  const stagedItems = Object.values(summary.delivery_stage_totals || {}).reduce((total, value) => total + value, 0);
+  const cards = [
+    ['Services', summary.services_total, `${summary.services_healthy} healthy · ${summary.services_unreachable} unreachable`],
+    ['Findings', summary.findings_total, `${criticalFindings} high/critical · ${formatCounts(summary.findings_by_severity)}`],
+    ['Queue', summary.work_items_total, `${summary.approvals_waiting} approvals waiting · ${summary.executions_running} running`],
+    ['Promotions', stagedItems, `${formatCounts(summary.delivery_stage_totals)} · ${formatCounts(summary.rollout_strategy_totals)}`],
+    ['Prod Deploys', dora.successful_production_deployments ?? 0, `${dora.attempted_production_deployments ?? 0} attempts in ${dora.window_days ?? 0}d`],
+    ['Deploy Freq', (dora.deployment_frequency_per_day ?? 0).toFixed(2), 'successful prod deploys / day'],
+    ['Lead Time', formatHours(dora.lead_time_hours_median ?? dora.lead_time_hours_average), `median · avg ${formatHours(dora.lead_time_hours_average)}`],
+    ['Change Failure', `${(dora.change_failure_rate_pct ?? 0).toFixed(1)}%`, `MTTR ${formatHours(dora.mean_time_to_restore_hours)}`],
+    ['Cycles', summary.cycles_total, summary.latest_cycle ? summary.latest_cycle.summary : 'no cycles yet'],
+  ];
   els.summaryCards.innerHTML = cards.map(([label, metric, detail]) => `<article class="card"><div class="label">${label}</div><div class="metric">${metric}</div><div class="muted">${detail}</div></article>`).join('');
 }
 function renderServices(services) {
-  els.services.innerHTML = services.map((service) => `<tr><td><strong>${service.display_name}</strong><br><span class="muted">${service.kind}</span><br><span class="mono">${service.role_name}</span></td><td><span class="pill" style="color:${toneForHealth(service.health)}; border-color:${toneForHealth(service.health)}33; background:${toneForHealth(service.health)}18;">${service.health}</span></td><td class="mono">${service.public_url ? `public: ${service.public_url}<br>` : ''}${service.internal_url ? `internal: ${service.internal_url}<br>` : ''}${service.repo_path ? `repo: ${service.repo_path}` : '<span class="muted">no repo hint</span>'}</td><td>${(service.dependencies || []).map((item) => `<span class="pill">${item}</span>`).join('') || '<span class="muted">none</span>'}</td><td>${(service.capabilities || []).map((item) => `<span class="pill">${item}</span>`).join('')}</td></tr>`).join('');
+  els.services.innerHTML = services.map((service) => `<tr><td><strong>${service.display_name}</strong><br><span class="muted">${service.kind}</span><br><span class="mono">${service.role_name}</span></td><td><span class="pill" style="color:${toneForHealth(service.health)}; border-color:${toneForHealth(service.health)}33; background:${toneForHealth(service.health)}18;">${service.health}</span></td><td>${service.deployment_environment ? `<span class="pill">${service.deployment_environment}</span>` : '<span class="muted">unknown</span>'}</td><td class="mono">${service.public_url ? `public: ${service.public_url}<br>` : ''}${service.internal_url ? `internal: ${service.internal_url}<br>` : ''}${service.repo_path ? `repo: ${service.repo_path}` : '<span class="muted">no repo hint</span>'}</td><td>${(service.dependencies || []).map((item) => `<span class="pill">${item}</span>`).join('') || '<span class="muted">none</span>'}</td><td>${(service.capabilities || []).map((item) => `<span class="pill">${item}</span>`).join('')}</td></tr>`).join('');
 }
 function renderCycles(cycles) {
   els.cycles.innerHTML = cycles.map((cycle) => `<div class="cycle"><div><strong>${cycle.summary}</strong></div><div class="muted">${new Date(cycle.finished_at).toLocaleString()} · ${cycle.status}</div><div>${(cycle.source_services || []).map((item) => `<span class="pill">${item}</span>`).join('')}</div>${cycle.gail_response ? `<details><summary>Gail advisory</summary><pre class="mono">${JSON.stringify(cycle.gail_response, null, 2)}</pre></details>` : ''}</div>`).join('') || '<div class="muted">No improvement cycles recorded yet.</div>';
@@ -229,7 +250,9 @@ function toDateTimeLocal(value) {
 }
 function renderWorkItems(items) {
   const statuses = ['planned', 'scheduled', 'in_operation', 'success', 'failure', 'aborted', 'on_hold'];
-  els.workItems.innerHTML = items.map((item) => `<tr><td><strong>${item.title}</strong><br><div class="muted">${item.summary}</div><div>${(item.tags || []).map((tag) => `<span class="pill">${tag}</span>`).join('')}</div>${(item.depends_on || []).length ? `<div class="muted mono">depends_on: ${(item.depends_on || []).join(', ')}</div>` : ''}</td><td><select data-field="status" data-id="${item.id}">${statuses.map((status) => `<option value="${status}" ${status === item.status ? 'selected' : ''}>${status}</option>`).join('')}</select></td><td><input type="number" data-field="priority" data-id="${item.id}" value="${item.priority}" /></td><td><input type="number" data-field="progress_pct" data-id="${item.id}" min="0" max="100" value="${item.progress_pct}" /></td><td><input type="datetime-local" data-field="scheduled_for" data-id="${item.id}" value="${toDateTimeLocal(item.scheduled_for)}" /></td><td>${item.target_service || '<span class="muted">none</span>'}</td><td><div class="row-actions"><label><input type="checkbox" data-field="execution_approved" data-id="${item.id}" ${item.execution_approved ? 'checked' : ''} /> execution approved</label><label><input type="checkbox" data-field="verification_required" data-id="${item.id}" ${item.verification_required ? 'checked' : ''} /> verification required</label><input data-field="depends_on" data-id="${item.id}" value="${(item.depends_on || []).join(', ')}" placeholder="comma-separated dependency ids or dedupe keys" />${item.last_execution_id ? `<div class="muted mono">last execution: ${item.last_execution_id}</div>` : '<div class="muted">no execution yet</div>'}<button class="secondary" data-action="execute" data-id="${item.id}">Execute</button></div></td><td><div class="row-actions"><label><input type="checkbox" data-field="admin_override" data-id="${item.id}" ${item.admin_override ? 'checked' : ''} /> admin override</label><textarea data-field="note" data-id="${item.id}" placeholder="append note"></textarea><button class="secondary" data-action="save" data-id="${item.id}">Save</button></div></td></tr>`).join('');
+  const stages = ['development', 'testing', 'integration', 'integration_testing', 'uat', 'production'];
+  const rolloutStrategies = ['direct', 'canary', 'red_green'];
+  els.workItems.innerHTML = items.map((item) => `<tr><td><strong>${item.title}</strong><br><div class="muted">${item.summary}</div><div>${(item.tags || []).map((tag) => `<span class="pill">${tag}</span>`).join('')}</div><div>${(item.validated_stages || []).map((stage) => `<span class="pill">${stage}</span>`).join('') || '<span class="muted">no validated stages yet</span>'}</div>${(item.depends_on || []).length ? `<div class="muted mono">depends_on: ${(item.depends_on || []).join(', ')}</div>` : ''}</td><td><select data-field="status" data-id="${item.id}">${statuses.map((status) => `<option value="${status}" ${status === item.status ? 'selected' : ''}>${status}</option>`).join('')}</select></td><td><div class="stack"><select data-field="delivery_stage" data-id="${item.id}">${stages.map((stage) => `<option value="${stage}" ${stage === item.delivery_stage ? 'selected' : ''}>${stage}</option>`).join('')}</select><div class="muted">validated ${(item.validated_stages || []).length}/${stages.length}</div></div></td><td><select data-field="rollout_strategy" data-id="${item.id}">${rolloutStrategies.map((strategy) => `<option value="${strategy}" ${strategy === item.rollout_strategy ? 'selected' : ''}>${strategy}</option>`).join('')}</select></td><td><input type="number" data-field="priority" data-id="${item.id}" value="${item.priority}" /></td><td><input type="number" data-field="progress_pct" data-id="${item.id}" min="0" max="100" value="${item.progress_pct}" /></td><td><input type="datetime-local" data-field="scheduled_for" data-id="${item.id}" value="${toDateTimeLocal(item.scheduled_for)}" /></td><td>${item.target_service || '<span class="muted">none</span>'}</td><td><div class="row-actions"><label><input type="checkbox" data-field="execution_approved" data-id="${item.id}" ${item.execution_approved ? 'checked' : ''} /> execution approved</label><label><input type="checkbox" data-field="verification_required" data-id="${item.id}" ${item.verification_required ? 'checked' : ''} /> verification required</label><input data-field="depends_on" data-id="${item.id}" value="${(item.depends_on || []).join(', ')}" placeholder="comma-separated dependency ids or dedupe keys" />${item.last_execution_id ? `<div class="muted mono">last execution: ${item.last_execution_id}</div>` : '<div class="muted">no execution yet</div>'}<button class="secondary" data-action="execute" data-id="${item.id}">Execute</button></div></td><td><div class="row-actions"><label><input type="checkbox" data-field="admin_override" data-id="${item.id}" ${item.admin_override ? 'checked' : ''} /> admin override</label><textarea data-field="note" data-id="${item.id}" placeholder="append note"></textarea><button class="secondary" data-action="save" data-id="${item.id}">Save</button></div></td></tr>`).join('');
   els.workItems.querySelectorAll('button[data-action="save"]').forEach((button) => {
     button.addEventListener('click', async () => {
       const id = button.dataset.id; const values = {};

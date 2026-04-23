@@ -9,25 +9,29 @@ The main loops are:
 1. Discovery loop
    - Reads Ansible playbooks, role defaults, host vars, group vars, and inventory groups.
    - Scans the mounted local repository estate and optionally enriches it from the GitHub organisation API.
-   - Produces service snapshots with endpoints, dependencies, capabilities, storage hints, resolved host targets, and repository associations.
+   - Produces service snapshots with endpoints, dependencies, capabilities, storage hints, resolved host targets, repository associations, and inferred deployment environments.
    - Produces repository snapshots with SCM metadata, runtime/deployment classification, linked services, and inventory provenance.
    - Probes the live control surfaces and records the resulting health.
 2. Planning loop
    - Consumes the latest service snapshots, repository snapshots, and metric trends.
    - Derives typed findings with explicit evidence and provenance.
    - Converts those findings into improvement recommendations for reliability, storage durability, scaling, integration gaps, performance pressure, and repository quality gaps.
+   - Seeds new work items at the `development` stage with explicit rollout metadata.
    - Optionally asks Gail for an advisory summary.
    - Upserts work items unless `planning.auto_queue` is disabled.
 3. Admin loop
-   - Lets operators change status, priority, progress, schedule, and admin override state.
+   - Lets operators change status, delivery stage, rollout strategy, priority, progress, schedule, and admin override state.
    - Supports manual discovery, planning, execution-cycle, and per-item execution triggers.
 4. Execution loop
    - Claims due scheduled work items through Postgres-backed coordination.
    - Respects `scheduled_for` and instance-safe dispatch leases.
-   - Evaluates policy gates.
+   - Evaluates policy gates, including stage prerequisites and production rollout restrictions.
    - Supports `dry_run` preview mode and `emergency_stop` execution halts.
    - Submits approved work into Refiner's planning and job APIs.
-   - Polls execution status and stores verification results.
+   - Polls execution status, stores verification results, and can auto-promote the work item after successful validation.
+5. Summary loop
+   - Aggregates stage totals, rollout totals, and DORA metrics from persisted work-item and production-execution history.
+   - Feeds the dashboard and summary API with current estate and delivery posture data.
 
 ## Core Modules
 
@@ -45,13 +49,15 @@ The main loops are:
   - Attaches evidence and provenance records that keep deterministic reasoning visible.
 - `src/planner.rs`
   - Persists typed findings and converts them into prioritized work items and dependency edges.
+  - Seeds staged delivery metadata for every new recommendation.
   - Preserves admin overrides during planner refreshes.
 - `src/executor.rs`
   - Converts approved work items into Refiner execution attempts.
   - Uses DB-backed claiming to avoid duplicate execution dispatch.
-  - Persists execution policy, payloads, status, and verification outcomes.
+  - Persists execution policy, payloads, delivery metadata, status, and verification outcomes.
+  - Auto-promotes work items through the staged pipeline when configured to do so.
 - `src/service.rs`
-  - Orchestration layer for repository access, auth behavior, summary generation, and background loops.
+  - Orchestration layer for repository access, auth behavior, DORA-aware summary generation, and background loops.
 - `src/app.rs`
   - Axum routes for dashboard, task graph, and execution/admin API.
 - `src/storage/postgres.rs`
@@ -74,6 +80,26 @@ Conductor stores eleven primary entities:
 - `conductor_events`
 
 This design gives a stable audit trail without conflating live topology with queued work.
+
+## Delivery Model
+
+Conductor promotes one governed work item through these stages:
+
+1. `development`
+2. `testing`
+3. `integration`
+4. `integration_testing`
+5. `uat`
+6. `production`
+
+Key rules:
+
+- Discovery can infer a service's deployed environment from the tenant environment values already present in SwarmHPC Ansible.
+- Planner-generated items begin in `development`.
+- A stage can only be promoted when its predecessor has been validated, unless the current stage is already marked as validated.
+- `production` cannot run with a `direct` rollout strategy.
+- Successful verification can auto-advance the work item and reset approval state for the next stage.
+- DORA metrics are calculated from persisted `production` executions, not from planner timestamps.
 
 ## External Systems
 
@@ -101,6 +127,7 @@ Treated as both a runtime surface and a future self-improvement substrate. Curre
 
 - Read APIs are private by default and only become public if `allow_dashboard_without_token` is explicitly enabled.
 - Mutating APIs and manual loop triggers require the admin bearer token when configured.
+- Release gates are stage-aware: UAT and production require explicit approval when policy is enabled, and production requires a controlled rollout strategy.
 - Upstream bearer tokens are per-integration and remain out of source control.
 
 ## Next Iterations

@@ -4,7 +4,10 @@ use serde_json::Value;
 
 use crate::{
     config::ConductorConfig,
-    models::{PolicyEvaluation, PolicySummary, PolicyVerdict, ServiceSnapshot, WorkItem, now_utc},
+    models::{
+        DeliveryStage, PolicyEvaluation, PolicySummary, PolicyVerdict, RolloutStrategy,
+        ServiceSnapshot, WorkItem, now_utc,
+    },
 };
 
 pub fn evaluate_work_item(
@@ -12,10 +15,19 @@ pub fn evaluate_work_item(
     work_item: &WorkItem,
     service: Option<&ServiceSnapshot>,
 ) -> PolicyEvaluation {
+    let required_previous_stage = required_previous_stage(
+        work_item.delivery_stage,
+        config.delivery.require_uat_before_production,
+    );
+
     if !config.policy.enabled {
         return PolicyEvaluation {
             verdict: PolicyVerdict::Allowed,
             risk_level: "low".to_string(),
+            delivery_stage: work_item.delivery_stage,
+            validated_stages: work_item.validated_stages.clone(),
+            required_previous_stage,
+            rollout_strategy: work_item.rollout_strategy,
             protected_targets: Vec::new(),
             external_repos: Vec::new(),
             required_verifications: Vec::new(),
@@ -91,21 +103,54 @@ pub fn evaluate_work_item(
         ));
     }
 
-    let required_verifications = required_verifications(service);
+    if let Some(previous_stage) = required_previous_stage {
+        if !work_item.stage_is_validated(previous_stage)
+            && !work_item.stage_is_validated(work_item.delivery_stage)
+        {
+            reasons.push(format!(
+                "{} promotion requires {} to be validated first",
+                work_item.delivery_stage.as_str(),
+                previous_stage.as_str()
+            ));
+        }
+    }
+
+    if matches!(work_item.delivery_stage, DeliveryStage::Production)
+        && matches!(work_item.rollout_strategy, RolloutStrategy::Direct)
+    {
+        reasons
+            .push("production stage requires a canary or red_green rollout strategy".to_string());
+    }
+
+    let required_verifications = required_verifications(
+        service,
+        work_item.delivery_stage,
+        work_item.rollout_strategy,
+    );
     if config.policy.require_verification && !work_item.verification_required {
         reasons.push("verification gate is required for execution".to_string());
     }
+    let stage_requires_approval = config.policy.require_admin_approval
+        && work_item.delivery_stage.is_release_gate()
+        && !work_item.execution_approved;
 
-    let verdict = if reasons
-        .iter()
-        .any(|reason| reason.contains("blocked action keyword"))
-    {
+    let verdict = if reasons.iter().any(|reason| {
+        reason.contains("blocked action keyword")
+            || reason.contains("requires a canary or red_green rollout strategy")
+            || reason.contains("requires") && reason.contains("to be validated first")
+    }) {
         PolicyVerdict::Blocked
     } else if !config.policy.allow_external_repo_execution && !external_repos.is_empty() {
         reasons.push("external repository execution is disabled by policy".to_string());
         PolicyVerdict::Blocked
     } else if config.policy.require_verification && !work_item.verification_required {
         PolicyVerdict::Blocked
+    } else if stage_requires_approval {
+        reasons.push(format!(
+            "{} stage requires explicit admin approval before execution",
+            work_item.delivery_stage.as_str()
+        ));
+        PolicyVerdict::NeedsApproval
     } else if config.policy.require_admin_approval
         && (!protected_targets.is_empty() || !external_repos.is_empty())
         && !work_item.execution_approved
@@ -121,6 +166,10 @@ pub fn evaluate_work_item(
 
     let risk_level = if matches!(verdict, PolicyVerdict::Blocked) {
         "critical"
+    } else if matches!(work_item.delivery_stage, DeliveryStage::Production) {
+        "critical"
+    } else if matches!(work_item.delivery_stage, DeliveryStage::Uat) {
+        "high"
     } else if !protected_targets.is_empty() || !external_repos.is_empty() {
         "high"
     } else if work_item.verification_required {
@@ -133,12 +182,26 @@ pub fn evaluate_work_item(
     PolicyEvaluation {
         verdict,
         risk_level,
+        delivery_stage: work_item.delivery_stage,
+        validated_stages: work_item.validated_stages.clone(),
+        required_previous_stage,
+        rollout_strategy: work_item.rollout_strategy,
         protected_targets,
         external_repos,
         required_verifications,
         reasons,
         generated_at: now_utc(),
     }
+}
+
+fn required_previous_stage(
+    stage: DeliveryStage,
+    require_uat_before_production: bool,
+) -> Option<DeliveryStage> {
+    if matches!(stage, DeliveryStage::Production) && !require_uat_before_production {
+        return Some(DeliveryStage::IntegrationTesting);
+    }
+    stage.previous()
 }
 
 pub fn policy_summary(config: &ConductorConfig) -> PolicySummary {
@@ -166,7 +229,41 @@ fn path_starts_with(candidate: &Path, root: &Path) -> bool {
     candidate.starts_with(&root)
 }
 
-fn required_verifications(service: Option<&ServiceSnapshot>) -> Vec<String> {
+fn required_verifications(
+    service: Option<&ServiceSnapshot>,
+    delivery_stage: DeliveryStage,
+    rollout_strategy: RolloutStrategy,
+) -> Vec<String> {
+    let mut commands = project_native_verifications(service);
+    match delivery_stage {
+        DeliveryStage::Development => {}
+        DeliveryStage::Testing => {
+            commands.push("unit and component tests".to_string());
+        }
+        DeliveryStage::Integration => {
+            commands.push("cross-service integration checks".to_string());
+        }
+        DeliveryStage::IntegrationTesting => {
+            commands.push("integration-test suite".to_string());
+            commands.push("regression verification".to_string());
+        }
+        DeliveryStage::Uat => {
+            commands.push("user acceptance verification".to_string());
+            commands.push("release candidate sign-off".to_string());
+        }
+        DeliveryStage::Production => {
+            commands.push(format!(
+                "{} rollout verification",
+                rollout_strategy.as_str()
+            ));
+            commands.push("rollback readiness check".to_string());
+            commands.push("production smoke and health verification".to_string());
+        }
+    }
+    commands
+}
+
+fn project_native_verifications(service: Option<&ServiceSnapshot>) -> Vec<String> {
     let Some(service) = service else {
         return vec!["project-native verification commands".to_string()];
     };
@@ -199,7 +296,7 @@ mod tests {
     use super::*;
     use crate::{
         config::ConductorConfig,
-        models::{NewWorkItem, ServiceHealth, WorkItem},
+        models::{DeliveryStage, NewWorkItem, RolloutStrategy, ServiceHealth, WorkItem},
     };
     use serde_json::json;
 
@@ -211,6 +308,9 @@ mod tests {
             title: "Improve Gail".to_string(),
             summary: "Tighten Gail execution path".to_string(),
             target_service: Some("gail".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
             status: None,
             priority: None,
             progress_pct: None,
@@ -233,6 +333,7 @@ mod tests {
             hosts: vec![],
             namespace: None,
             service_name: None,
+            deployment_environment: Some(DeliveryStage::Production),
             internal_url: None,
             public_url: None,
             repo_path: Some("/home/pbisaacs/Developer/neuralmimicry/gail".to_string()),
@@ -260,6 +361,9 @@ mod tests {
             title: "Danger".to_string(),
             summary: "Run rm -rf on repo".to_string(),
             target_service: None,
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
             status: None,
             priority: None,
             progress_pct: None,
@@ -268,6 +372,40 @@ mod tests {
             verification_required: Some(true),
             tags: vec![],
             plan: json!({"action": "rm -rf"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+
+        let evaluation = evaluate_work_item(&config, &item, None);
+        assert_eq!(evaluation.verdict, PolicyVerdict::Blocked);
+    }
+
+    #[test]
+    fn production_stage_requires_release_rollout_strategy() {
+        let config = ConductorConfig::default();
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: None,
+            title: "Promote".to_string(),
+            summary: "Promote to production".to_string(),
+            target_service: Some("gail".to_string()),
+            delivery_stage: Some(DeliveryStage::Production),
+            validated_stages: vec![
+                DeliveryStage::Development,
+                DeliveryStage::Testing,
+                DeliveryStage::Integration,
+                DeliveryStage::IntegrationTesting,
+                DeliveryStage::Uat,
+            ],
+            rollout_strategy: Some(RolloutStrategy::Direct),
+            status: Some(crate::models::WorkStatus::Scheduled),
+            priority: None,
+            progress_pct: None,
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "promote"}),
             depends_on: vec![],
             source: None,
             scheduled_for: None,

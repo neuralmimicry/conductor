@@ -1,7 +1,12 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Result;
 use axum::http::HeaderMap;
+use chrono::Duration as ChronoDuration;
 use reqwest::Client;
 use serde_json::json;
 use tokio::sync::broadcast;
@@ -13,9 +18,9 @@ use crate::{
     error::ApiError,
     executor::{ExecutionEventCallback, execute_specific_work_item, run_execution_cycle},
     models::{
-        ConductorEvent, DashboardSummary, DiscoveryRun, FindingEvidence, FindingProvenance,
-        FindingRecord, ImprovementCycle, RepositorySnapshot, WorkExecution, WorkItem, WorkStatus,
-        now_utc, topology_from_services,
+        ConductorEvent, DashboardSummary, DeliveryStage, DiscoveryRun, DoraMetricsSummary,
+        FindingEvidence, FindingProvenance, FindingRecord, ImprovementCycle, RepositorySnapshot,
+        WorkExecution, WorkItem, WorkStatus, now_utc, topology_from_services,
     },
     planner::run_planning_cycle,
     repository::ConductorRepository,
@@ -297,12 +302,23 @@ impl ConductorService {
             .into_iter()
             .next();
         let cycles_total = self.repository.list_improvement_cycles(200).await?.len();
-        let executions = self.repository.list_work_executions(200).await?;
+        let executions = self.repository.list_work_executions(1000).await?;
 
         let mut work_by_status = BTreeMap::new();
         for item in &work_items {
             *work_by_status
                 .entry(item.status.as_str().to_string())
+                .or_insert(0usize) += 1;
+        }
+
+        let mut delivery_stage_totals = BTreeMap::new();
+        let mut rollout_strategy_totals = BTreeMap::new();
+        for item in &work_items {
+            *delivery_stage_totals
+                .entry(item.delivery_stage.as_str().to_string())
+                .or_insert(0usize) += 1;
+            *rollout_strategy_totals
+                .entry(item.rollout_strategy.as_str().to_string())
                 .or_insert(0usize) += 1;
         }
 
@@ -312,6 +328,12 @@ impl ConductorService {
                 .entry(finding.severity.as_str().to_string())
                 .or_insert(0usize) += 1;
         }
+
+        let dora_metrics = compute_dora_metrics(
+            &work_items,
+            &executions,
+            self.config.delivery.dora_window_days,
+        );
 
         Ok(DashboardSummary {
             generated_at: now_utc(),
@@ -339,6 +361,8 @@ impl ConductorService {
                 .count(),
             work_items_total: work_items.len(),
             work_by_status,
+            delivery_stage_totals,
+            rollout_strategy_totals,
             cycles_total,
             executions_total: executions.len(),
             executions_running: executions
@@ -355,6 +379,7 @@ impl ConductorService {
                         )
                 })
                 .count(),
+            dora_metrics,
             latest_discovery,
             latest_cycle,
         })
@@ -363,6 +388,116 @@ impl ConductorService {
     pub async fn topology(&self) -> Result<crate::models::TopologyGraph> {
         let services = self.repository.list_service_snapshots().await?;
         Ok(topology_from_services(&services))
+    }
+}
+
+fn compute_dora_metrics(
+    work_items: &[WorkItem],
+    executions: &[WorkExecution],
+    window_days: i64,
+) -> DoraMetricsSummary {
+    let window_days = window_days.max(1);
+    let cutoff = now_utc() - ChronoDuration::days(window_days);
+    let work_items_by_id = work_items
+        .iter()
+        .map(|item| (item.id, item))
+        .collect::<HashMap<_, _>>();
+
+    let mut production_executions = executions
+        .iter()
+        .filter(|execution| matches!(execution.delivery_stage, DeliveryStage::Production))
+        .filter(|execution| execution.finished_at.unwrap_or(execution.updated_at) >= cutoff)
+        .collect::<Vec<_>>();
+    production_executions
+        .sort_by_key(|execution| execution.finished_at.unwrap_or(execution.updated_at));
+
+    let attempted_production_deployments = production_executions.len();
+    let successful_executions = production_executions
+        .iter()
+        .copied()
+        .filter(|execution| matches!(execution.status, crate::models::ExecutionStatus::Success))
+        .collect::<Vec<_>>();
+    let failed_executions = production_executions
+        .iter()
+        .copied()
+        .filter(|execution| {
+            matches!(
+                execution.status,
+                crate::models::ExecutionStatus::Failure
+                    | crate::models::ExecutionStatus::Blocked
+                    | crate::models::ExecutionStatus::Cancelled
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut lead_times = successful_executions
+        .iter()
+        .filter_map(|execution| {
+            let item = work_items_by_id.get(&execution.work_item_id)?;
+            let finished_at = execution.finished_at?;
+            Some((finished_at - item.created_at).num_minutes() as f64 / 60.0)
+        })
+        .collect::<Vec<_>>();
+    lead_times.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut mttr_values = Vec::new();
+    for failed in &failed_executions {
+        let failed_at = failed.finished_at.unwrap_or(failed.updated_at);
+        if let Some(recovery) = successful_executions.iter().find(|candidate| {
+            let candidate_finished = candidate.finished_at.unwrap_or(candidate.updated_at);
+            candidate_finished > failed_at && same_recovery_scope(candidate, failed)
+        }) {
+            let recovered_at = recovery.finished_at.unwrap_or(recovery.updated_at);
+            mttr_values.push((recovered_at - failed_at).num_minutes() as f64 / 60.0);
+        }
+    }
+
+    DoraMetricsSummary {
+        window_days,
+        attempted_production_deployments,
+        successful_production_deployments: successful_executions.len(),
+        deployment_frequency_per_day: successful_executions.len() as f64 / window_days as f64,
+        lead_time_hours_average: average(&lead_times),
+        lead_time_hours_median: median(&lead_times),
+        change_failure_rate_pct: if attempted_production_deployments == 0 {
+            0.0
+        } else {
+            (failed_executions.len() as f64 / attempted_production_deployments as f64) * 100.0
+        },
+        mean_time_to_restore_hours: average(&mttr_values),
+    }
+}
+
+fn same_recovery_scope(candidate: &WorkExecution, failed: &WorkExecution) -> bool {
+    if candidate.work_item_id == failed.work_item_id {
+        return true;
+    }
+    match (
+        candidate.target_service.as_deref(),
+        failed.target_service.as_deref(),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn average(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.iter().sum::<f64>() / values.len() as f64)
+    }
+}
+
+fn median(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        Some((values[mid - 1] + values[mid]) / 2.0)
+    } else {
+        Some(values[mid])
     }
 }
 
@@ -459,4 +594,117 @@ pub fn spawn_background_loops(service: ConductorService) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{ExecutionStatus, NewWorkItem, RolloutStrategy};
+    use serde_json::json;
+
+    #[test]
+    fn dora_metrics_use_production_stage_history() {
+        let mut production_item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("promote:gail".to_string()),
+            title: "Promote Gail".to_string(),
+            summary: "Advance Gail to production".to_string(),
+            target_service: Some("gail".to_string()),
+            delivery_stage: Some(DeliveryStage::Production),
+            validated_stages: vec![
+                DeliveryStage::Development,
+                DeliveryStage::Testing,
+                DeliveryStage::Integration,
+                DeliveryStage::IntegrationTesting,
+                DeliveryStage::Uat,
+            ],
+            rollout_strategy: Some(RolloutStrategy::Canary),
+            status: Some(WorkStatus::Scheduled),
+            priority: Some(80),
+            progress_pct: Some(80),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        production_item.created_at = now_utc() - ChronoDuration::hours(48);
+
+        let mut success = WorkExecution::new(
+            production_item.id,
+            Some("gail".to_string()),
+            DeliveryStage::Production,
+            RolloutStrategy::Canary,
+        );
+        success.status = ExecutionStatus::Success;
+        success.started_at = now_utc() - ChronoDuration::hours(2);
+        success.updated_at = now_utc() - ChronoDuration::hours(1);
+        success.finished_at = Some(now_utc() - ChronoDuration::hours(1));
+
+        let mut failed_item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("promote:tracey".to_string()),
+            title: "Promote Tracey".to_string(),
+            summary: "Advance Tracey to production".to_string(),
+            target_service: Some("tracey".to_string()),
+            delivery_stage: Some(DeliveryStage::Production),
+            validated_stages: vec![
+                DeliveryStage::Development,
+                DeliveryStage::Testing,
+                DeliveryStage::Integration,
+                DeliveryStage::IntegrationTesting,
+                DeliveryStage::Uat,
+            ],
+            rollout_strategy: Some(RolloutStrategy::RedGreen),
+            status: Some(WorkStatus::Scheduled),
+            priority: Some(80),
+            progress_pct: Some(80),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        failed_item.created_at = now_utc() - ChronoDuration::hours(72);
+
+        let mut failed = WorkExecution::new(
+            failed_item.id,
+            Some("tracey".to_string()),
+            DeliveryStage::Production,
+            RolloutStrategy::RedGreen,
+        );
+        failed.status = ExecutionStatus::Failure;
+        failed.started_at = now_utc() - ChronoDuration::hours(10);
+        failed.updated_at = now_utc() - ChronoDuration::hours(9);
+        failed.finished_at = Some(now_utc() - ChronoDuration::hours(9));
+
+        let mut recovery = WorkExecution::new(
+            failed_item.id,
+            Some("tracey".to_string()),
+            DeliveryStage::Production,
+            RolloutStrategy::Canary,
+        );
+        recovery.status = ExecutionStatus::Success;
+        recovery.started_at = now_utc() - ChronoDuration::hours(4);
+        recovery.updated_at = now_utc() - ChronoDuration::hours(3);
+        recovery.finished_at = Some(now_utc() - ChronoDuration::hours(3));
+
+        let metrics = compute_dora_metrics(
+            &[production_item, failed_item],
+            &[success, failed, recovery],
+            30,
+        );
+
+        assert_eq!(metrics.attempted_production_deployments, 3);
+        assert_eq!(metrics.successful_production_deployments, 2);
+        assert!(metrics.deployment_frequency_per_day > 0.0);
+        assert!((metrics.change_failure_rate_pct - 33.33333333333333).abs() < 0.0001);
+        assert_eq!(metrics.mean_time_to_restore_hours, Some(6.0));
+        assert!(metrics.lead_time_hours_average.is_some());
+        assert!(metrics.lead_time_hours_median.is_some());
+    }
 }

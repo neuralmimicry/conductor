@@ -245,6 +245,119 @@ impl ExecutionStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryStage {
+    #[default]
+    Development,
+    Testing,
+    Integration,
+    IntegrationTesting,
+    Uat,
+    Production,
+}
+
+impl DeliveryStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Development => "development",
+            Self::Testing => "testing",
+            Self::Integration => "integration",
+            Self::IntegrationTesting => "integration_testing",
+            Self::Uat => "uat",
+            Self::Production => "production",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Self {
+        match value.trim() {
+            "development" | "dev" => Self::Development,
+            "testing" | "test" => Self::Testing,
+            "integration" | "int" => Self::Integration,
+            "integration_testing" | "integration-test" | "integration_test" => {
+                Self::IntegrationTesting
+            }
+            "uat" | "staging" | "stage" | "preprod" | "pre-production" => Self::Uat,
+            "production" | "prod" => Self::Production,
+            _ => Self::Development,
+        }
+    }
+
+    pub fn all() -> [Self; 6] {
+        [
+            Self::Development,
+            Self::Testing,
+            Self::Integration,
+            Self::IntegrationTesting,
+            Self::Uat,
+            Self::Production,
+        ]
+    }
+
+    pub fn previous(self) -> Option<Self> {
+        match self {
+            Self::Development => None,
+            Self::Testing => Some(Self::Development),
+            Self::Integration => Some(Self::Testing),
+            Self::IntegrationTesting => Some(Self::Integration),
+            Self::Uat => Some(Self::IntegrationTesting),
+            Self::Production => Some(Self::Uat),
+        }
+    }
+
+    pub fn next(self) -> Option<Self> {
+        match self {
+            Self::Development => Some(Self::Testing),
+            Self::Testing => Some(Self::Integration),
+            Self::Integration => Some(Self::IntegrationTesting),
+            Self::IntegrationTesting => Some(Self::Uat),
+            Self::Uat => Some(Self::Production),
+            Self::Production => None,
+        }
+    }
+
+    pub fn is_release_gate(self) -> bool {
+        matches!(self, Self::Uat | Self::Production)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutStrategy {
+    #[default]
+    Direct,
+    Canary,
+    #[serde(alias = "blue_green")]
+    RedGreen,
+}
+
+impl RolloutStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Canary => "canary",
+            Self::RedGreen => "red_green",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Self {
+        match value.trim() {
+            "direct" => Self::Direct,
+            "canary" => Self::Canary,
+            "red_green" | "blue_green" => Self::RedGreen,
+            _ => Self::Direct,
+        }
+    }
+
+    pub fn default_for_stage(stage: DeliveryStage) -> Self {
+        if matches!(stage, DeliveryStage::Production) {
+            Self::Canary
+        } else {
+            Self::Direct
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyVerdict {
@@ -279,6 +392,10 @@ pub struct NewWorkItem {
     pub title: String,
     pub summary: String,
     pub target_service: Option<String>,
+    pub delivery_stage: Option<DeliveryStage>,
+    #[serde(default)]
+    pub validated_stages: Vec<DeliveryStage>,
+    pub rollout_strategy: Option<RolloutStrategy>,
     pub status: Option<WorkStatus>,
     pub priority: Option<i32>,
     pub progress_pct: Option<i32>,
@@ -302,6 +419,9 @@ pub struct WorkItemPatch {
     pub title: Option<String>,
     pub summary: Option<String>,
     pub target_service: Option<String>,
+    pub delivery_stage: Option<DeliveryStage>,
+    pub validated_stages: Option<Vec<DeliveryStage>>,
+    pub rollout_strategy: Option<RolloutStrategy>,
     pub status: Option<WorkStatus>,
     pub priority: Option<i32>,
     pub progress_pct: Option<i32>,
@@ -324,6 +444,9 @@ pub struct WorkItem {
     pub title: String,
     pub summary: String,
     pub target_service: Option<String>,
+    pub delivery_stage: DeliveryStage,
+    pub validated_stages: Vec<DeliveryStage>,
+    pub rollout_strategy: RolloutStrategy,
     pub status: WorkStatus,
     pub priority: i32,
     pub progress_pct: i32,
@@ -353,6 +476,11 @@ pub struct WorkItem {
 impl WorkItem {
     pub fn from_new(input: NewWorkItem) -> Self {
         let now = now_utc();
+        let delivery_stage = input.delivery_stage.unwrap_or_default();
+        let validated_stages = unique_delivery_stages(input.validated_stages);
+        let rollout_strategy = input
+            .rollout_strategy
+            .unwrap_or_else(|| RolloutStrategy::default_for_stage(delivery_stage));
         Self {
             id: Uuid::new_v4(),
             dedupe_key: input
@@ -362,6 +490,9 @@ impl WorkItem {
             title: input.title,
             summary: input.summary,
             target_service: input.target_service,
+            delivery_stage,
+            validated_stages,
+            rollout_strategy,
             status: input.status.unwrap_or_default(),
             priority: input.priority.unwrap_or(50),
             progress_pct: input.progress_pct.unwrap_or(0).clamp(0, 100),
@@ -395,6 +526,18 @@ impl WorkItem {
         }
         if let Some(target_service) = patch.target_service {
             self.target_service = Some(target_service);
+        }
+        if let Some(delivery_stage) = patch.delivery_stage {
+            self.delivery_stage = delivery_stage;
+        }
+        if let Some(validated_stages) = patch.validated_stages {
+            self.validated_stages = unique_delivery_stages(validated_stages);
+            if self.progress_pct == 0 || self.progress_pct < self.pipeline_progress_pct() {
+                self.progress_pct = self.pipeline_progress_pct();
+            }
+        }
+        if let Some(rollout_strategy) = patch.rollout_strategy {
+            self.rollout_strategy = rollout_strategy;
         }
         if let Some(status) = patch.status {
             self.status = status;
@@ -468,6 +611,28 @@ impl WorkItem {
         self.updated_at = now_utc();
     }
 
+    pub fn stage_is_validated(&self, stage: DeliveryStage) -> bool {
+        self.validated_stages.contains(&stage)
+    }
+
+    pub fn stage_prerequisite(&self) -> Option<DeliveryStage> {
+        self.delivery_stage.previous()
+    }
+
+    pub fn mark_stage_validated(&mut self, stage: DeliveryStage) {
+        let mut stages = self.validated_stages.clone();
+        stages.push(stage);
+        self.validated_stages = unique_delivery_stages(stages);
+        self.progress_pct = self.pipeline_progress_pct();
+        self.updated_at = now_utc();
+    }
+
+    pub fn pipeline_progress_pct(&self) -> i32 {
+        let total = DeliveryStage::all().len().max(1) as f64;
+        let completed = self.validated_stages.len() as f64;
+        ((completed / total) * 100.0).round() as i32
+    }
+
     pub fn matches_reference(&self, reference: &str) -> bool {
         let reference = reference.trim();
         !reference.is_empty()
@@ -490,6 +655,7 @@ pub struct ServiceSnapshot {
     pub hosts: Vec<String>,
     pub namespace: Option<String>,
     pub service_name: Option<String>,
+    pub deployment_environment: Option<DeliveryStage>,
     pub internal_url: Option<String>,
     pub public_url: Option<String>,
     pub repo_path: Option<String>,
@@ -627,10 +793,13 @@ pub struct DashboardSummary {
     pub services_unreachable: usize,
     pub work_items_total: usize,
     pub work_by_status: BTreeMap<String, usize>,
+    pub delivery_stage_totals: BTreeMap<String, usize>,
+    pub rollout_strategy_totals: BTreeMap<String, usize>,
     pub cycles_total: usize,
     pub executions_total: usize,
     pub executions_running: usize,
     pub approvals_waiting: usize,
+    pub dora_metrics: DoraMetricsSummary,
     pub latest_discovery: Option<DiscoveryRun>,
     pub latest_cycle: Option<ImprovementCycle>,
 }
@@ -647,6 +816,10 @@ pub struct ProbeResult {
 pub struct PolicyEvaluation {
     pub verdict: PolicyVerdict,
     pub risk_level: String,
+    pub delivery_stage: DeliveryStage,
+    pub validated_stages: Vec<DeliveryStage>,
+    pub required_previous_stage: Option<DeliveryStage>,
+    pub rollout_strategy: RolloutStrategy,
     pub protected_targets: Vec<String>,
     pub external_repos: Vec<String>,
     pub required_verifications: Vec<String>,
@@ -659,6 +832,8 @@ pub struct WorkExecution {
     pub id: Uuid,
     pub work_item_id: Uuid,
     pub target_service: Option<String>,
+    pub delivery_stage: DeliveryStage,
+    pub rollout_strategy: RolloutStrategy,
     pub status: ExecutionStatus,
     pub refiner_job_id: Option<String>,
     pub policy: Value,
@@ -672,12 +847,19 @@ pub struct WorkExecution {
 }
 
 impl WorkExecution {
-    pub fn new(work_item_id: Uuid, target_service: Option<String>) -> Self {
+    pub fn new(
+        work_item_id: Uuid,
+        target_service: Option<String>,
+        delivery_stage: DeliveryStage,
+        rollout_strategy: RolloutStrategy,
+    ) -> Self {
         let now = now_utc();
         Self {
             id: Uuid::new_v4(),
             work_item_id,
             target_service,
+            delivery_stage,
+            rollout_strategy,
             status: ExecutionStatus::Pending,
             refiner_job_id: None,
             policy: json!({}),
@@ -770,6 +952,18 @@ pub struct PolicySummary {
     pub allow_external_repo_execution: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DoraMetricsSummary {
+    pub window_days: i64,
+    pub attempted_production_deployments: usize,
+    pub successful_production_deployments: usize,
+    pub deployment_frequency_per_day: f64,
+    pub lead_time_hours_average: Option<f64>,
+    pub lead_time_hours_median: Option<f64>,
+    pub change_failure_rate_pct: f64,
+    pub mean_time_to_restore_hours: Option<f64>,
+}
+
 pub fn unique_strings(values: Vec<String>) -> Vec<String> {
     let mut seen = BTreeSet::new();
     values
@@ -777,6 +971,14 @@ pub fn unique_strings(values: Vec<String>) -> Vec<String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .filter(|value| seen.insert(value.clone()))
+        .collect()
+}
+
+pub fn unique_delivery_stages(values: Vec<DeliveryStage>) -> Vec<DeliveryStage> {
+    let mut seen = BTreeSet::new();
+    values
+        .into_iter()
+        .filter(|stage| seen.insert(*stage))
         .collect()
 }
 

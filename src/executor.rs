@@ -8,8 +8,8 @@ use uuid::Uuid;
 use crate::{
     config::ConductorConfig,
     models::{
-        ConductorEvent, ExecutionStatus, PolicyVerdict, ServiceSnapshot, WorkExecution, WorkItem,
-        WorkStatus,
+        ConductorEvent, ExecutionStatus, PolicyVerdict, RolloutStrategy, ServiceSnapshot,
+        WorkExecution, WorkItem, WorkStatus,
     },
     policy::{evaluate_work_item, policy_evaluation_to_value},
     repository::ConductorRepository,
@@ -200,7 +200,12 @@ async fn dispatch_claimed_work_item_inner(
             "risk_level": "dependency_graph",
             "reasons": dependency_blockers,
         });
-        let mut execution = WorkExecution::new(item.id, item.target_service.clone());
+        let mut execution = WorkExecution::new(
+            item.id,
+            item.target_service.clone(),
+            item.delivery_stage,
+            item.rollout_strategy,
+        );
         execution.policy = policy.clone();
         execution.error = Some(message.clone());
         execution.mark_status(ExecutionStatus::Blocked);
@@ -240,7 +245,12 @@ async fn dispatch_claimed_work_item_inner(
     });
     let policy = evaluate_work_item(config, item, target_service);
 
-    let mut execution = WorkExecution::new(item.id, item.target_service.clone());
+    let mut execution = WorkExecution::new(
+        item.id,
+        item.target_service.clone(),
+        item.delivery_stage,
+        item.rollout_strategy,
+    );
     execution.policy = policy_evaluation_to_value(&policy);
     item.touch_execution(execution.id, execution.policy.clone());
 
@@ -529,7 +539,16 @@ async fn dispatch_claimed_work_item_inner(
     };
 
     execution.mark_status(ExecutionStatus::Verifying);
-    let verification = verify_refiner_result(&terminal);
+    let current_stage = item.delivery_stage;
+    let current_rollout = item.rollout_strategy;
+    let mut verification = verify_refiner_result(&terminal);
+    if let Some(object) = verification.as_object_mut() {
+        object.insert("delivery_stage".to_string(), json!(current_stage.as_str()));
+        object.insert(
+            "rollout_strategy".to_string(),
+            json!(current_rollout.as_str()),
+        );
+    }
     execution.verification = verification.clone();
     execution.latest_payload = terminal.clone();
 
@@ -539,14 +558,7 @@ async fn dispatch_claimed_work_item_inner(
         .unwrap_or(false);
     if verification_passed {
         execution.mark_status(ExecutionStatus::Success);
-        item.status = WorkStatus::Success;
-        item.progress_pct = 100;
-        item.finished_at = Some(crate::models::now_utc());
-        item.notes.push(format!(
-            "{} Refiner job {} completed and passed verification",
-            crate::models::now_utc().to_rfc3339(),
-            refiner_job_id
-        ));
+        item.mark_stage_validated(current_stage);
         emit_execution_event(
             event_callback,
             "execution.verification",
@@ -556,6 +568,72 @@ async fn dispatch_claimed_work_item_inner(
             Some("success"),
             verification.clone(),
         );
+        if config.delivery.auto_advance {
+            if let Some(next_stage) = current_stage.next() {
+                item.delivery_stage = next_stage;
+                item.rollout_strategy = RolloutStrategy::default_for_stage(next_stage);
+                item.status = WorkStatus::Planned;
+                item.execution_approved = false;
+                item.finished_at = None;
+                item.notes.push(format!(
+                    "{} Refiner job {} validated {} and advanced the work item to {}",
+                    crate::models::now_utc().to_rfc3339(),
+                    refiner_job_id,
+                    current_stage.as_str(),
+                    next_stage.as_str()
+                ));
+                emit_execution_event(
+                    event_callback,
+                    "execution.stage_promoted",
+                    format!(
+                        "Refiner job {} promoted {} to {}",
+                        refiner_job_id,
+                        current_stage.as_str(),
+                        next_stage.as_str()
+                    ),
+                    Some(item),
+                    Some(&execution),
+                    Some("success"),
+                    json!({
+                        "completed_stage": current_stage.as_str(),
+                        "next_stage": next_stage.as_str(),
+                        "validated_stages": item
+                            .validated_stages
+                            .iter()
+                            .map(|stage| stage.as_str())
+                            .collect::<Vec<_>>(),
+                        "rollout_strategy": item.rollout_strategy.as_str(),
+                    }),
+                );
+            } else {
+                item.status = WorkStatus::Success;
+                item.progress_pct = 100;
+                item.finished_at = Some(crate::models::now_utc());
+                item.notes.push(format!(
+                    "{} Refiner job {} completed the production stage and passed verification",
+                    crate::models::now_utc().to_rfc3339(),
+                    refiner_job_id
+                ));
+            }
+        } else if current_stage.next().is_some() {
+            item.status = WorkStatus::OnHold;
+            item.finished_at = None;
+            item.notes.push(format!(
+                "{} Refiner job {} validated {}. Manual promotion is required for the next stage.",
+                crate::models::now_utc().to_rfc3339(),
+                refiner_job_id,
+                current_stage.as_str()
+            ));
+        } else {
+            item.status = WorkStatus::Success;
+            item.progress_pct = 100;
+            item.finished_at = Some(crate::models::now_utc());
+            item.notes.push(format!(
+                "{} Refiner job {} completed the production stage and passed verification",
+                crate::models::now_utc().to_rfc3339(),
+                refiner_job_id
+            ));
+        }
     } else {
         let failure_reason = verification
             .get("reasons")
@@ -615,7 +693,12 @@ async fn preview_work_item_execution(
             "risk_level": "dependency_graph",
             "reasons": dependency_blockers,
         });
-        let mut execution = WorkExecution::new(item.id, item.target_service.clone());
+        let mut execution = WorkExecution::new(
+            item.id,
+            item.target_service.clone(),
+            item.delivery_stage,
+            item.rollout_strategy,
+        );
         execution.policy = policy.clone();
         execution.error = Some("dry-run preview blocked by dependency graph".to_string());
         execution.verification = json!({
@@ -638,7 +721,12 @@ async fn preview_work_item_execution(
             .find(|service| service.service_key == target)
     });
     let policy = evaluate_work_item(config, &item, target_service);
-    let mut execution = WorkExecution::new(item.id, item.target_service.clone());
+    let mut execution = WorkExecution::new(
+        item.id,
+        item.target_service.clone(),
+        item.delivery_stage,
+        item.rollout_strategy,
+    );
     execution.policy = policy_evaluation_to_value(&policy);
     item.touch_execution(execution.id, execution.policy.clone());
 
@@ -831,10 +919,23 @@ fn build_refiner_prompt(
     } else {
         policy.required_verifications.join(", ")
     };
+    let validated_stages = if work_item.validated_stages.is_empty() {
+        "none".to_string()
+    } else {
+        work_item
+            .validated_stages
+            .iter()
+            .map(|stage| stage.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     format!(
-        "Work item: {title}\nTarget: {target}\nSummary: {summary}\nPlan JSON: {plan}\nRepository context: {repo}\nConstraints: keep changes scoped, resilient, and secure; avoid destructive commands; leave unrelated files untouched.\nRequired verification: {verification}\nProduce a project-solver plan and job payload that implements the change with explicit verification.",
+        "Work item: {title}\nTarget: {target}\nDelivery stage: {delivery_stage}\nValidated stages: {validated_stages}\nRollout strategy: {rollout_strategy}\nSummary: {summary}\nPlan JSON: {plan}\nRepository context: {repo}\nConstraints: keep changes scoped, resilient, and secure; avoid destructive commands; leave unrelated files untouched; do not bypass staged delivery gates.\nRequired verification: {verification}\nProduce a project-solver plan and job payload that implements the change with explicit verification and stage-aware rollout notes.",
         title = work_item.title,
         target = service_name,
+        delivery_stage = work_item.delivery_stage.as_str(),
+        validated_stages = validated_stages,
+        rollout_strategy = work_item.rollout_strategy.as_str(),
         summary = work_item.summary,
         plan = work_item.plan,
         repo = repo_context,
@@ -882,6 +983,36 @@ fn build_job_payload(
         "commit_message".to_string(),
         json!(format!("conductor: {}", work_item.title)),
     );
+    payload.insert(
+        "delivery_stage".to_string(),
+        json!(work_item.delivery_stage.as_str()),
+    );
+    payload.insert(
+        "validated_stages".to_string(),
+        json!(
+            work_item
+                .validated_stages
+                .iter()
+                .map(|stage| stage.as_str())
+                .collect::<Vec<_>>()
+        ),
+    );
+    payload.insert(
+        "rollout_strategy".to_string(),
+        json!(work_item.rollout_strategy.as_str()),
+    );
+    payload.insert(
+        "rollout".to_string(),
+        json!({
+            "strategy": work_item.rollout_strategy.as_str(),
+            "canary_percentage": if matches!(work_item.rollout_strategy, RolloutStrategy::Canary) {
+                config.delivery.production_canary_percentage
+            } else {
+                0
+            },
+            "staggered_cutover": matches!(work_item.rollout_strategy, RolloutStrategy::RedGreen),
+        }),
+    );
     if config.policy.require_refiner_strict_mode {
         payload.insert("solver_command_policy_mode".to_string(), json!("strict"));
     }
@@ -927,8 +1058,20 @@ fn requirements_text(
         .map(|service| service.display_name.as_str())
         .unwrap_or("target service");
     format!(
-        "Overview: Improve {target} through the Conductor execution loop.\n\nRequirements Register:\n- REQ-001: Implement the scoped change described in the work item.\n- REQ-002: Preserve secure, resilient behaviour and avoid destructive commands.\n- REQ-003: Update or add tests covering the changed path.\n- REQ-004: Run verification commands and report the outcome.\n- REQ-005: Leave unrelated files untouched.\n\nWork Item Summary:\n{summary}\n\nPlan JSON:\n{plan}",
+        "Overview: Improve {target} through the Conductor execution loop.\n\nDelivery Context:\n- Current stage: {delivery_stage}\n- Validated stages: {validated_stages}\n- Rollout strategy: {rollout_strategy}\n\nRequirements Register:\n- REQ-001: Implement the scoped change described in the work item.\n- REQ-002: Preserve secure, resilient behaviour and avoid destructive commands.\n- REQ-003: Update or add tests covering the changed path.\n- REQ-004: Run verification commands and report the outcome.\n- REQ-005: Leave unrelated files untouched.\n- REQ-006: Preserve staged progression and rollout governance metadata.\n\nWork Item Summary:\n{summary}\n\nPlan JSON:\n{plan}",
         target = target,
+        delivery_stage = work_item.delivery_stage.as_str(),
+        validated_stages = if work_item.validated_stages.is_empty() {
+            "none".to_string()
+        } else {
+            work_item
+                .validated_stages
+                .iter()
+                .map(|stage| stage.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+        rollout_strategy = work_item.rollout_strategy.as_str(),
         summary = work_item.summary,
         plan = work_item.plan,
     )
@@ -1163,7 +1306,7 @@ mod tests {
     use super::*;
     use crate::{
         config::ConductorConfig,
-        models::{NewWorkItem, ServiceHealth},
+        models::{DeliveryStage, NewWorkItem, ServiceHealth},
         storage::memory::MemoryRepository,
     };
     use chrono::Duration as ChronoDuration;
@@ -1180,6 +1323,7 @@ mod tests {
             hosts: vec![],
             namespace: None,
             service_name: None,
+            deployment_environment: Some(DeliveryStage::Production),
             internal_url: None,
             public_url: None,
             repo_path: Some("/tmp/conductor".to_string()),
@@ -1204,6 +1348,9 @@ mod tests {
             title: "Stabilize Conductor".to_string(),
             summary: "Improve executor reliability".to_string(),
             target_service: Some("conductor".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
             status: None,
             priority: None,
             progress_pct: None,
@@ -1236,6 +1383,53 @@ mod tests {
     }
 
     #[test]
+    fn job_payload_uses_configured_canary_percentage() {
+        let mut config = ConductorConfig::default();
+        config.delivery.production_canary_percentage = 25;
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("promote:conductor".to_string()),
+            title: "Promote Conductor".to_string(),
+            summary: "Promote the release candidate to production".to_string(),
+            target_service: Some("conductor".to_string()),
+            delivery_stage: Some(DeliveryStage::Production),
+            validated_stages: vec![
+                DeliveryStage::Development,
+                DeliveryStage::Testing,
+                DeliveryStage::Integration,
+                DeliveryStage::IntegrationTesting,
+                DeliveryStage::Uat,
+            ],
+            rollout_strategy: Some(RolloutStrategy::Canary),
+            status: Some(WorkStatus::Scheduled),
+            priority: Some(90),
+            progress_pct: Some(90),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "promote_release"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        let payload = build_job_payload(
+            &config,
+            &item,
+            Some(&sample_service()),
+            &json!({"job_payload": {"workflow": "project_solver"}}),
+        )
+        .expect("payload");
+        assert_eq!(
+            payload
+                .get("rollout")
+                .and_then(Value::as_object)
+                .and_then(|rollout| rollout.get("canary_percentage"))
+                .and_then(Value::as_u64),
+            Some(25)
+        );
+    }
+
+    #[test]
     fn verification_fails_when_failed_stage_exists() {
         let report = verify_refiner_result(&json!({
             "status": "completed",
@@ -1257,6 +1451,9 @@ mod tests {
             title: "Stabilize Dependency".to_string(),
             summary: "Resolve dependency first".to_string(),
             target_service: Some("conductor".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
             status: Some(WorkStatus::Planned),
             priority: Some(90),
             progress_pct: Some(0),
@@ -1274,6 +1471,9 @@ mod tests {
             title: "Follow-up".to_string(),
             summary: "Run after stabilization".to_string(),
             target_service: Some("conductor".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
             status: Some(WorkStatus::Scheduled),
             priority: Some(80),
             progress_pct: Some(0),
@@ -1314,6 +1514,9 @@ mod tests {
             title: "Stabilize Dependency".to_string(),
             summary: "Resolve dependency first".to_string(),
             target_service: Some("conductor".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
             status: Some(WorkStatus::Planned),
             priority: Some(90),
             progress_pct: Some(0),
@@ -1331,6 +1534,9 @@ mod tests {
             title: "Follow-up".to_string(),
             summary: "Run after stabilization".to_string(),
             target_service: Some("conductor".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
             status: Some(WorkStatus::Scheduled),
             priority: Some(80),
             progress_pct: Some(0),
@@ -1385,6 +1591,9 @@ mod tests {
             title: "Future".to_string(),
             summary: "Do not run yet".to_string(),
             target_service: Some("conductor".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
             status: Some(WorkStatus::Scheduled),
             priority: Some(80),
             progress_pct: Some(0),
@@ -1427,6 +1636,9 @@ mod tests {
             title: "Preview".to_string(),
             summary: "Generate a dry-run payload".to_string(),
             target_service: Some("conductor".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
             status: Some(WorkStatus::Scheduled),
             priority: Some(70),
             progress_pct: Some(0),
@@ -1475,6 +1687,9 @@ mod tests {
             title: "Stop".to_string(),
             summary: "Should not run".to_string(),
             target_service: Some("conductor".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
             status: Some(WorkStatus::Scheduled),
             priority: Some(90),
             progress_pct: Some(0),

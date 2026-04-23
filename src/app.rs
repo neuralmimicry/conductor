@@ -642,6 +642,9 @@ mod tests {
             title: "Probe".to_string(),
             summary: "Record execution history".to_string(),
             target_service: Some("refiner".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
             status: None,
             priority: None,
             progress_pct: None,
@@ -659,7 +662,12 @@ mod tests {
             .upsert_work_item(&item)
             .await
             .expect("work item");
-        let execution = WorkExecution::new(item.id, item.target_service.clone());
+        let execution = WorkExecution::new(
+            item.id,
+            item.target_service.clone(),
+            item.delivery_stage,
+            item.rollout_strategy,
+        );
         service
             .repository
             .upsert_work_execution(&execution)

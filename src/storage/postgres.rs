@@ -12,10 +12,10 @@ use uuid::Uuid;
 use crate::{
     config::DatabaseConfig,
     models::{
-        ConductorEvent, DiscoveryRun, ExecutionStatus, FindingEvidence, FindingProvenance,
-        FindingRecord, FindingSeverity, FindingStatus, ImprovementCycle, RepositorySnapshot,
-        RunStatus, ServiceHealth, ServiceMetricSample, ServiceSnapshot, WorkExecution, WorkItem,
-        WorkItemPatch, WorkStatus,
+        ConductorEvent, DeliveryStage, DiscoveryRun, ExecutionStatus, FindingEvidence,
+        FindingProvenance, FindingRecord, FindingSeverity, FindingStatus, ImprovementCycle,
+        RepositorySnapshot, RolloutStrategy, RunStatus, ServiceHealth, ServiceMetricSample,
+        ServiceSnapshot, WorkExecution, WorkItem, WorkItemPatch, WorkStatus,
     },
     repository::ConductorRepository,
 };
@@ -84,14 +84,14 @@ impl ConductorRepository for PostgresRepository {
                 r#"
                 INSERT INTO service_snapshots (
                     service_key, display_name, kind, role_name, playbooks, host_targets, hosts, namespace,
-                    service_name, internal_url, public_url, repo_path, repo_url, repo_branch,
+                    service_name, deployment_environment, internal_url, public_url, repo_path, repo_url, repo_branch,
                     health, capabilities, dependencies, storage_paths, raw_defaults, probe,
                     discovered_at, updated_at
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8,
-                    $9, $10, $11, $12, $13, $14,
-                    $15, $16, $17, $18, $19, $20,
-                    $21, $22
+                    $9, $10, $11, $12, $13, $14, $15,
+                    $16, $17, $18, $19, $20, $21,
+                    $22, $23
                 )
                 "#,
             )
@@ -104,6 +104,7 @@ impl ConductorRepository for PostgresRepository {
             .bind(Json(service.hosts.clone()))
             .bind(&service.namespace)
             .bind(&service.service_name)
+            .bind(service.deployment_environment.map(|stage| stage.as_str().to_string()))
             .bind(&service.internal_url)
             .bind(&service.public_url)
             .bind(&service.repo_path)
@@ -423,23 +424,27 @@ impl ConductorRepository for PostgresRepository {
         sqlx::query(
             r#"
             INSERT INTO work_items (
-                id, dedupe_key, title, summary, target_service, status, priority,
+                id, dedupe_key, title, summary, target_service, delivery_stage, validated_stages,
+                rollout_strategy, status, priority,
                 progress_pct, admin_override, execution_approved, verification_required,
                 source, tags, plan, depends_on, notes, scheduled_for, claimed_by,
                 claim_expires_at, claim_token, started_at, finished_at, last_execution_id,
                 last_policy, created_at, updated_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7,
-                $8, $9, $10, $11,
-                $12, $13, $14, $15, $16, $17, $18,
-                $19, $20, $21, $22, $23, $24,
-                $25, $26
+                $8, $9, $10, $11, $12,
+                $13, $14, $15, $16, $17, $18, $19, $20,
+                $21, $22, $23, $24, $25, $26,
+                $27, $28, $29
             )
             ON CONFLICT (id) DO UPDATE SET
                 dedupe_key = EXCLUDED.dedupe_key,
                 title = EXCLUDED.title,
                 summary = EXCLUDED.summary,
                 target_service = EXCLUDED.target_service,
+                delivery_stage = EXCLUDED.delivery_stage,
+                validated_stages = EXCLUDED.validated_stages,
+                rollout_strategy = EXCLUDED.rollout_strategy,
                 status = EXCLUDED.status,
                 priority = EXCLUDED.priority,
                 progress_pct = EXCLUDED.progress_pct,
@@ -467,6 +472,14 @@ impl ConductorRepository for PostgresRepository {
         .bind(&item.title)
         .bind(&item.summary)
         .bind(&item.target_service)
+        .bind(item.delivery_stage.as_str())
+        .bind(Json(
+            item.validated_stages
+                .iter()
+                .map(|stage| stage.as_str().to_string())
+                .collect::<Vec<_>>(),
+        ))
+        .bind(item.rollout_strategy.as_str())
         .bind(item.status.as_str())
         .bind(item.priority)
         .bind(item.progress_pct)
@@ -724,17 +737,19 @@ impl ConductorRepository for PostgresRepository {
         sqlx::query(
             r#"
             INSERT INTO work_executions (
-                id, work_item_id, target_service, status, refiner_job_id, policy,
+                id, work_item_id, target_service, delivery_stage, rollout_strategy, status, refiner_job_id, policy,
                 request_payload, latest_payload, verification, error, started_at,
                 updated_at, finished_at
             ) VALUES (
-                $1, $2, $3, $4, $5, $6,
-                $7, $8, $9, $10, $11,
-                $12, $13
+                $1, $2, $3, $4, $5, $6, $7, $8,
+                $9, $10, $11, $12, $13,
+                $14, $15
             )
             ON CONFLICT (id) DO UPDATE SET
                 work_item_id = EXCLUDED.work_item_id,
                 target_service = EXCLUDED.target_service,
+                delivery_stage = EXCLUDED.delivery_stage,
+                rollout_strategy = EXCLUDED.rollout_strategy,
                 status = EXCLUDED.status,
                 refiner_job_id = EXCLUDED.refiner_job_id,
                 policy = EXCLUDED.policy,
@@ -750,6 +765,8 @@ impl ConductorRepository for PostgresRepository {
         .bind(execution.id)
         .bind(execution.work_item_id)
         .bind(&execution.target_service)
+        .bind(execution.delivery_stage.as_str())
+        .bind(execution.rollout_strategy.as_str())
         .bind(execution.status.as_str())
         .bind(&execution.refiner_job_id)
         .bind(Json(execution.policy.clone()))
@@ -882,6 +899,18 @@ fn map_work_item(row: PgRow) -> Result<WorkItem> {
         title: row.try_get("title")?,
         summary: row.try_get("summary")?,
         target_service: row.try_get("target_service")?,
+        delivery_stage: DeliveryStage::from_db(
+            row.try_get::<String, _>("delivery_stage")?.as_str(),
+        ),
+        validated_stages: row
+            .try_get::<Json<Vec<String>>, _>("validated_stages")?
+            .0
+            .into_iter()
+            .map(|value| DeliveryStage::from_db(value.as_str()))
+            .collect(),
+        rollout_strategy: RolloutStrategy::from_db(
+            row.try_get::<String, _>("rollout_strategy")?.as_str(),
+        ),
         status: WorkStatus::from_db(row.try_get::<String, _>("status")?.as_str()),
         priority: row.try_get("priority")?,
         progress_pct: row.try_get("progress_pct")?,
@@ -917,6 +946,9 @@ fn map_service_snapshot(row: PgRow) -> Result<ServiceSnapshot> {
         hosts: row.try_get::<Json<Vec<String>>, _>("hosts")?.0,
         namespace: row.try_get("namespace")?,
         service_name: row.try_get("service_name")?,
+        deployment_environment: row
+            .try_get::<Option<String>, _>("deployment_environment")?
+            .map(|value| DeliveryStage::from_db(value.as_str())),
         internal_url: row.try_get("internal_url")?,
         public_url: row.try_get("public_url")?,
         repo_path: row.try_get("repo_path")?,
@@ -1039,6 +1071,12 @@ fn map_work_execution(row: PgRow) -> Result<WorkExecution> {
         id: row.try_get("id")?,
         work_item_id: row.try_get("work_item_id")?,
         target_service: row.try_get("target_service")?,
+        delivery_stage: DeliveryStage::from_db(
+            row.try_get::<String, _>("delivery_stage")?.as_str(),
+        ),
+        rollout_strategy: RolloutStrategy::from_db(
+            row.try_get::<String, _>("rollout_strategy")?.as_str(),
+        ),
         status: ExecutionStatus::from_db(row.try_get::<String, _>("status")?.as_str()),
         refiner_job_id: row.try_get("refiner_job_id")?,
         policy: row.try_get::<Json<serde_json::Value>, _>("policy")?.0,

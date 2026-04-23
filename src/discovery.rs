@@ -208,6 +208,7 @@ impl MutableService {
             ],
         )
         .or_else(|| Some(self.service_key.clone()));
+        let deployment_environment = infer_delivery_environment(&self.vars, &self.service_key);
 
         let port = pick_port(
             &self.vars,
@@ -306,6 +307,7 @@ impl MutableService {
             hosts,
             namespace,
             service_name,
+            deployment_environment,
             internal_url,
             public_url,
             repo_path: self.repo_path,
@@ -321,6 +323,36 @@ impl MutableService {
             updated_at: now,
         }
     }
+}
+
+fn infer_delivery_environment(
+    vars: &Map<String, Value>,
+    service_key: &str,
+) -> Option<crate::models::DeliveryStage> {
+    let explicit = pick_string(
+        vars,
+        &[
+            &format!("continuum_tenant_{}_environment", service_key),
+            &format!("continuum_{}_tenant_environment", service_key),
+            "continuum_tenant_environment",
+        ],
+    );
+    if let Some(value) = explicit {
+        return Some(crate::models::DeliveryStage::from_db(&value));
+    }
+
+    for (key, value) in vars {
+        if !key.ends_with("_tenant_environment") {
+            continue;
+        }
+        if !key.contains(service_key) {
+            continue;
+        }
+        if let Some(text) = value.as_str() {
+            return Some(crate::models::DeliveryStage::from_db(text));
+        }
+    }
+    None
 }
 
 impl InventoryIndex {
@@ -2361,6 +2393,7 @@ mod tests {
         let vars = serde_json::from_value::<Map<String, Value>>(json!({
             "continuum_tenant_gail_namespace": "gail",
             "continuum_tenant_gail_service_name": "gail",
+            "continuum_tenant_gail_environment": "prod",
             "continuum_tenant_gail_port": 8080,
             "continuum_tenant_gail_ingress_hostname": "gail.neuralmimicry.ai",
             "continuum_tenant_gail_enable_tls": true,
@@ -2384,10 +2417,27 @@ mod tests {
             service.internal_url.as_deref(),
             Some("http://gail.gail.svc.cluster.local:8080")
         );
+        assert_eq!(
+            service.deployment_environment,
+            Some(crate::models::DeliveryStage::Production)
+        );
         assert!(
             service
                 .capabilities
                 .contains(&"persistent_storage".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_delivery_environment_uses_service_specific_tenant_environment() {
+        let vars = serde_json::from_value::<Map<String, Value>>(json!({
+            "continuum_tenant_refiner_environment": "integration_testing"
+        }))
+        .expect("vars");
+
+        assert_eq!(
+            infer_delivery_environment(&vars, "refiner"),
+            Some(crate::models::DeliveryStage::IntegrationTesting)
         );
     }
 

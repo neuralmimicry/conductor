@@ -104,9 +104,9 @@ The governance layer is present but narrow.
 
 Observed behaviour:
 
-- work items carry status, priority, scheduling state, dependency edges, approval state, verification requirement, and notes
-- policy evaluation checks protected services, protected repository roots, blocked keywords, and basic verification requirements
-- admin APIs allow reprioritisation, approval, schedule changes, manual execution, and manual loop triggering
+- work items carry status, priority, scheduling state, dependency edges, approval state, verification requirement, delivery stage, rollout strategy, validated stages, and notes
+- policy evaluation checks protected services, protected repository roots, blocked keywords, stage prerequisites, production rollout constraints, and verification requirements
+- admin APIs allow reprioritisation, approval, stage/rollout changes, schedule changes, manual execution, and manual loop triggering
 
 This is implemented primarily in:
 
@@ -128,7 +128,8 @@ Observed behaviour:
 - calls Refiner planning and job endpoints
 - polls Refiner job state
 - performs shallow verification against returned stage and finding data
-- records execution payloads, policy decisions, errors, and verification output
+- records execution payloads, policy decisions, stage/rollout metadata, errors, and verification output
+- auto-promotes the work item to the next delivery stage after successful validation when configured to do so
 
 This is implemented primarily in:
 
@@ -168,7 +169,7 @@ The codebase is already separated into coherent modules.
 | `src/integrations.rs` | HTTP client and service-specific probes | practical, but narrow and hardcoded |
 | `src/trends.rs` | metric sample normalisation and trend summaries | good support module |
 | `src/planner.rs` | heuristic recommendation generation | works, but far too limited for the specification |
-| `src/policy.rs` | approval and keyword/path policy checks | only a first-stage gate |
+| `src/policy.rs` | approval, delivery-stage, rollout, and keyword/path policy checks | stage-aware gate, but still not a full governance model |
 | `src/executor.rs` | Refiner submission, polling, verification | strategically important, needs hardening |
 | `src/service.rs` | background orchestration and aggregate queries | solid orchestration layer |
 | `src/app.rs` | HTTP routes and auth checks | adequate for current scope |
@@ -362,8 +363,8 @@ Status meanings used below:
 | REQ-126 to REQ-132 | Recommendation and planning | Partial | prioritised heuristic work items exist, but not dependency-aware implementation plans at programme level |
 | REQ-133 to REQ-139 | Change generation | Partial | Refiner execution exists, but branch/PR/documentation generation is indirect and weakly modelled |
 | REQ-140 to REQ-146 | Validation | Partial | verification exists and findings now carry explicit evidence/provenance, but independent multi-mode validation is still incomplete |
-| REQ-147 to REQ-157 | Governance, safety, trust | Partial | approval and policy gates exist, but permission separation and risk tiers are under-specified |
-| REQ-158 to REQ-163 | Observability | Partial | broadcast events and stored runs exist; no self-metrics or persistent event ledger |
+| REQ-147 to REQ-157 | Governance, safety, trust | Partial | approval, dry-run, emergency-stop, stage progression, and rollout gates now exist, but permission separation and risk tiers are still under-specified |
+| REQ-158 to REQ-163 | Observability | Partial | stored runs, persistent events, stage/rollout summaries, and DORA aggregates now exist, but self-metrics and end-to-end traceability are still missing |
 | REQ-164 to REQ-168 | Knowledge model | Partial | findings, evidence, provenance, repositories, services, and runs are now modelled explicitly, but there is still no richer cross-repository graph or long-horizon temporal knowledge model |
 | REQ-169 to REQ-175 | Non-functional requirements | Partial | some modularity and resilience exist; scaling, incremental analysis, and secret protection need more work |
 | REQ-176 to REQ-185 | Acceptance and implementation principles | Partial | evidence-first staging is now materially stronger because work can be traced back to explicit findings, but maturity targets are still not met |
@@ -388,7 +389,7 @@ Main gaps:
 - no branch, tag, commit, or pull-request inventory beyond current/default branch state
 - no verified ownership, stale-repo, duplicate-repo, or orphaned-component inventory
 - repository classification is still heuristic and not yet backed by language-specific analyzers
-- no explicit environment model for development, test, staging, and production boundaries
+- deployment environment is now inferred per service from Ansible tenant environment variables, but there is still no richer environment graph across repositories, policies, and rollouts
 - no durable dependency map across repositories, services, and infrastructure
 
 Implication:
@@ -568,15 +569,20 @@ What exists:
 - protected target checks
 - keyword blocking
 - staged execution flow
+- delivery-stage and rollout metadata on work items and executions
+- `execution.dry_run` preview mode
+- `execution.emergency_stop`
+- DB-backed execution claims
+- production release gating for `canary` or `red_green`
 
 Main gaps:
 
 - no explicit permission separation between read, recommend, generate, validate, and apply
 - no risk-tier model
-- no dry-run mode for the full pipeline
-- no environment-scoped restrictions
-- no kill switch for autonomous actions
-- no prevention of duplicate autonomous actions across multiple `conductor` instances
+- no end-to-end dry-run that simulates discovery, planning, validation, and release consequences together
+- environment-scoped restrictions are still narrow and mostly expressed through delivery stage rather than explicit environment policy
+- no estate-wide kill switch that spans external executors and adjacent systems
+- non-execution loops still lack the same coordination guarantees that execution now has
 
 Implication:
 
@@ -590,11 +596,12 @@ What exists:
 - stored improvement cycles
 - stored work items
 - stored executions
+- stored persistent conductor events
 - SSE event stream
+- dashboard stage totals, rollout totals, and DORA summary
 
 Main gaps:
 
-- no persistent event journal
 - no metrics about `conductor`'s own loop latency, queue depth, throughput, or failures
 - no traceability graph from finding to change to validation to ticket
 - no cross-repository knowledge model
@@ -608,40 +615,17 @@ The current database is an audit log for a narrow workflow, not a knowledge mode
 
 These are the most important near-term engineering issues observed in the current codebase.
 
-## 9.1 `scheduled_for` is stored but not enforced
+## 9.1 Verification is still not independent
 
-Work items carry `scheduled_for`, but the execution selector currently runs any item that is both approved and in `scheduled` state.
-
-Practical effect:
-
-- a work item scheduled for the future may execute immediately
-- operator intent can be violated
-- dependency-aware scheduling semantics are weaker than the data model suggests
-
-This is a correctness issue, not just a feature gap.
-
-## 9.2 No execution lease or multi-instance coordination
-
-Execution selection is performed without a database lease, row lock, or coordination token.
+Execution verification is still derived mainly from Refiner job result payloads and shallow stage result inspection.
 
 Practical effect:
 
-- two `conductor` instances can pick the same work item
-- duplicate Refiner jobs can be submitted
-- the current design is unsafe for active-active deployment
+- the execution chain still proposes, performs, and largely self-reports success
+- changes affecting security, resilience, concurrency, or performance do not yet trigger independent validation modes
+- release promotion remains auditable, but not yet independently trustworthy enough for higher-autonomy modes
 
-This is the most important resilience gap in the current executor.
-
-## 9.3 Public read access is allowed by default
-
-`allow_dashboard_without_token` defaults to `true`.
-
-Practical effect:
-
-- service topology, queue state, and execution summaries can be exposed unintentionally
-- this is an unsafe default for a governance service
-
-## 9.4 Probe and planning coverage is hardcoded to a small service subset
+## 9.2 Probe and planning coverage is hardcoded to a small service subset
 
 Discovery, probing, and planning all know about a small list of named services.
 
@@ -651,14 +635,34 @@ Practical effect:
 - new services require code edits rather than adapter registration
 - reuse of the broader repository estate is constrained by configuration shape
 
-## 9.5 Verification is not independent
+## 9.3 Governance is stage-aware but still too coarse
 
-Execution verification is derived mainly from Refiner job result payloads.
+The staged delivery pipeline is now explicit, but governance is still mostly binary approval plus a few hardcoded rollout checks.
 
 Practical effect:
 
-- the same execution chain proposes, performs, and effectively self-reports success
-- this violates the spirit of the independent validation requirements
+- there is still no clear permission split between analyse, recommend, generate, validate, and apply
+- risk-tier behaviour is not yet encoded beyond coarse production/UAT gating
+- environment policy remains weaker than the explicit development, test, staging, and production governance required by the specification
+
+## 9.4 Observability is still control-room oriented rather than analytical
+
+Conductor now stores events and computes stage/DORA summaries, but it still lacks first-class self-metrics and traceability graphs.
+
+Practical effect:
+
+- operators can see the current state, but cannot yet analyse queue latency, claim contention, or loop throughput rigorously
+- the system still cannot trace an issue cleanly from finding to recommendation to validation to ticket within one model
+
+## 9.5 DORA coverage is local to Conductor execution history
+
+DORA metrics are now calculated from persisted production-stage executions, but they are not yet correlated with incident systems, bug flow, or runtime rollout telemetry.
+
+Practical effect:
+
+- DORA is useful for Conductor-controlled work, but it is not yet a complete estate-wide release performance model
+- change failure and restore signals can miss incidents that are tracked outside Conductor
+- rollout safety decisions still rely on limited operational evidence
 
 ## 10. Enhancement Roadmap
 
@@ -742,6 +746,26 @@ Suggested module additions:
 - `src/findings.rs`
 - future `src/evidence/`
 - future `src/knowledge/`
+
+## Phase 2b: Staged delivery pipeline and DORA governance
+
+Objective:
+
+make release progression explicit, auditable, and safer before deeper autonomous changes are introduced
+
+Required changes:
+
+- add explicit delivery-stage and rollout-strategy models
+- keep release progression visible on both work items and executions
+- enforce prerequisite stage validation and production rollout controls
+- infer deployed environment context from the existing Ansible estate
+- compute DORA metrics from persisted production execution history
+
+Primary reuse:
+
+- SwarmHPC Ansible for environment hints
+- Refiner as the governed executor
+- existing Postgres execution history rather than a second deployment ledger
 
 ## Phase 3: Repository and code analysis
 
@@ -878,10 +902,11 @@ These are the best initial workstreams if tickets are created next.
 1. Execution safety hardening
 2. Estate inventory and knowledge graph
 3. Repository analysis adapters
-4. Runtime and telemetry ingestion
-5. Atlassian integration
-6. Independent validation pipeline
-7. Governed LLM and AARNN decision pipeline
+4. Staged delivery governance and DORA telemetry
+5. Runtime and telemetry ingestion
+6. Atlassian integration
+7. Independent validation pipeline
+8. Governed LLM and AARNN decision pipeline
 
 ## 14. Minimal Acceptance Path
 
@@ -892,10 +917,11 @@ From the current codebase, the shortest credible path is:
 1. Fix execution correctness and multi-instance safety.
 2. Expand estate inventory across GitHub and Ansible.
 3. Add typed findings with evidence and provenance.
-4. Add repository analysis and runtime telemetry ingestion using internal estate capabilities.
-5. Add Atlassian integration for documentation and work-item management.
-6. Add independent validation and risk-tier governance.
-7. Then add broader autonomous improvement loops.
+4. Add staged delivery progression, controlled rollout governance, and DORA telemetry.
+5. Add repository analysis and runtime telemetry ingestion using internal estate capabilities.
+6. Add Atlassian integration for documentation and work-item management.
+7. Add independent validation and risk-tier governance.
+8. Then add broader autonomous improvement loops.
 
 ## 15. Progress Update: Phase 0 Hardening
 
@@ -972,7 +998,32 @@ Residual Phase 2 work still worth doing:
 
 This means REQ-026 to REQ-038 and REQ-164 to REQ-168 are no longer structurally missing, but they remain partial because deeper multi-source analysis and knowledge correlation are still to be built.
 
-## 18. Final Conclusion
+## 18. Progress Update: Phase 2b Delivery Pipeline and DORA Governance
+
+Status as of 2026-04-23:
+
+Phase 2b has now started in the `conductor` repository and is partially delivered.
+
+Delivered in this pass:
+
+- `work_items`, `work_executions`, service snapshots, policy evaluation, and dashboard summaries now carry explicit delivery-stage and rollout-strategy data
+- discovery now infers per-service deployment environment from existing SwarmHPC `*_tenant_environment` values
+- planner-generated work items now start in `development` with explicit rollout defaults
+- policy now blocks production work that uses `direct` rollout and enforces predecessor-stage validation, including configurable UAT-before-production behaviour
+- executor now records the attempted stage and rollout, validates the completed stage, and can auto-promote the work item to the next stage
+- the dashboard now shows stage totals, rollout totals, deployment environment, and DORA metrics derived from production-stage execution history
+- the SwarmHPC Conductor rollout template now passes the delivery configuration through to the running service so local and deployed behaviour stay aligned
+
+Residual Phase 2b work still worth doing:
+
+- correlate DORA with incidents, Jira bugs, and rollback telemetry rather than Conductor execution history alone
+- add explicit environment-scoped permissions and risk-tier policy rather than relying mainly on stage semantics
+- capture rollout-observation evidence from Tracey, Prometheus, and service-native health signals during canary and red/green promotion
+- expose persisted event history, queue latency, and claim contention more directly in the operator UI
+
+This means REQ-066 to REQ-088, REQ-117 to REQ-125, REQ-147 to REQ-163, and REQ-169 to REQ-185 are now better covered in the delivery control plane, but remain partial because independent validation, Atlassian-native lifecycle correlation, and broader runtime evidence are still incomplete.
+
+## 19. Final Conclusion
 
 `conductor` is already a useful governance and execution coordinator for the NeuralMimicry stack, but it is presently much closer to a topology-aware improvement queue than to the full autonomous improvement conductor defined in the requirements.
 

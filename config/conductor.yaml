@@ -36,6 +36,12 @@ discovery:
     refiner_repo: "/home/pbisaacs/Developer/neuralmimicry/rag_demo"
     aarnn_repo: "/home/pbisaacs/Developer/neuralmimicry/aarnn_rust"
 
+delivery:
+  auto_advance: true
+  dora_window_days: 30
+  require_uat_before_production: true
+  production_canary_percentage: 10
+
 integrations:
   gail:
     enabled: true
