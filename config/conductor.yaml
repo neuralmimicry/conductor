@@ -51,6 +51,7 @@ validation:
   max_commands: 6
 
 integrations:
+  # NeuralMimicry service bearer tokens should be Customers-issued service-account tokens.
   gail:
     enabled: true
     base_url: "${GAIL_BASE_URL}"
@@ -71,6 +72,7 @@ integrations:
     enabled: true
     base_url: "${REFINER_BASE_URL}"
     bearer_token: "${REFINER_BEARER_TOKEN}"
+    # Only use username/password when a first-party human login flow is explicitly required.
     username: "${REFINER_USERNAME}"
     password: "${REFINER_PASSWORD}"
     timeout_seconds: 10

@@ -42,7 +42,7 @@ Rust control-plane service for the NeuralMimicry stack. Conductor discovers the 
 ## Quick Start
 
 1. Create a Postgres database and export `CONDUCTOR_DATABASE_URL`.
-2. Optionally export `CONDUCTOR_ADMIN_TOKEN`, the upstream base URLs / bearer tokens, and Atlassian credentials if ticket/page lifecycle operations should be enabled.
+2. Optionally export `CONDUCTOR_ADMIN_TOKEN`, the upstream base URLs / bearer tokens, and Atlassian credentials if ticket/page lifecycle operations should be enabled. For NeuralMimicry service integrations, prefer Customers-issued service-account bearer tokens scoped to the target service.
 3. Start the service:
 
 ```bash
