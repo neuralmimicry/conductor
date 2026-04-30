@@ -5,7 +5,7 @@ Rust control-plane service for the NeuralMimicry stack. Conductor discovers the 
 ## What It Does
 
 - Parses the SwarmHPC Ansible tree, including inventory groups, `group_vars`, `host_vars`, and tenant playbooks, to infer the deployed topology.
-- Builds a first-class repository inventory from the mounted local estate under `/home/pbisaacs/Developer/neuralmimicry` and optional GitHub organisation metadata.
+- Builds a first-class repository inventory from the mounted local estate under `/home/pbisaacs/Developer/neuralmimicry`, the mounted SwarmHPC rollout repository, and optional GitHub organisation metadata.
 - Resolves repository URLs and branches from Ansible defaults, local git metadata, and explicit repo hints for cross-checking.
 - Probes live endpoints to classify health, capture surfaced capabilities, and persist snapshots, including Gail orchestration and trading status when available.
 - Infers deployment environments from the existing SwarmHPC tenant environment variables where they are present.
@@ -15,6 +15,7 @@ Rust control-plane service for the NeuralMimicry stack. Conductor discovers the 
 - Uses Gail as an optional planning advisor and stores its response alongside each planning cycle.
 - Uses Gail's routed AI stack to perform policy-aware autonomous approval reviews for protected work items and records the decision metadata on each work item.
 - Carries rollout strategy metadata on work items and executions so release promotion stays explicit and auditable.
+- Exposes the mounted SwarmHPC Ansible workspace as a first-class `swarmhpc` deployment-automation target and includes Ansible rollout context in execution payloads for service work.
 - Runs bounded project-native verification commands after Refiner completes and records missing-toolchain cases as explicit `unavailable` validation outcomes.
 - Periodically self-tests the Conductor repository with its own project-native validation commands and queues a regression work item if that baseline breaks.
 - Exposes a work-item traceability view that joins findings, evidence, provenance, executions, and the latest validation state.
@@ -34,6 +35,7 @@ Rust control-plane service for the NeuralMimicry stack. Conductor discovers the 
 - AI-approved work items are automatically moved into `scheduled` status and the execution loop is triggered immediately when capacity is available.
 - Successful stage verification can auto-promote the work item to the next delivery stage.
 - Independent validation now executes discovered repository-native checks when a local repo path and suitable tooling are available.
+- Deployment automation is now represented as a protected `swarmhpc` service backed by the mounted Ansible workspace, so rollout automation can be reviewed and improved through the same queue.
 - Gail capability discovery now absorbs repository-level capabilities such as the trading bridge and backtesting surfaces into the service inventory.
 - Conductor now exposes a native API surface for attaching, creating, publishing, and syncing Atlassian-linked traceability references.
 - Conductor now exposes an estate-wide graph API for tracing change intent from finding through execution, rollout, and synced external systems.
@@ -46,14 +48,15 @@ Rust control-plane service for the NeuralMimicry stack. Conductor discovers the 
 ## Quick Start
 
 1. Create a Postgres database and export `CONDUCTOR_DATABASE_URL`.
-2. Optionally export `CONDUCTOR_ADMIN_TOKEN`, the upstream base URLs / bearer tokens, and Atlassian credentials if ticket/page lifecycle operations should be enabled. For NeuralMimicry service integrations, prefer Customers-issued service-account bearer tokens scoped to the target service.
-3. Start the service:
+2. Export `CONDUCTOR_LOCAL_REPO_ROOT` and `CONDUCTOR_ANSIBLE_ROOT` if your mounted repository estate or Ansible workspace live somewhere other than the default local paths. When running the container image, mount the NeuralMimicry checkout and the SwarmHPC checkout into those paths.
+3. Optionally export `CONDUCTOR_ADMIN_TOKEN`, the upstream base URLs / bearer tokens, and Atlassian credentials if ticket/page lifecycle operations should be enabled. For NeuralMimicry service integrations, prefer Customers-issued service-account bearer tokens scoped to the target service.
+4. Start the service:
 
 ```bash
 cargo run -- --config config/conductor.yaml
 ```
 
-4. Open `http://127.0.0.1:8091/dashboard`.
+5. Open `http://127.0.0.1:8091/dashboard`.
 
 Read APIs are protected by default. Set `allow_dashboard_without_token` to `true` only if you explicitly want public read-only access.
 
@@ -109,6 +112,7 @@ Read APIs are protected by default. Set `allow_dashboard_without_token` to `true
 ## Local Paths Assumed By Default
 
 - Ansible: `/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible`
+- SwarmHPC repo: `/home/pbisaacs/Developer/swarmhpc/swarmhpc`
 - Local repository estate: `/home/pbisaacs/Developer/neuralmimicry`
 - Gail: `/home/pbisaacs/Developer/neuralmimicry/gail`
 - Tracey: `/home/pbisaacs/Developer/neuralmimicry/tracey`

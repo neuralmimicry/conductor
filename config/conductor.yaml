@@ -16,8 +16,8 @@ database:
   run_migrations: true
 
 discovery:
-  ansible_root: "/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible"
-  local_repo_root: "/home/pbisaacs/Developer/neuralmimicry"
+  ansible_root: "${CONDUCTOR_ANSIBLE_ROOT}"
+  local_repo_root: "${CONDUCTOR_LOCAL_REPO_ROOT}"
   refresh_interval_seconds: 180
   probe_services: true
   service_timeout_seconds: 5
@@ -29,12 +29,12 @@ discovery:
     timeout_seconds: 10
     max_repositories: 200
   repo_hints:
-    conductor_repo: "/home/pbisaacs/Developer/neuralmimicry/conductor"
-    gail_repo: "/home/pbisaacs/Developer/neuralmimicry/gail"
-    tracey_repo: "/home/pbisaacs/Developer/neuralmimicry/tracey"
-    continuum_repo: "/home/pbisaacs/Developer/neuralmimicry/nmc"
-    refiner_repo: "/home/pbisaacs/Developer/neuralmimicry/rag_demo"
-    aarnn_repo: "/home/pbisaacs/Developer/neuralmimicry/aarnn_rust"
+    conductor_repo: "${CONDUCTOR_REPO_HINT_CONDUCTOR}"
+    gail_repo: "${CONDUCTOR_REPO_HINT_GAIL}"
+    tracey_repo: "${CONDUCTOR_REPO_HINT_TRACEY}"
+    continuum_repo: "${CONDUCTOR_REPO_HINT_CONTINUUM}"
+    refiner_repo: "${CONDUCTOR_REPO_HINT_REFINER}"
+    aarnn_repo: "${CONDUCTOR_REPO_HINT_AARNN}"
 
 delivery:
   auto_advance: true
@@ -128,6 +128,8 @@ policy:
   require_verification: true
   require_refiner_strict_mode: true
   allow_external_repo_execution: true
+  require_successful_github_actions_for_production: true
+  github_actions_workflow_file: "ci.yml"
   ai_approvals_enabled: true
   ai_approval_interval_seconds: 60
   ai_approval_workflow: "conductor_safe_approval"
@@ -138,13 +140,8 @@ policy:
     - "gail"
     - "refiner"
     - "aarnn"
-  protected_repo_roots:
-    - "/home/pbisaacs/Developer/neuralmimicry/conductor"
-    - "/home/pbisaacs/Developer/neuralmimicry/gail"
-    - "/home/pbisaacs/Developer/neuralmimicry/tracey"
-    - "/home/pbisaacs/Developer/neuralmimicry/nmc"
-    - "/home/pbisaacs/Developer/neuralmimicry/rag_demo"
-    - "/home/pbisaacs/Developer/neuralmimicry/aarnn_rust"
+    - "swarmhpc"
+  protected_repo_roots: []
   blocked_action_keywords:
     - "reset --hard"
     - "rm -rf"

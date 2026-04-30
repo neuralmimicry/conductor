@@ -663,13 +663,25 @@ pub async fn discover_and_probe(
             InventoryIndex::default()
         }
     };
-    let local_repositories = match discover_local_repositories(&config.discovery.local_repo_root) {
-        Ok(repositories) => repositories,
-        Err(error) => {
-            issues.push(format!("local repository inventory failed: {}", error));
-            Vec::new()
+    let mut local_repositories =
+        match discover_local_repositories(&config.discovery.local_repo_root) {
+            Ok(repositories) => repositories,
+            Err(error) => {
+                issues.push(format!("local repository inventory failed: {}", error));
+                Vec::new()
+            }
+        };
+    if let Some(repo_root) = deployment_automation_repo_root(&config.discovery.ansible_root) {
+        if !local_repositories
+            .iter()
+            .any(|repository| repository.local_path == repo_root)
+        {
+            if let Some(repository) = inspect_local_repository(&repo_root) {
+                local_repositories.push(repository);
+                local_repositories.sort_by(|left, right| left.name.cmp(&right.name));
+            }
         }
-    };
+    }
 
     let role_defaults = load_role_defaults(ansible_root)?;
     let global_vars = load_global_vars(ansible_root)?;
@@ -682,6 +694,10 @@ pub async fn discover_and_probe(
         &inventory,
         &local_repositories,
     );
+    if let Some(service) = deployment_automation_service(config, &inventory, &local_repositories) {
+        services.push(service);
+        services.sort_by(|left, right| left.service_key.cmp(&right.service_key));
+    }
 
     if config.discovery.probe_services {
         for service in &mut services {
@@ -867,6 +883,121 @@ fn collect_services(
     entries
         .into_values()
         .map(|entry| entry.finalize(config, inventory, local_repositories))
+        .collect()
+}
+
+fn deployment_automation_service(
+    config: &ConductorConfig,
+    inventory: &InventoryIndex,
+    local_repositories: &[LocalRepository],
+) -> Option<ServiceSnapshot> {
+    let ansible_root = &config.discovery.ansible_root;
+    if !ansible_root.exists() {
+        return None;
+    }
+
+    let repo_root = deployment_automation_repo_root(ansible_root)
+        .unwrap_or_else(|| ansible_root.parent().unwrap_or(ansible_root).to_path_buf());
+    let repo_metadata = repo_metadata(ansible_root);
+    let discovered_at = now_utc();
+    let secrets_root = ansible_root.join(".secrets");
+    let mut capabilities = BTreeSet::from([
+        "ansible".to_string(),
+        "deployment_automation".to_string(),
+        "rollout_scripts".to_string(),
+    ]);
+    if let Some(repository) = local_repositories
+        .iter()
+        .find(|repository| repository.local_path == repo_root)
+    {
+        capabilities.extend(repository.signals.capabilities.iter().cloned());
+    }
+    if secrets_root.exists() {
+        capabilities.insert("secret_material".to_string());
+    }
+    let storage_paths = if secrets_root.exists() {
+        vec![secrets_root.display().to_string()]
+    } else {
+        Vec::new()
+    };
+    let playbooks = top_level_ansible_playbooks(ansible_root);
+    let hosts = all_inventory_hosts(inventory);
+
+    Some(ServiceSnapshot {
+        service_key: "swarmhpc".to_string(),
+        display_name: "SwarmHPC".to_string(),
+        kind: "deployment_automation".to_string(),
+        role_name: "ansible_control_plane".to_string(),
+        playbooks,
+        host_targets: if hosts.is_empty() {
+            Vec::new()
+        } else {
+            vec!["all".to_string()]
+        },
+        hosts,
+        namespace: None,
+        service_name: Some("swarmhpc-ansible".to_string()),
+        deployment_environment: Some(crate::models::DeliveryStage::Production),
+        internal_url: None,
+        public_url: None,
+        repo_path: Some(ansible_root.display().to_string()),
+        repo_url: repo_metadata.url,
+        repo_branch: repo_metadata.branch,
+        health: ServiceHealth::Unknown,
+        capabilities: capabilities.into_iter().collect(),
+        dependencies: Vec::new(),
+        storage_paths,
+        raw_defaults: json!({
+            "ansible_root": ansible_root.display().to_string(),
+            "ansible_repo_root": repo_root.display().to_string(),
+            "ansible_config_path": ansible_root.join("ansible.cfg").display().to_string(),
+            "ansible_inventory_path": ansible_root.join("inventory").join("hosts.ini").display().to_string(),
+            "ansible_roles_path": ansible_root.join("roles").display().to_string(),
+            "ansible_secrets_root": secrets_root.display().to_string(),
+        }),
+        probe: json!({}),
+        discovered_at,
+        updated_at: discovered_at,
+    })
+}
+
+fn top_level_ansible_playbooks(root: &Path) -> Vec<String> {
+    let mut playbooks = fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .is_some_and(|file_type| file_type.is_file())
+        })
+        .filter_map(|entry| {
+            let path = entry.path();
+            let extension = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.to_ascii_lowercase())?;
+            if extension != "yml" && extension != "yaml" {
+                return None;
+            }
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(ToString::to_string)
+        })
+        .collect::<Vec<_>>();
+    playbooks.sort();
+    unique_strings(playbooks)
+}
+
+fn all_inventory_hosts(inventory: &InventoryIndex) -> Vec<String> {
+    inventory
+        .groups
+        .values()
+        .flat_map(|hosts| hosts.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -1159,46 +1290,50 @@ fn discover_local_repositories(root: &Path) -> Result<Vec<LocalRepository>> {
     entries.sort();
 
     for path in entries {
-        if !looks_like_git_repo(&path) {
-            continue;
+        if let Some(repository) = inspect_local_repository(&path) {
+            repositories.push(repository);
         }
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let remote_url = git_output(&path, ["config", "--get", "remote.origin.url"]);
-        let current_branch = git_output(&path, ["rev-parse", "--abbrev-ref", "HEAD"]);
-        let default_branch = git_output(
-            &path,
-            [
-                "symbolic-ref",
-                "--quiet",
-                "--short",
-                "refs/remotes/origin/HEAD",
-            ],
-        )
-        .map(|branch| branch.trim_start_matches("origin/").to_string());
-        let coordinate = remote_url
-            .as_deref()
-            .and_then(repo_coordinate_from_url)
-            .or_else(|| {
-                Some(RepoCoordinate {
-                    owner: None,
-                    name: name.to_string(),
-                })
-            });
-        repositories.push(LocalRepository {
-            name: name.to_string(),
-            local_path: path.clone(),
-            remote_url,
-            current_branch,
-            default_branch,
-            coordinate,
-            signals: analyze_repository(&path, name),
-        });
     }
 
     repositories.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(repositories)
+}
+
+fn inspect_local_repository(path: &Path) -> Option<LocalRepository> {
+    if !looks_like_git_repo(path) {
+        return None;
+    }
+    let name = path.file_name().and_then(|name| name.to_str())?;
+    let remote_url = git_output(path, ["config", "--get", "remote.origin.url"]);
+    let current_branch = git_output(path, ["rev-parse", "--abbrev-ref", "HEAD"]);
+    let default_branch = git_output(
+        path,
+        [
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    )
+    .map(|branch| branch.trim_start_matches("origin/").to_string());
+    let coordinate = remote_url
+        .as_deref()
+        .and_then(repo_coordinate_from_url)
+        .or_else(|| {
+            Some(RepoCoordinate {
+                owner: None,
+                name: name.to_string(),
+            })
+        });
+    Some(LocalRepository {
+        name: name.to_string(),
+        local_path: path.to_path_buf(),
+        remote_url,
+        current_branch,
+        default_branch,
+        coordinate,
+        signals: analyze_repository(path, name),
+    })
 }
 
 async fn load_github_repositories(
@@ -1545,6 +1680,7 @@ fn kind_for_service(service_key: &str, role: &str) -> String {
     match service_key {
         "conductor" | "continuum" => "control_plane".to_string(),
         "tracey" => "host_agent".to_string(),
+        "swarmhpc" => "deployment_automation".to_string(),
         "postgres" => "database".to_string(),
         "prometheus" | "grafana" => "observability".to_string(),
         "ollama" => "llm_runtime".to_string(),
@@ -1560,6 +1696,7 @@ fn friendly_name(service_key: &str) -> String {
         "continuum" => "Continuum".to_string(),
         "refiner" => "Refiner".to_string(),
         "aarnn" => "AARNN".to_string(),
+        "swarmhpc" => "SwarmHPC".to_string(),
         "nmchain" => "NMChain".to_string(),
         "nmstt" => "NMSTT".to_string(),
         "postgres" => "Postgres".to_string(),
@@ -1866,12 +2003,40 @@ fn infer_repository_capabilities_from_files(
     capabilities: &mut BTreeSet<String>,
 ) {
     let readme = readme.unwrap_or_default().to_ascii_lowercase();
+    let ansible_root = if path.join("ansible").join("ansible.cfg").exists()
+        || path.join("ansible").join("inventory").exists()
+        || path.join("ansible").join("roles").exists()
+    {
+        Some(path.join("ansible"))
+    } else if path.join("ansible.cfg").exists()
+        || path.join("inventory").exists()
+        || path.join("roles").exists()
+    {
+        Some(path.to_path_buf())
+    } else {
+        None
+    };
     let has_trading_module = path.join("src").join("trading").exists();
     let has_backtest_module = path
         .join("src")
         .join("trading")
         .join("backtest.rs")
         .exists();
+
+    if let Some(ansible_root) = ansible_root {
+        capabilities.insert("ansible".to_string());
+        capabilities.insert("deployment_automation".to_string());
+        capabilities.insert("rollout_scripts".to_string());
+        if ansible_root.join("inventory").exists() {
+            capabilities.insert("inventory".to_string());
+        }
+        if ansible_root.join("roles").exists() {
+            capabilities.insert("ansible_roles".to_string());
+        }
+        if ansible_root.join(".secrets").exists() || readme.contains(".secrets/") {
+            capabilities.insert("secret_material".to_string());
+        }
+    }
 
     if has_trading_module
         || readme.contains("/v1/trading/")
@@ -2179,6 +2344,23 @@ fn service_repo_aliases(service_key: &str) -> Vec<String> {
     unique_strings(aliases)
 }
 
+fn deployment_automation_repo_root(ansible_root: &Path) -> Option<PathBuf> {
+    if ansible_root.as_os_str().is_empty() {
+        return None;
+    }
+    if looks_like_git_repo(ansible_root) {
+        return Some(ansible_root.to_path_buf());
+    }
+    let mut current = ansible_root.parent();
+    while let Some(candidate) = current {
+        if looks_like_git_repo(candidate) {
+            return Some(candidate.to_path_buf());
+        }
+        current = candidate.parent();
+    }
+    ansible_root.parent().map(Path::to_path_buf)
+}
+
 fn deployment_type_for_service(service: &ServiceSnapshot) -> String {
     match service.kind.as_str() {
         "host_agent" => "host_managed".to_string(),
@@ -2210,6 +2392,7 @@ fn purpose_for_service(service: &ServiceSnapshot) -> String {
         "gail" => "llm_orchestration_gateway".to_string(),
         "tracey" => "telemetry_and_runtime_analysis".to_string(),
         "aarnn" => "neuromorphic_runtime".to_string(),
+        "swarmhpc" => "deployment_automation_and_rollout".to_string(),
         "customers" => "identity_and_session_service".to_string(),
         "billing" => "commercial_service".to_string(),
         _ => "runtime_service".to_string(),
@@ -2219,7 +2402,7 @@ fn purpose_for_service(service: &ServiceSnapshot) -> String {
 fn criticality_for_service(service: &ServiceSnapshot) -> String {
     match service.service_key.as_str() {
         "conductor" | "continuum" | "refiner" | "gail" | "tracey" | "postgres" | "customers"
-        | "billing" | "aarnn" => "critical".to_string(),
+        | "billing" | "aarnn" | "swarmhpc" => "critical".to_string(),
         _ if service.public_url.is_some() || service.capabilities.contains(&"auth".to_string()) => {
             "high".to_string()
         }
@@ -2234,6 +2417,7 @@ fn runtime_type_for_repository_name(name: &str) -> Option<String> {
         "tracey" => Some("host_agent".to_string()),
         "conductor" => Some("control_plane".to_string()),
         "nmc" => Some("control_plane".to_string()),
+        "swarmhpc" => Some("deployment_automation".to_string()),
         _ => None,
     }
 }
@@ -2246,6 +2430,7 @@ fn purpose_for_repository_name(name: &str) -> Option<String> {
         "gail" => Some("llm_orchestration_gateway".to_string()),
         "tracey" => Some("telemetry_and_runtime_analysis".to_string()),
         "nmc" => Some("cluster_control_plane".to_string()),
+        "swarmhpc" => Some("deployment_automation_and_rollout".to_string()),
         "aarnn_rust" | "aarnn-network" | "aarnn-nsys" => Some("neuromorphic_runtime".to_string()),
         _ => None,
     }
@@ -2254,7 +2439,7 @@ fn purpose_for_repository_name(name: &str) -> Option<String> {
 fn criticality_for_repository_name(name: &str) -> String {
     match normalize_repo_name(name).as_str() {
         "conductor" | "rag_demo" | "gail" | "tracey" | "nmc" | "aarnn_rust" | "customers"
-        | "billing" | "nmchain" => "critical".to_string(),
+        | "billing" | "nmchain" | "swarmhpc" => "critical".to_string(),
         "jirastats" | "nmstt" | "oshift" => "high".to_string(),
         _ => "medium".to_string(),
     }
@@ -2263,6 +2448,10 @@ fn criticality_for_repository_name(name: &str) -> String {
 fn repository_capabilities_by_name(name: &str) -> BTreeSet<String> {
     match normalize_repo_name(name).as_str() {
         "conductor" => ["governance", "inventory", "execution_control"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect(),
+        "swarmhpc" => ["ansible", "deployment_automation", "rollout_scripts"]
             .into_iter()
             .map(ToString::to_string)
             .collect(),
@@ -2517,5 +2706,65 @@ mod tests {
         assert!(signals.capabilities.contains(&"crypto_trading".to_string()));
         assert!(signals.capabilities.contains(&"trading_api".to_string()));
         assert!(signals.capabilities.contains(&"backtesting".to_string()));
+    }
+
+    #[test]
+    fn analyze_repository_detects_ansible_automation_capabilities() {
+        let temp = tempdir().expect("tempdir");
+        fs::create_dir_all(temp.path().join("ansible").join("inventory")).expect("inventory");
+        fs::create_dir_all(temp.path().join("ansible").join("roles").join("demo")).expect("roles");
+        fs::write(
+            temp.path().join("ansible").join("ansible.cfg"),
+            "[defaults]\n",
+        )
+        .expect("cfg");
+        fs::write(
+            temp.path()
+                .join("ansible")
+                .join("inventory")
+                .join("hosts.ini"),
+            "[all]\nlocalhost ansible_connection=local\n",
+        )
+        .expect("hosts");
+
+        let signals = analyze_repository(temp.path(), "swarmhpc");
+        assert!(signals.capabilities.contains(&"ansible".to_string()));
+        assert!(
+            signals
+                .capabilities
+                .contains(&"deployment_automation".to_string())
+        );
+        assert!(signals.capabilities.contains(&"inventory".to_string()));
+        assert!(signals.capabilities.contains(&"ansible_roles".to_string()));
+    }
+
+    #[test]
+    fn deployment_automation_service_is_synthesized_from_ansible_root() {
+        let temp = tempdir().expect("tempdir");
+        let ansible_root = temp.path().join("ansible");
+        fs::create_dir_all(ansible_root.join("inventory")).expect("inventory");
+        fs::create_dir_all(ansible_root.join("roles")).expect("roles");
+        fs::write(ansible_root.join("ansible.cfg"), "[defaults]\n").expect("cfg");
+        fs::write(
+            ansible_root.join("inventory").join("hosts.ini"),
+            "[all]\nspirit\nvega\n",
+        )
+        .expect("hosts");
+        fs::write(ansible_root.join("playbook.yml"), "---\n- hosts: all\n").expect("playbook");
+
+        let mut config = ConductorConfig::default();
+        config.discovery.ansible_root = ansible_root.clone();
+        let inventory = load_inventory_hosts(&ansible_root).expect("inventory index");
+
+        let service = deployment_automation_service(&config, &inventory, &[])
+            .expect("deployment automation service");
+        assert_eq!(service.service_key, "swarmhpc");
+        assert_eq!(service.kind, "deployment_automation");
+        assert_eq!(
+            service.repo_path.as_deref(),
+            Some(ansible_root.to_string_lossy().as_ref())
+        );
+        assert!(service.playbooks.contains(&"playbook.yml".to_string()));
+        assert!(service.capabilities.contains(&"ansible".to_string()));
     }
 }

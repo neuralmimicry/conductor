@@ -1176,6 +1176,8 @@ pub struct PolicySummary {
     pub require_verification: bool,
     pub require_refiner_strict_mode: bool,
     pub allow_external_repo_execution: bool,
+    pub require_successful_github_actions_for_production: bool,
+    pub github_actions_workflow_file: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

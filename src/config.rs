@@ -191,6 +191,8 @@ pub struct PolicyConfig {
     pub require_verification: bool,
     pub require_refiner_strict_mode: bool,
     pub allow_external_repo_execution: bool,
+    pub require_successful_github_actions_for_production: bool,
+    pub github_actions_workflow_file: String,
     pub ai_approvals_enabled: bool,
     pub ai_approval_interval_seconds: u64,
     pub ai_approval_workflow: String,
@@ -417,6 +419,8 @@ impl Default for PolicyConfig {
             require_verification: true,
             require_refiner_strict_mode: true,
             allow_external_repo_execution: true,
+            require_successful_github_actions_for_production: true,
+            github_actions_workflow_file: "ci.yml".to_string(),
             ai_approvals_enabled: true,
             ai_approval_interval_seconds: 60,
             ai_approval_workflow: "conductor_safe_approval".to_string(),
@@ -427,6 +431,7 @@ impl Default for PolicyConfig {
                 "gail".to_string(),
                 "refiner".to_string(),
                 "aarnn".to_string(),
+                "swarmhpc".to_string(),
                 "ollama".to_string(),
             ],
             protected_repo_roots: Vec::new(),
@@ -463,9 +468,52 @@ impl ConductorConfig {
         if self.discovery.refresh_interval_seconds == 0 {
             self.discovery.refresh_interval_seconds = 180;
         }
+        if self.discovery.ansible_root.as_os_str().is_empty() {
+            self.discovery.ansible_root =
+                PathBuf::from("/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible");
+        }
         if self.discovery.local_repo_root.as_os_str().is_empty() {
             self.discovery.local_repo_root =
                 PathBuf::from("/home/pbisaacs/Developer/neuralmimicry");
+        }
+        if self
+            .discovery
+            .repo_hints
+            .conductor_repo
+            .as_os_str()
+            .is_empty()
+        {
+            self.discovery.repo_hints.conductor_repo =
+                self.discovery.local_repo_root.join("conductor");
+        }
+        if self.discovery.repo_hints.gail_repo.as_os_str().is_empty() {
+            self.discovery.repo_hints.gail_repo = self.discovery.local_repo_root.join("gail");
+        }
+        if self.discovery.repo_hints.tracey_repo.as_os_str().is_empty() {
+            self.discovery.repo_hints.tracey_repo = self.discovery.local_repo_root.join("tracey");
+        }
+        if self
+            .discovery
+            .repo_hints
+            .continuum_repo
+            .as_os_str()
+            .is_empty()
+        {
+            self.discovery.repo_hints.continuum_repo = self.discovery.local_repo_root.join("nmc");
+        }
+        if self
+            .discovery
+            .repo_hints
+            .refiner_repo
+            .as_os_str()
+            .is_empty()
+        {
+            self.discovery.repo_hints.refiner_repo =
+                self.discovery.local_repo_root.join("rag_demo");
+        }
+        if self.discovery.repo_hints.aarnn_repo.as_os_str().is_empty() {
+            self.discovery.repo_hints.aarnn_repo =
+                self.discovery.local_repo_root.join("aarnn_rust");
         }
         if self.delivery.dora_window_days <= 0 {
             self.delivery.dora_window_days = 30;
@@ -557,6 +605,12 @@ impl ConductorConfig {
             self.policy.ai_approval_interval_seconds = 60;
         }
         self.policy.ai_approval_interval_seconds = self.policy.ai_approval_interval_seconds.max(15);
+        if self.policy.github_actions_workflow_file.trim().is_empty() {
+            self.policy.github_actions_workflow_file = "ci.yml".to_string();
+        } else {
+            self.policy.github_actions_workflow_file =
+                self.policy.github_actions_workflow_file.trim().to_string();
+        }
         if self.policy.ai_approval_workflow.trim().is_empty() {
             self.policy.ai_approval_workflow = "conductor_safe_approval".to_string();
         } else {
@@ -574,7 +628,7 @@ impl ConductorConfig {
         normalize_unique_strings(&mut self.policy.blocked_action_keywords);
         normalize_paths(&mut self.policy.protected_repo_roots);
         if self.policy.protected_repo_roots.is_empty() {
-            self.policy.protected_repo_roots = vec![
+            let mut protected_roots = vec![
                 self.discovery.repo_hints.conductor_repo.clone(),
                 self.discovery.repo_hints.gail_repo.clone(),
                 self.discovery.repo_hints.tracey_repo.clone(),
@@ -582,6 +636,16 @@ impl ConductorConfig {
                 self.discovery.repo_hints.refiner_repo.clone(),
                 self.discovery.repo_hints.aarnn_repo.clone(),
             ];
+            if let Some(ansible_repo_root) = self
+                .discovery
+                .ansible_root
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+            {
+                protected_roots.push(ansible_repo_root);
+            }
+            self.policy.protected_repo_roots = protected_roots;
             normalize_paths(&mut self.policy.protected_repo_roots);
         }
         Ok(())

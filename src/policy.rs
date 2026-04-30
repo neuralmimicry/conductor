@@ -217,6 +217,10 @@ pub fn policy_summary(config: &ConductorConfig) -> PolicySummary {
         require_verification: config.policy.require_verification,
         require_refiner_strict_mode: config.policy.require_refiner_strict_mode,
         allow_external_repo_execution: config.policy.allow_external_repo_execution,
+        require_successful_github_actions_for_production: config
+            .policy
+            .require_successful_github_actions_for_production,
+        github_actions_workflow_file: config.policy.github_actions_workflow_file.clone(),
     }
 }
 
@@ -276,6 +280,27 @@ pub(crate) fn project_native_verification_commands(
         return Vec::new();
     };
     let repo = Path::new(repo_path);
+    if let Some(ansible_root) = ansible_root(repo) {
+        let inventory = ansible_root.join("inventory").join("hosts.ini");
+        let primary_playbook = preferred_ansible_playbook(&ansible_root, service);
+        let ansible_config = relative_command_path(repo, &ansible_root.join("ansible.cfg"));
+        let mut commands = Vec::new();
+        if let Some(playbook) = primary_playbook {
+            commands.push(format!(
+                "env ANSIBLE_CONFIG={} ansible-playbook --syntax-check {}",
+                ansible_config,
+                relative_command_path(repo, &playbook)
+            ));
+        }
+        if inventory.exists() {
+            commands.push(format!(
+                "env ANSIBLE_CONFIG={} ansible-inventory -i {} --list",
+                ansible_config,
+                relative_command_path(repo, &inventory)
+            ));
+        }
+        return commands;
+    }
     if repo.join("Cargo.toml").exists() {
         return vec![
             "cargo fmt --check".to_string(),
@@ -292,6 +317,41 @@ pub(crate) fn project_native_verification_commands(
     Vec::new()
 }
 
+fn ansible_root(repo: &Path) -> Option<std::path::PathBuf> {
+    if repo.join("ansible.cfg").exists() && repo.join("inventory").exists() {
+        return Some(repo.to_path_buf());
+    }
+    let nested = repo.join("ansible");
+    if nested.join("ansible.cfg").exists() && nested.join("inventory").exists() {
+        return Some(nested);
+    }
+    None
+}
+
+fn preferred_ansible_playbook(
+    ansible_root: &Path,
+    service: &ServiceSnapshot,
+) -> Option<std::path::PathBuf> {
+    for preferred in ["playbook.yml", "site.yml"] {
+        let candidate = ansible_root.join(preferred);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    service
+        .playbooks
+        .iter()
+        .map(|playbook| ansible_root.join(playbook))
+        .find(|playbook| playbook.exists())
+}
+
+fn relative_command_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
 pub fn policy_evaluation_to_value(evaluation: &PolicyEvaluation) -> Value {
     serde_json::to_value(evaluation).unwrap_or_else(|_| serde_json::json!({}))
 }
@@ -304,6 +364,7 @@ mod tests {
         models::{DeliveryStage, NewWorkItem, RolloutStrategy, ServiceHealth, WorkItem},
     };
     use serde_json::json;
+    use tempfile::tempdir;
 
     #[test]
     fn protected_target_requires_approval() {
@@ -418,5 +479,62 @@ mod tests {
 
         let evaluation = evaluate_work_item(&config, &item, None);
         assert_eq!(evaluation.verdict, PolicyVerdict::Blocked);
+    }
+
+    #[test]
+    fn project_native_verification_commands_detect_ansible_repo() {
+        let temp = tempdir().expect("tempdir");
+        std::fs::create_dir_all(temp.path().join("inventory")).expect("inventory");
+        std::fs::create_dir_all(temp.path().join("roles")).expect("roles");
+        std::fs::write(temp.path().join("ansible.cfg"), "[defaults]\n").expect("cfg");
+        std::fs::write(
+            temp.path().join("inventory").join("hosts.ini"),
+            "[all]\nlocalhost ansible_connection=local\n",
+        )
+        .expect("hosts");
+        std::fs::write(temp.path().join("playbook.yml"), "---\n- hosts: all\n").expect("playbook");
+
+        let service = crate::models::ServiceSnapshot {
+            service_key: "swarmhpc".to_string(),
+            display_name: "SwarmHPC".to_string(),
+            kind: "deployment_automation".to_string(),
+            role_name: "ansible_control_plane".to_string(),
+            playbooks: vec!["playbook.yml".to_string()],
+            host_targets: vec!["all".to_string()],
+            hosts: vec!["localhost".to_string()],
+            namespace: None,
+            service_name: Some("swarmhpc-ansible".to_string()),
+            deployment_environment: Some(DeliveryStage::Production),
+            internal_url: None,
+            public_url: None,
+            repo_path: Some(temp.path().display().to_string()),
+            repo_url: None,
+            repo_branch: None,
+            health: ServiceHealth::Healthy,
+            capabilities: vec!["ansible".to_string()],
+            dependencies: vec![],
+            storage_paths: vec![],
+            raw_defaults: json!({}),
+            probe: json!({}),
+            discovered_at: now_utc(),
+            updated_at: now_utc(),
+        };
+
+        let commands = project_native_verification_commands(Some(&service));
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("ansible-playbook --syntax-check playbook.yml"))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("ANSIBLE_CONFIG=ansible.cfg"))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("ansible-inventory -i inventory/hosts.ini --list"))
+        );
     }
 }

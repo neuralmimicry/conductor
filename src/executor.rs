@@ -7,9 +7,13 @@ use uuid::Uuid;
 
 use crate::{
     config::ConductorConfig,
+    integrations::{
+        GitHubActionsEvidence, build_http_client, fetch_latest_github_actions_evidence,
+        github_repository_coordinate,
+    },
     models::{
-        ConductorEvent, ExecutionStatus, PolicyVerdict, RolloutStrategy, ServiceSnapshot,
-        WorkExecution, WorkItem, WorkStatus,
+        ConductorEvent, DeliveryStage, ExecutionStatus, PolicyVerdict, RepositorySnapshot,
+        RolloutStrategy, ServiceSnapshot, WorkExecution, WorkItem, WorkStatus,
     },
     policy::{evaluate_work_item, policy_evaluation_to_value},
     repository::ConductorRepository,
@@ -244,7 +248,15 @@ async fn dispatch_claimed_work_item_inner(
             .iter()
             .find(|service| service.service_key == target)
     });
-    let policy = evaluate_work_item(config, item, target_service);
+    let repositories = if matches!(item.delivery_stage, DeliveryStage::Production) {
+        repository.list_repository_snapshots().await?
+    } else {
+        Vec::new()
+    };
+    let mut policy = evaluate_work_item(config, item, target_service);
+    let github_actions =
+        production_github_actions_evidence(config, item, target_service, &repositories).await;
+    apply_github_actions_gate(&mut policy, github_actions.as_ref());
 
     let mut execution = WorkExecution::new(
         item.id,
@@ -252,7 +264,7 @@ async fn dispatch_claimed_work_item_inner(
         item.delivery_stage,
         item.rollout_strategy,
     );
-    execution.policy = policy_evaluation_to_value(&policy);
+    execution.policy = policy_value_with_github_actions(&policy, github_actions.as_ref());
     item.touch_execution(execution.id, execution.policy.clone());
 
     if !matches!(policy.verdict, PolicyVerdict::Allowed) {
@@ -355,7 +367,7 @@ async fn dispatch_claimed_work_item_inner(
     }
 
     execution.mark_status(ExecutionStatus::Planning);
-    let prompt = build_refiner_prompt(item, target_service, &policy);
+    let prompt = build_refiner_prompt(config, item, target_service, &policy);
     let plan_response = match post_refiner_json(
         &client,
         config,
@@ -777,7 +789,7 @@ async fn preview_work_item_execution(
         return Ok(execution);
     }
 
-    let prompt = build_refiner_prompt(&item, target_service, &policy);
+    let prompt = build_refiner_prompt(config, &item, target_service, &policy);
     let preview_payload = build_job_payload(config, &item, target_service, &json!({}))?;
     let independent_validation = preview_independent_validation(
         &config.validation,
@@ -944,6 +956,7 @@ async fn login_refiner_if_configured(
 }
 
 fn build_refiner_prompt(
+    config: &ConductorConfig,
     work_item: &WorkItem,
     service: Option<&ServiceSnapshot>,
     policy: &crate::models::PolicyEvaluation,
@@ -959,6 +972,9 @@ fn build_refiner_prompt(
     } else {
         policy.required_verifications.join(", ")
     };
+    let rollout_context = deployment_automation_context(config, service)
+        .map(|context| format!("\nAnsible rollout context: {}", context))
+        .unwrap_or_default();
     let validated_stages = if work_item.validated_stages.is_empty() {
         "none".to_string()
     } else {
@@ -970,7 +986,7 @@ fn build_refiner_prompt(
             .join(", ")
     };
     format!(
-        "Work item: {title}\nTarget: {target}\nDelivery stage: {delivery_stage}\nValidated stages: {validated_stages}\nRollout strategy: {rollout_strategy}\nSummary: {summary}\nPlan JSON: {plan}\nRepository context: {repo}\nConstraints: keep changes scoped, resilient, and secure; avoid destructive commands; leave unrelated files untouched; do not bypass staged delivery gates.\nRequired verification: {verification}\nProduce a project-solver plan and job payload that implements the change with explicit verification and stage-aware rollout notes.",
+        "Work item: {title}\nTarget: {target}\nDelivery stage: {delivery_stage}\nValidated stages: {validated_stages}\nRollout strategy: {rollout_strategy}\nSummary: {summary}\nPlan JSON: {plan}\nRepository context: {repo}{rollout_context}\nConstraints: keep changes scoped, resilient, and secure; avoid destructive commands; leave unrelated files untouched; do not bypass staged delivery gates.\nRequired verification: {verification}\nProduce a project-solver plan and job payload that implements the change with explicit verification and stage-aware rollout notes.",
         title = work_item.title,
         target = service_name,
         delivery_stage = work_item.delivery_stage.as_str(),
@@ -979,6 +995,7 @@ fn build_refiner_prompt(
         summary = work_item.summary,
         plan = work_item.plan,
         repo = repo_context,
+        rollout_context = rollout_context,
         verification = verification,
     )
 }
@@ -1011,7 +1028,7 @@ fn build_job_payload(
     );
     payload.insert(
         "requirements_text".to_string(),
-        json!(requirements_text(plan_response, work_item, service)),
+        json!(requirements_text(config, plan_response, work_item, service)),
     );
     payload.insert("project_run".to_string(), json!(true));
     payload.insert("dry_run".to_string(), json!(config.execution.dry_run));
@@ -1079,10 +1096,14 @@ fn build_job_payload(
             json!(work_branch_name(work_item)),
         );
     }
+    if let Some(deployment_automation) = deployment_automation_context(config, service) {
+        payload.insert("deployment_automation".to_string(), deployment_automation);
+    }
     Ok(Value::Object(payload))
 }
 
 fn requirements_text(
+    config: &ConductorConfig,
     plan_response: &Value,
     work_item: &WorkItem,
     service: Option<&ServiceSnapshot>,
@@ -1097,8 +1118,17 @@ fn requirements_text(
     let target = service
         .map(|service| service.display_name.as_str())
         .unwrap_or("target service");
+    let rollout_requirement = if let Some(context) = deployment_automation_context(config, service)
+    {
+        format!(
+            "\n- REQ-007: When runtime rollout or restart work is needed, use the available Ansible automation context: {}.",
+            context
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "Overview: Improve {target} through the Conductor execution loop.\n\nDelivery Context:\n- Current stage: {delivery_stage}\n- Validated stages: {validated_stages}\n- Rollout strategy: {rollout_strategy}\n\nRequirements Register:\n- REQ-001: Implement the scoped change described in the work item.\n- REQ-002: Preserve secure, resilient behaviour and avoid destructive commands.\n- REQ-003: Update or add tests covering the changed path.\n- REQ-004: Run verification commands and report the outcome.\n- REQ-005: Leave unrelated files untouched.\n- REQ-006: Preserve staged progression and rollout governance metadata.\n\nWork Item Summary:\n{summary}\n\nPlan JSON:\n{plan}",
+        "Overview: Improve {target} through the Conductor execution loop.\n\nDelivery Context:\n- Current stage: {delivery_stage}\n- Validated stages: {validated_stages}\n- Rollout strategy: {rollout_strategy}\n\nRequirements Register:\n- REQ-001: Implement the scoped change described in the work item.\n- REQ-002: Preserve secure, resilient behaviour and avoid destructive commands.\n- REQ-003: Update or add tests covering the changed path.\n- REQ-004: Run verification commands and report the outcome.\n- REQ-005: Leave unrelated files untouched.\n- REQ-006: Preserve staged progression and rollout governance metadata.{rollout_requirement}\n\nWork Item Summary:\n{summary}\n\nPlan JSON:\n{plan}",
         target = target,
         delivery_stage = work_item.delivery_stage.as_str(),
         validated_stages = if work_item.validated_stages.is_empty() {
@@ -1112,9 +1142,32 @@ fn requirements_text(
                 .join(", ")
         },
         rollout_strategy = work_item.rollout_strategy.as_str(),
+        rollout_requirement = rollout_requirement,
         summary = work_item.summary,
         plan = work_item.plan,
     )
+}
+
+fn deployment_automation_context(
+    config: &ConductorConfig,
+    service: Option<&ServiceSnapshot>,
+) -> Option<Value> {
+    let ansible_root = &config.discovery.ansible_root;
+    if ansible_root.as_os_str().is_empty() || !ansible_root.exists() {
+        return None;
+    }
+    let repo_root = ansible_root.parent().unwrap_or(ansible_root);
+    Some(json!({
+        "repo_root": repo_root.display().to_string(),
+        "ansible_root": ansible_root.display().to_string(),
+        "config_path": ansible_root.join("ansible.cfg").display().to_string(),
+        "inventory_path": ansible_root.join("inventory").join("hosts.ini").display().to_string(),
+        "roles_path": ansible_root.join("roles").display().to_string(),
+        "secrets_root": ansible_root.join(".secrets").display().to_string(),
+        "playbooks": service.map(|service| service.playbooks.clone()).unwrap_or_default(),
+        "host_targets": service.map(|service| service.host_targets.clone()).unwrap_or_default(),
+        "hosts": service.map(|service| service.hosts.clone()).unwrap_or_default(),
+    }))
 }
 
 fn work_branch_name(work_item: &WorkItem) -> String {
@@ -1133,6 +1186,194 @@ fn work_branch_name(work_item: &WorkItem) -> String {
         })
         .collect();
     format!("conductor/{}", sanitized.trim_matches('-'))
+}
+
+fn policy_value_with_github_actions(
+    policy: &crate::models::PolicyEvaluation,
+    github_actions: Option<&GitHubActionsEvidence>,
+) -> Value {
+    let mut value = policy_evaluation_to_value(policy);
+    if let Some(evidence) = github_actions {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "github_actions".to_string(),
+                serde_json::to_value(evidence).unwrap_or_else(|_| json!({})),
+            );
+        }
+    }
+    value
+}
+
+fn apply_github_actions_gate(
+    policy: &mut crate::models::PolicyEvaluation,
+    github_actions: Option<&GitHubActionsEvidence>,
+) {
+    let Some(evidence) = github_actions else {
+        return;
+    };
+    if evidence.succeeded {
+        return;
+    }
+
+    policy
+        .reasons
+        .retain(|reason| reason != "policy checks passed");
+    if !policy.reasons.contains(&evidence.reason) {
+        policy.reasons.push(evidence.reason.clone());
+    }
+    policy.verdict = PolicyVerdict::Blocked;
+    policy.risk_level = "critical".to_string();
+}
+
+async fn production_github_actions_evidence(
+    config: &ConductorConfig,
+    item: &WorkItem,
+    service: Option<&ServiceSnapshot>,
+    repositories: &[RepositorySnapshot],
+) -> Option<GitHubActionsEvidence> {
+    if !config
+        .policy
+        .require_successful_github_actions_for_production
+        || !matches!(item.delivery_stage, DeliveryStage::Production)
+    {
+        return None;
+    }
+
+    let workflow_file = config.policy.github_actions_workflow_file.clone();
+    let context = rollout_repository_context(service, repositories);
+    let Some((repo_url, branches)) = context else {
+        return Some(GitHubActionsEvidence {
+            workflow_file,
+            owner: None,
+            repository: None,
+            branch: None,
+            succeeded: false,
+            reason: "production rollout requires repository and branch context for GitHub Actions verification".to_string(),
+            run: None,
+        });
+    };
+
+    let Some((owner, repository)) = github_repository_coordinate(&repo_url) else {
+        return Some(GitHubActionsEvidence {
+            workflow_file,
+            owner: None,
+            repository: None,
+            branch: branches.first().cloned(),
+            succeeded: false,
+            reason: format!(
+                "production rollout requires a GitHub repository URL, but '{}' could not be parsed",
+                repo_url
+            ),
+            run: None,
+        });
+    };
+
+    let client = match build_http_client(config.discovery.github.timeout_seconds.max(1)) {
+        Ok(client) => client,
+        Err(error) => {
+            return Some(GitHubActionsEvidence {
+                workflow_file,
+                owner: Some(owner),
+                repository: Some(repository),
+                branch: branches.first().cloned(),
+                succeeded: false,
+                reason: format!("unable to create GitHub Actions client: {}", error),
+                run: None,
+            });
+        }
+    };
+
+    let mut last_missing = None;
+    for branch in branches {
+        match fetch_latest_github_actions_evidence(
+            &client,
+            config,
+            &owner,
+            &repository,
+            &branch,
+            &workflow_file,
+        )
+        .await
+        {
+            Ok(evidence) if evidence.succeeded => return Some(evidence),
+            Ok(evidence) if evidence.run.is_some() => return Some(evidence),
+            Ok(evidence) => last_missing = Some(evidence),
+            Err(error) => {
+                return Some(GitHubActionsEvidence {
+                    workflow_file: workflow_file.clone(),
+                    owner: Some(owner.clone()),
+                    repository: Some(repository.clone()),
+                    branch: Some(branch),
+                    succeeded: false,
+                    reason: format!(
+                        "unable to verify GitHub Actions workflow {}: {}",
+                        workflow_file, error
+                    ),
+                    run: None,
+                });
+            }
+        }
+    }
+
+    last_missing.or_else(|| {
+        Some(GitHubActionsEvidence {
+            workflow_file,
+            owner: Some(owner),
+            repository: Some(repository),
+            branch: None,
+            succeeded: false,
+            reason: "production rollout requires a branch to verify GitHub Actions CI".to_string(),
+            run: None,
+        })
+    })
+}
+
+fn rollout_repository_context(
+    service: Option<&ServiceSnapshot>,
+    repositories: &[RepositorySnapshot],
+) -> Option<(String, Vec<String>)> {
+    let service = service?;
+    let matched = service
+        .repo_path
+        .as_deref()
+        .and_then(|repo_path| {
+            repositories
+                .iter()
+                .find(|repository| repository.local_path.as_deref() == Some(repo_path))
+        })
+        .or_else(|| {
+            service.repo_url.as_deref().and_then(|repo_url| {
+                repositories
+                    .iter()
+                    .find(|repository| repository.repo_url.as_deref() == Some(repo_url))
+            })
+        })
+        .or_else(|| {
+            repositories
+                .iter()
+                .find(|repository| repository.linked_services.contains(&service.service_key))
+        });
+
+    let repo_url = service
+        .repo_url
+        .clone()
+        .or_else(|| matched.and_then(|repository| repository.repo_url.clone()))?;
+    let mut branches = Vec::new();
+    for branch in [
+        service.repo_branch.clone(),
+        matched.and_then(|repository| repository.current_branch.clone()),
+        matched.and_then(|repository| repository.default_branch.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let branch = branch.trim();
+        if !branch.is_empty() && !branches.iter().any(|candidate| candidate == branch) {
+            branches.push(branch.to_string());
+        }
+    }
+
+    Some((repo_url, branches))
 }
 
 async fn poll_refiner_job(
@@ -1394,8 +1635,11 @@ mod tests {
         storage::memory::MemoryRepository,
         validation::{IndependentValidationReport, ValidationCommandResult},
     };
+    use axum::{Json, Router, routing::get};
     use chrono::Duration as ChronoDuration;
     use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::net::TcpListener;
 
     fn sample_service() -> ServiceSnapshot {
         ServiceSnapshot {
@@ -1423,6 +1667,36 @@ mod tests {
             discovered_at: crate::models::now_utc(),
             updated_at: crate::models::now_utc(),
         }
+    }
+
+    async fn spawn_mock_github(conclusion: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/repos/neuralmimicry/conductor/actions/workflows/ci.yml/runs",
+            get(move || async move {
+                Json(json!({
+                    "workflow_runs": [
+                        {
+                            "id": 100,
+                            "name": "CI",
+                            "status": "completed",
+                            "conclusion": conclusion,
+                            "html_url": "https://github.com/neuralmimicry/conductor/actions/runs/100",
+                            "run_number": 12,
+                            "head_sha": "abc123",
+                            "event": "push",
+                            "updated_at": "2026-04-30T10:00:00Z"
+                        }
+                    ]
+                }))
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind github");
+        let addr = listener.local_addr().expect("github addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve github");
+        });
+        (format!("http://{}", addr), handle)
     }
 
     #[test]
@@ -1511,6 +1785,67 @@ mod tests {
                 .and_then(|rollout| rollout.get("canary_percentage"))
                 .and_then(Value::as_u64),
             Some(25)
+        );
+    }
+
+    #[test]
+    fn job_payload_includes_deployment_automation_context() {
+        let temp = tempdir().expect("tempdir");
+        let ansible_root = temp.path().join("ansible");
+        std::fs::create_dir_all(ansible_root.join("inventory")).expect("inventory");
+        std::fs::create_dir_all(ansible_root.join("roles")).expect("roles");
+        std::fs::write(ansible_root.join("ansible.cfg"), "[defaults]\n").expect("cfg");
+        std::fs::write(
+            ansible_root.join("inventory").join("hosts.ini"),
+            "[all]\nlocalhost ansible_connection=local\n",
+        )
+        .expect("hosts");
+
+        let mut config = ConductorConfig::default();
+        config.discovery.ansible_root = ansible_root.clone();
+        let mut service = sample_service();
+        service.playbooks = vec!["continuum_tenant_conductor_site.yml".to_string()];
+        service.host_targets = vec!["rk1".to_string()];
+        service.hosts = vec!["spirit".to_string()];
+
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("rollout:conductor".to_string()),
+            title: "Roll out Conductor".to_string(),
+            summary: "Apply a controlled runtime restart".to_string(),
+            target_service: Some("conductor".to_string()),
+            delivery_stage: Some(DeliveryStage::IntegrationTesting),
+            validated_stages: vec![DeliveryStage::Development, DeliveryStage::Testing],
+            rollout_strategy: Some(RolloutStrategy::Canary),
+            status: Some(WorkStatus::Scheduled),
+            priority: Some(80),
+            progress_pct: Some(50),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "rollout_restart"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+
+        let payload =
+            build_job_payload(&config, &item, Some(&service), &json!({})).expect("payload");
+        let deployment = payload
+            .get("deployment_automation")
+            .and_then(Value::as_object)
+            .expect("deployment automation");
+        assert_eq!(
+            deployment.get("ansible_root").and_then(Value::as_str),
+            Some(ansible_root.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            deployment
+                .get("playbooks")
+                .and_then(Value::as_array)
+                .and_then(|playbooks| playbooks.first())
+                .and_then(Value::as_str),
+            Some("continuum_tenant_conductor_site.yml")
         );
     }
 
@@ -1861,5 +2196,64 @@ mod tests {
                 .expect("executions")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn production_execution_blocks_when_github_actions_ci_failed() {
+        let (github_base_url, github_handle) = spawn_mock_github("failure").await;
+        let mut config = ConductorConfig::default();
+        config.discovery.github.api_base_url = github_base_url;
+
+        let repository = Arc::new(MemoryRepository::new());
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("promote:conductor".to_string()),
+            title: "Promote Conductor".to_string(),
+            summary: "Promote the candidate to production".to_string(),
+            target_service: Some("conductor".to_string()),
+            delivery_stage: Some(DeliveryStage::Production),
+            validated_stages: vec![DeliveryStage::Uat],
+            rollout_strategy: Some(RolloutStrategy::Canary),
+            status: Some(WorkStatus::Scheduled),
+            priority: Some(95),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "promote_release"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+
+        repository.upsert_work_item(&item).await.expect("item");
+        repository
+            .replace_service_snapshots(&[sample_service()])
+            .await
+            .expect("services");
+
+        let execution =
+            execute_specific_work_item(repository.as_ref(), &config, item.id, false, None)
+                .await
+                .expect("execution");
+
+        assert_eq!(execution.status, ExecutionStatus::Blocked);
+        assert!(
+            execution
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("GitHub Actions workflow ci.yml concluded with failure")
+        );
+        assert_eq!(
+            execution
+                .policy
+                .get("github_actions")
+                .and_then(|value| value.get("succeeded"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        github_handle.abort();
     }
 }

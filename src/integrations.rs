@@ -1,7 +1,8 @@
-use std::time::Duration;
+use std::{fs, path::Path, time::Duration};
 
 use anyhow::{Result, anyhow};
 use reqwest::{Client, StatusCode};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
@@ -14,11 +15,209 @@ pub mod continuum;
 pub mod refiner;
 pub mod tracey;
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitHubActionsRunEvidence {
+    pub id: u64,
+    pub name: Option<String>,
+    pub status: Option<String>,
+    pub conclusion: Option<String>,
+    pub html_url: Option<String>,
+    pub run_number: Option<u64>,
+    pub head_sha: Option<String>,
+    pub event: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitHubActionsEvidence {
+    pub workflow_file: String,
+    pub owner: Option<String>,
+    pub repository: Option<String>,
+    pub branch: Option<String>,
+    pub succeeded: bool,
+    pub reason: String,
+    pub run: Option<GitHubActionsRunEvidence>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubWorkflowRunsResponse {
+    #[serde(default)]
+    workflow_runs: Vec<GitHubWorkflowRun>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubWorkflowRun {
+    id: u64,
+    name: Option<String>,
+    status: Option<String>,
+    conclusion: Option<String>,
+    html_url: Option<String>,
+    run_number: Option<u64>,
+    head_sha: Option<String>,
+    event: Option<String>,
+    updated_at: Option<String>,
+}
+
 pub fn build_http_client(timeout_seconds: u64) -> Result<Client> {
     Ok(Client::builder()
         .use_rustls_tls()
         .timeout(Duration::from_secs(timeout_seconds.max(1)))
         .build()?)
+}
+
+pub fn github_repository_coordinate(url: &str) -> Option<(String, String)> {
+    let trimmed = url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let path = if let Some(rest) = trimmed.strip_prefix("git@") {
+        rest.split_once(':')?.1
+    } else if let Some(rest) = trimmed.strip_prefix("https://") {
+        rest.split_once('/')?.1
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        rest.split_once('/')?.1
+    } else {
+        return None;
+    };
+
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let repository = parts.next()?.trim().trim_end_matches(".git");
+    if owner.is_empty() || repository.is_empty() {
+        return None;
+    }
+    Some((owner.to_string(), repository.to_string()))
+}
+
+pub async fn fetch_latest_github_actions_evidence(
+    client: &Client,
+    config: &ConductorConfig,
+    owner: &str,
+    repository: &str,
+    branch: &str,
+    workflow_file: &str,
+) -> Result<GitHubActionsEvidence> {
+    let workflow_file = workflow_file.trim();
+    let branch = branch.trim();
+    let base_url = config.discovery.github.api_base_url.trim_end_matches('/');
+    let url = format!(
+        "{}/repos/{}/{}/actions/workflows/{}/runs",
+        base_url, owner, repository, workflow_file
+    );
+
+    let mut request = client
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "neuralmimicry-conductor");
+    if let Some(token) = config
+        .discovery
+        .github
+        .token
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        request = request.bearer_auth(token);
+    }
+
+    let response = request
+        .query(&[
+            ("branch", branch),
+            ("status", "completed"),
+            ("per_page", "1"),
+        ])
+        .send()
+        .await?;
+    let status = response.status();
+
+    if status == StatusCode::NOT_FOUND {
+        return Ok(GitHubActionsEvidence {
+            workflow_file: workflow_file.to_string(),
+            owner: Some(owner.to_string()),
+            repository: Some(repository.to_string()),
+            branch: Some(branch.to_string()),
+            succeeded: false,
+            reason: format!(
+                "GitHub Actions workflow {} is missing or has no completed runs for {}/{} on branch {}",
+                workflow_file, owner, repository, branch
+            ),
+            run: None,
+        });
+    }
+
+    if !status.is_success() {
+        let payload = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+        let message = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("error").and_then(Value::as_str))
+            .unwrap_or("request failed");
+        return Err(anyhow!(
+            "GitHub Actions query failed with {} for {}/{} on branch {}: {}",
+            status,
+            owner,
+            repository,
+            branch,
+            message
+        ));
+    }
+
+    let payload = response.json::<GitHubWorkflowRunsResponse>().await?;
+    let run = payload.workflow_runs.into_iter().next();
+    let Some(run) = run else {
+        return Ok(GitHubActionsEvidence {
+            workflow_file: workflow_file.to_string(),
+            owner: Some(owner.to_string()),
+            repository: Some(repository.to_string()),
+            branch: Some(branch.to_string()),
+            succeeded: false,
+            reason: format!(
+                "GitHub Actions workflow {} has no completed runs for {}/{} on branch {}",
+                workflow_file, owner, repository, branch
+            ),
+            run: None,
+        });
+    };
+
+    let succeeded = run
+        .conclusion
+        .as_deref()
+        .is_some_and(|conclusion| conclusion.eq_ignore_ascii_case("success"));
+    let conclusion = run
+        .conclusion
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let reason = if succeeded {
+        format!(
+            "GitHub Actions workflow {} succeeded for {}/{} on branch {}",
+            workflow_file, owner, repository, branch
+        )
+    } else {
+        format!(
+            "GitHub Actions workflow {} concluded with {} for {}/{} on branch {}",
+            workflow_file, conclusion, owner, repository, branch
+        )
+    };
+
+    Ok(GitHubActionsEvidence {
+        workflow_file: workflow_file.to_string(),
+        owner: Some(owner.to_string()),
+        repository: Some(repository.to_string()),
+        branch: Some(branch.to_string()),
+        succeeded,
+        reason,
+        run: Some(GitHubActionsRunEvidence {
+            id: run.id,
+            name: run.name,
+            status: run.status,
+            conclusion: run.conclusion,
+            html_url: run.html_url,
+            run_number: run.run_number,
+            head_sha: run.head_sha,
+            event: run.event,
+            updated_at: run.updated_at,
+        }),
+    })
 }
 
 pub async fn probe_service(
@@ -32,6 +231,7 @@ pub async fn probe_service(
         "continuum" => probe_continuum(client, config, service).await,
         "refiner" => probe_refiner(client, config, service).await,
         "aarnn" => probe_aarnn(client, config, service).await,
+        "swarmhpc" => probe_swarmhpc(config, service).await,
         "ollama" => probe_ollama(client, config, service).await,
         _ => {
             probe_generic(
@@ -178,6 +378,73 @@ async fn probe_tracey(
             "resource_forecast": status.get("resource_forecast").cloned(),
         }),
         health: ServiceHealth::Healthy,
+    })
+}
+
+async fn probe_swarmhpc(
+    config: &ConductorConfig,
+    service: &ServiceSnapshot,
+) -> Result<ProbeResult> {
+    let ansible_root = service
+        .raw_defaults
+        .get("ansible_root")
+        .and_then(Value::as_str)
+        .map(Path::new)
+        .filter(|path| path.exists())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| config.discovery.ansible_root.clone());
+    let config_path = ansible_root.join("ansible.cfg");
+    let inventory_path = ansible_root.join("inventory").join("hosts.ini");
+    let roles_path = ansible_root.join("roles");
+    let secrets_path = ansible_root.join(".secrets");
+    let playbook_count = fs::read_dir(&ansible_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .is_some_and(|file_type| file_type.is_file())
+        })
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| matches!(extension, "yml" | "yaml"))
+        })
+        .count();
+    let healthy = config_path.exists() && inventory_path.exists() && roles_path.exists();
+    Ok(ProbeResult {
+        endpoint: None,
+        summary: if healthy {
+            format!(
+                "SwarmHPC deployment automation is available with {} playbook(s)",
+                playbook_count
+            )
+        } else {
+            "SwarmHPC deployment automation is missing one or more core Ansible paths".to_string()
+        },
+        metrics: json!({
+            "ansible_root": ansible_root.display().to_string(),
+            "ansible_config_path": config_path.display().to_string(),
+            "inventory_path": inventory_path.display().to_string(),
+            "roles_path": roles_path.display().to_string(),
+            "secrets_path": secrets_path.display().to_string(),
+            "ansible_config_exists": config_path.exists(),
+            "inventory_exists": inventory_path.exists(),
+            "roles_path_exists": roles_path.exists(),
+            "secrets_path_exists": secrets_path.exists(),
+            "playbook_count": playbook_count,
+            "playbooks": service.playbooks,
+        }),
+        health: if healthy {
+            ServiceHealth::Healthy
+        } else {
+            ServiceHealth::Degraded
+        },
     })
 }
 
@@ -561,4 +828,75 @@ pub(crate) async fn decode_json(response: reqwest::Response) -> Result<Value> {
         _ => "upstream_error",
     };
     Err(anyhow!("{}: {}", prefix, message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Json, Router, routing::get};
+    use tokio::net::TcpListener;
+
+    async fn spawn_mock_github(
+        run_conclusion: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/repos/neuralmimicry/conductor/actions/workflows/ci.yml/runs",
+            get(move || async move {
+                Json(json!({
+                    "workflow_runs": [
+                        {
+                            "id": 42,
+                            "name": "CI",
+                            "status": "completed",
+                            "conclusion": run_conclusion,
+                            "html_url": "https://github.com/neuralmimicry/conductor/actions/runs/42",
+                            "run_number": 7,
+                            "head_sha": "abc123",
+                            "event": "push",
+                            "updated_at": "2026-04-30T10:00:00Z"
+                        }
+                    ]
+                }))
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind github mock");
+        let addr = listener.local_addr().expect("github mock addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve github mock");
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_github_actions_evidence_reports_success() {
+        let (base_url, handle) = spawn_mock_github("success").await;
+        let mut config = ConductorConfig::default();
+        config.discovery.github.api_base_url = base_url;
+
+        let client = build_http_client(5).expect("client");
+        let evidence = fetch_latest_github_actions_evidence(
+            &client,
+            &config,
+            "neuralmimicry",
+            "conductor",
+            "main",
+            "ci.yml",
+        )
+        .await
+        .expect("github evidence");
+
+        assert!(evidence.succeeded);
+        assert_eq!(
+            evidence
+                .run
+                .as_ref()
+                .and_then(|run| run.conclusion.as_deref()),
+            Some("success")
+        );
+
+        handle.abort();
+    }
 }
