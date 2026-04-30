@@ -7,14 +7,16 @@ Rust control-plane service for the NeuralMimicry stack. Conductor discovers the 
 - Parses the SwarmHPC Ansible tree, including inventory groups, `group_vars`, `host_vars`, and tenant playbooks, to infer the deployed topology.
 - Builds a first-class repository inventory from the mounted local estate under `/home/pbisaacs/Developer/neuralmimicry` and optional GitHub organisation metadata.
 - Resolves repository URLs and branches from Ansible defaults, local git metadata, and explicit repo hints for cross-checking.
-- Probes live endpoints to classify health, capture surfaced capabilities, and persist snapshots.
+- Probes live endpoints to classify health, capture surfaced capabilities, and persist snapshots, including Gail orchestration and trading status when available.
 - Infers deployment environments from the existing SwarmHPC tenant environment variables where they are present.
 - Derives typed findings, evidence, and provenance records from repository inventory, service topology, runtime probes, and trend summaries.
 - Runs an improvement-planning loop that turns evidence-backed findings into graph-aware work items.
 - Seeds every new work item into an explicit staged delivery pipeline: `development`, `testing`, `integration`, `integration_testing`, `uat`, then `production`.
 - Uses Gail as an optional planning advisor and stores its response alongside each planning cycle.
+- Uses Gail's routed AI stack to perform policy-aware autonomous approval reviews for protected work items and records the decision metadata on each work item.
 - Carries rollout strategy metadata on work items and executions so release promotion stays explicit and auditable.
 - Runs bounded project-native verification commands after Refiner completes and records missing-toolchain cases as explicit `unavailable` validation outcomes.
+- Periodically self-tests the Conductor repository with its own project-native validation commands and queues a regression work item if that baseline breaks.
 - Exposes a work-item traceability view that joins findings, evidence, provenance, executions, and the latest validation state.
 - Stores persistent external traceability links for Jira, Confluence, builds, incidents, and rollout records against work items.
 - Creates or dedupes Jira issues and Confluence pages natively against Atlassian and persists the resulting references back into traceability links.
@@ -29,8 +31,10 @@ Rust control-plane service for the NeuralMimicry stack. Conductor discovers the 
 
 - Conductor now executes approved, scheduled, dependency-satisfied work items through Refiner's planning and job APIs.
 - Execution selection now respects `scheduled_for`, uses DB-backed claims to avoid duplicate dispatch, and supports `dry_run` and `emergency_stop` controls.
+- AI-approved work items are automatically moved into `scheduled` status and the execution loop is triggered immediately when capacity is available.
 - Successful stage verification can auto-promote the work item to the next delivery stage.
 - Independent validation now executes discovered repository-native checks when a local repo path and suitable tooling are available.
+- Gail capability discovery now absorbs repository-level capabilities such as the trading bridge and backtesting surfaces into the service inventory.
 - Conductor now exposes a native API surface for attaching, creating, publishing, and syncing Atlassian-linked traceability references.
 - Conductor now exposes an estate-wide graph API for tracing change intent from finding through execution, rollout, and synced external systems.
 - Production execution is policy-blocked unless the rollout strategy is `canary` or `red_green`.

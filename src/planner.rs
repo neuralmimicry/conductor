@@ -229,24 +229,52 @@ async fn upsert_recommendation(
         if existing.admin_override {
             return Ok(());
         }
-        repository
-            .patch_work_item(
-                existing.id,
-                crate::models::WorkItemPatch {
-                    title: Some(recommendation.title.clone()),
-                    summary: Some(recommendation.summary.clone()),
-                    target_service: recommendation.target_service.clone(),
-                    delivery_stage: Some(recommendation.delivery_stage),
-                    rollout_strategy: Some(recommendation.rollout_strategy),
-                    priority: Some(recommendation.priority),
-                    tags: Some(recommendation.tags.clone()),
-                    plan: Some(recommendation.plan.clone()),
-                    depends_on: Some(recommendation.depends_on.clone()),
-                    note: Some("planner refreshed recommendation".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await?;
+        let material_change = existing.title != recommendation.title
+            || existing.summary != recommendation.summary
+            || existing.target_service != recommendation.target_service
+            || existing.delivery_stage != recommendation.delivery_stage
+            || existing.rollout_strategy != recommendation.rollout_strategy
+            || existing.priority != recommendation.priority
+            || existing.tags != recommendation.tags
+            || existing.plan != recommendation.plan
+            || existing.depends_on != recommendation.depends_on;
+
+        let mut updated = existing.clone();
+        updated.title = recommendation.title.clone();
+        updated.summary = recommendation.summary.clone();
+        updated.target_service = recommendation.target_service.clone();
+        updated.delivery_stage = recommendation.delivery_stage;
+        updated.rollout_strategy = recommendation.rollout_strategy;
+        updated.priority = recommendation.priority;
+        updated.tags = recommendation.tags.clone();
+        updated.plan = recommendation.plan.clone();
+        updated.depends_on = recommendation.depends_on.clone();
+        updated.updated_at = now_utc();
+        updated.notes.push(format!(
+            "{} {}",
+            now_utc().to_rfc3339(),
+            if material_change {
+                "planner refreshed recommendation"
+            } else {
+                "planner confirmed recommendation"
+            }
+        ));
+        if material_change && (updated.execution_approved || updated.approval_metadata != json!({}))
+        {
+            updated.execution_approved = false;
+            updated.approval_metadata = json!({});
+            if matches!(
+                updated.status,
+                WorkStatus::Planned | WorkStatus::Scheduled | WorkStatus::OnHold
+            ) {
+                updated.status = WorkStatus::Planned;
+            }
+            updated.notes.push(format!(
+                "{} planner reset approval because the recommended change changed",
+                now_utc().to_rfc3339()
+            ));
+        }
+        repository.upsert_work_item(&updated).await?;
         return Ok(());
     }
 
@@ -305,8 +333,13 @@ mod tests {
     use super::*;
     use crate::{
         findings::detect_findings,
-        models::{DeliveryStage, ServiceHealth, ServiceSnapshot, ServiceTrendSummary},
+        models::{
+            DeliveryStage, NewWorkItem, RolloutStrategy, ServiceHealth, ServiceSnapshot,
+            ServiceTrendSummary, WorkStatus,
+        },
+        storage::memory::MemoryRepository,
     };
+    use std::sync::Arc;
 
     #[test]
     fn planner_flags_degraded_services() {
@@ -430,5 +463,60 @@ mod tests {
                 .iter()
                 .any(|item| item.dedupe_key == "tracey:worsening_trend")
         );
+    }
+
+    #[tokio::test]
+    async fn planner_resets_execution_approval_when_recommendation_changes() {
+        let repository = Arc::new(MemoryRepository::new());
+        let mut item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("gail:trading".to_string()),
+            title: "Improve Gail trading".to_string(),
+            summary: "Tighten the trading loop".to_string(),
+            target_service: Some("gail".to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: Vec::new(),
+            rollout_strategy: Some(RolloutStrategy::Direct),
+            status: Some(WorkStatus::Scheduled),
+            priority: Some(90),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec!["gail".to_string(), "trading".to_string()],
+            plan: json!({"action": "improve_trading", "scope": "signals"}),
+            depends_on: Vec::new(),
+            source: Some("planner".to_string()),
+            scheduled_for: None,
+        });
+        item.approval_metadata = json!({"verdict": "approved"});
+        repository.upsert_work_item(&item).await.expect("work item");
+
+        let recommendation = ImprovementRecommendation {
+            finding_id: uuid::Uuid::new_v4(),
+            finding_key: "gail_trading".to_string(),
+            dedupe_key: "gail:trading".to_string(),
+            title: "Improve Gail trading".to_string(),
+            summary: "Tighten the trading loop".to_string(),
+            target_service: Some("gail".to_string()),
+            delivery_stage: DeliveryStage::Development,
+            rollout_strategy: RolloutStrategy::Direct,
+            priority: 90,
+            tags: vec!["gail".to_string(), "trading".to_string()],
+            plan: json!({"action": "improve_trading", "scope": "risk_controls"}),
+            depends_on: Vec::new(),
+        };
+
+        upsert_recommendation(repository.as_ref(), &recommendation)
+            .await
+            .expect("upsert");
+
+        let updated = repository
+            .find_work_item_by_dedupe_key("gail:trading")
+            .await
+            .expect("lookup")
+            .expect("updated item");
+        assert!(!updated.execution_approved);
+        assert_eq!(updated.approval_metadata, json!({}));
+        assert_eq!(updated.status, WorkStatus::Planned);
     }
 }

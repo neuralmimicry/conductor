@@ -1,4 +1,5 @@
 pub mod app;
+pub mod approvals;
 pub mod config;
 pub mod dashboard;
 pub mod discovery;

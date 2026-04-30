@@ -50,6 +50,11 @@ validation:
   max_output_bytes: 4096
   max_commands: 6
 
+self_test:
+  enabled: true
+  refresh_interval_seconds: 900
+  auto_queue_regression_work_item: true
+
 integrations:
   # NeuralMimicry service bearer tokens should be Customers-issued service-account tokens.
   gail:
@@ -123,11 +128,18 @@ policy:
   require_verification: true
   require_refiner_strict_mode: true
   allow_external_repo_execution: true
+  ai_approvals_enabled: true
+  ai_approval_interval_seconds: 60
+  ai_approval_workflow: "conductor_safe_approval"
+  ai_approval_min_confidence: 0.7
+  ai_approval_max_items_per_cycle: 20
   protected_services:
+    - "conductor"
     - "gail"
     - "refiner"
     - "aarnn"
   protected_repo_roots:
+    - "/home/pbisaacs/Developer/neuralmimicry/conductor"
     - "/home/pbisaacs/Developer/neuralmimicry/gail"
     - "/home/pbisaacs/Developer/neuralmimicry/tracey"
     - "/home/pbisaacs/Developer/neuralmimicry/nmc"

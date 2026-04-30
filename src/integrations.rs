@@ -95,9 +95,19 @@ async fn probe_gail(
     )
     .await
     .ok();
+    let trading = get_json(
+        client,
+        &base_url,
+        "/v1/trading/status",
+        external.bearer_token.as_deref(),
+    )
+    .await
+    .ok();
     Ok(ProbeResult {
         endpoint: Some(base_url),
-        summary: if orchestration.is_some() {
+        summary: if orchestration.is_some() && trading.is_some() {
+            "Gail health, orchestration, and trading status retrieved".to_string()
+        } else if orchestration.is_some() {
             "Gail health and orchestration status retrieved".to_string()
         } else {
             "Gail health retrieved; orchestration detail unavailable".to_string()
@@ -105,6 +115,7 @@ async fn probe_gail(
         metrics: json!({
             "health": health,
             "orchestration": orchestration,
+            "trading": trading,
         }),
         health: ServiceHealth::Healthy,
     })

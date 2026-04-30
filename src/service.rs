@@ -13,6 +13,10 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::{
+    approvals::{
+        build_approval_metadata, metadata_matches_item, metadata_schedule_now, metadata_verdict,
+        request_ai_approval,
+    },
     config::ConductorConfig,
     discovery::discover_and_probe,
     error::ApiError,
@@ -31,8 +35,10 @@ use crate::{
         unique_strings,
     },
     planner::run_planning_cycle,
+    policy::{evaluate_work_item, project_native_verification_commands},
     repository::ConductorRepository,
     trends::collect_metric_samples,
+    validation::{failure_reasons, run_independent_validation},
 };
 
 #[derive(Clone)]
@@ -169,6 +175,247 @@ impl ConductorService {
         event.status = Some(cycle.status.as_str().to_string());
         self.publish_event(event);
         Ok(cycle)
+    }
+
+    pub async fn run_ai_approval_cycle(&self) -> Result<usize> {
+        if !self.config.policy.ai_approvals_enabled || !self.config.policy.require_admin_approval {
+            return Ok(0);
+        }
+
+        let services = self.repository.list_service_snapshots().await?;
+        let work_items = self.repository.list_work_items().await?;
+        let gail_base_url = services
+            .iter()
+            .find(|service| service.service_key == "gail")
+            .and_then(|service| {
+                service
+                    .public_url
+                    .as_deref()
+                    .or(service.internal_url.as_deref())
+            });
+
+        let mut reviewed = 0usize;
+        let mut approved = 0usize;
+        let mut denied = 0usize;
+        let mut errors = Vec::new();
+        for original in work_items
+            .iter()
+            .filter(|item| work_item_requires_ai_review(item))
+            .take(self.config.policy.ai_approval_max_items_per_cycle)
+        {
+            let target_service = original.target_service.as_deref().and_then(|target| {
+                services
+                    .iter()
+                    .find(|service| service.service_key == target)
+            });
+            let policy = evaluate_work_item(&self.config, original, target_service);
+            if !matches!(policy.verdict, crate::models::PolicyVerdict::NeedsApproval) {
+                continue;
+            }
+            if metadata_verdict(&original.approval_metadata) == Some("denied")
+                && metadata_matches_item(&original.approval_metadata, original)
+            {
+                continue;
+            }
+
+            let dependency_blockers = approval_dependency_blockers(original, &work_items);
+            match request_ai_approval(
+                &self.http,
+                &self.config,
+                original,
+                target_service,
+                &policy,
+                &dependency_blockers,
+                gail_base_url,
+            )
+            .await
+            {
+                Ok(Some(mut decision)) => {
+                    reviewed += 1;
+                    let effective_approval = decision.approved
+                        && decision.confidence >= self.config.policy.ai_approval_min_confidence;
+                    if decision.approved
+                        && decision.confidence < self.config.policy.ai_approval_min_confidence
+                    {
+                        decision.reason = format!(
+                            "{} Confidence {:.2} is below the configured approval threshold of {:.2}.",
+                            decision.reason.trim_end_matches('.'),
+                            decision.confidence,
+                            self.config.policy.ai_approval_min_confidence
+                        )
+                        .trim()
+                        .to_string();
+                    }
+
+                    let mut item = original.clone();
+                    item.execution_approved = effective_approval;
+                    item.approval_metadata =
+                        build_approval_metadata(&item, &policy, &decision, effective_approval);
+                    item.notes.push(format!(
+                        "{} AI approval {} (confidence {:.2}): {}",
+                        now_utc().to_rfc3339(),
+                        if effective_approval {
+                            "granted"
+                        } else {
+                            "denied"
+                        },
+                        decision.confidence,
+                        decision.reason
+                    ));
+
+                    let mut event = ConductorEvent::new(
+                        if effective_approval {
+                            "approval.granted"
+                        } else {
+                            "approval.denied"
+                        },
+                        format!(
+                            "AI approval {} for {}",
+                            if effective_approval {
+                                "granted"
+                            } else {
+                                "denied"
+                            },
+                            item.title
+                        ),
+                        json!({
+                            "work_item_id": item.id.to_string(),
+                            "target_service": item.target_service.clone(),
+                            "confidence": decision.confidence,
+                            "reason": decision.reason.clone(),
+                            "required_actions": decision.required_actions.clone(),
+                            "dependency_blockers": dependency_blockers,
+                        }),
+                    );
+                    event.work_item_id = Some(item.id);
+                    event.status = Some(if effective_approval {
+                        "approved".to_string()
+                    } else {
+                        "denied".to_string()
+                    });
+
+                    if effective_approval {
+                        approved += 1;
+                        if !dependency_blockers.is_empty() || !decision.schedule_now {
+                            item.status = WorkStatus::OnHold;
+                        }
+                    } else {
+                        denied += 1;
+                        item.status = WorkStatus::OnHold;
+                    }
+
+                    self.repository.upsert_work_item(&item).await?;
+                    self.publish_event(event);
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    errors.push(format!("{}: {}", original.id, error));
+                    let mut event = ConductorEvent::new(
+                        "approval.failed",
+                        format!("AI approval failed for {}: {}", original.title, error),
+                        json!({
+                            "work_item_id": original.id.to_string(),
+                            "error": error.to_string(),
+                        }),
+                    );
+                    event.work_item_id = Some(original.id);
+                    event.status = Some("failure".to_string());
+                    self.publish_event(event);
+                }
+            }
+        }
+
+        let scheduled = self.schedule_ready_approved_work_items().await?;
+        if reviewed == 0 && approved == 0 && denied == 0 && scheduled == 0 && errors.is_empty() {
+            return Ok(0);
+        }
+        let mut event = ConductorEvent::new(
+            "approval.cycle.completed",
+            format!(
+                "approval cycle reviewed {} item(s), approved {}, denied {}, scheduled {}",
+                reviewed, approved, denied, scheduled
+            ),
+            json!({
+                "reviewed": reviewed,
+                "approved": approved,
+                "denied": denied,
+                "scheduled": scheduled,
+                "errors": errors,
+            }),
+        );
+        event.status = Some(if errors.is_empty() {
+            "success".to_string()
+        } else {
+            "partial_failure".to_string()
+        });
+        self.publish_event(event);
+
+        if (approved > 0 || scheduled > 0)
+            && self.config.execution.enabled
+            && !self.config.execution.dry_run
+            && !self.config.execution.emergency_stop
+        {
+            if let Err(error) = self.run_execution_cycle().await {
+                let mut event = ConductorEvent::new(
+                    "approval.execution_trigger.failed",
+                    format!("post-approval execution trigger failed: {}", error),
+                    json!({"error": error.to_string()}),
+                );
+                event.status = Some("failure".to_string());
+                self.publish_event(event);
+            }
+        }
+
+        Ok(approved)
+    }
+
+    pub async fn run_self_test_cycle(&self) -> Result<bool> {
+        if !self.config.self_test.enabled {
+            return Ok(true);
+        }
+
+        let services = self.repository.list_service_snapshots().await?;
+        let conductor = conductor_self_test_service(
+            &self.config,
+            services
+                .iter()
+                .find(|service| service.service_key == "conductor"),
+        );
+        let required_checks = project_native_verification_commands(Some(&conductor));
+        let report =
+            run_independent_validation(&self.config.validation, Some(&conductor), &required_checks)
+                .await;
+        let healthy = report.passed && report.completeness == "full";
+        let payload = serde_json::to_value(&report).unwrap_or_else(|_| json!({}));
+
+        if healthy {
+            let mut event = ConductorEvent::new(
+                "self_test.completed",
+                "Conductor self-test cycle passed".to_string(),
+                payload,
+            );
+            event.status = Some("success".to_string());
+            self.publish_event(event);
+            return Ok(true);
+        }
+
+        let work_item = if self.config.self_test.auto_queue_regression_work_item {
+            Some(self.upsert_self_test_regression_work_item(&report).await?)
+        } else {
+            None
+        };
+        let mut event = ConductorEvent::new(
+            "self_test.failed",
+            format!(
+                "Conductor self-test regression detected: {}",
+                report.summary
+            ),
+            payload,
+        );
+        event.status = Some("failure".to_string());
+        event.work_item_id = work_item.as_ref().map(|item| item.id);
+        self.publish_event(event);
+        Ok(false)
     }
 
     pub async fn services(&self) -> Result<Vec<crate::models::ServiceSnapshot>> {
@@ -1420,6 +1667,161 @@ impl ConductorService {
         .await
     }
 
+    async fn schedule_ready_approved_work_items(&self) -> Result<usize> {
+        let services = self.repository.list_service_snapshots().await?;
+        let work_items = self.repository.list_work_items().await?;
+        let mut scheduled = 0usize;
+
+        for original in work_items
+            .iter()
+            .filter(|item| item.execution_approved)
+            .filter(|item| matches!(item.status, WorkStatus::Planned | WorkStatus::OnHold))
+        {
+            if !metadata_schedule_now(&original.approval_metadata) {
+                continue;
+            }
+            let target_service = original.target_service.as_deref().and_then(|target| {
+                services
+                    .iter()
+                    .find(|service| service.service_key == target)
+            });
+            let policy = evaluate_work_item(&self.config, original, target_service);
+            if !matches!(policy.verdict, crate::models::PolicyVerdict::Allowed) {
+                continue;
+            }
+            let dependency_blockers = approval_dependency_blockers(original, &work_items);
+            if !dependency_blockers.is_empty() {
+                continue;
+            }
+
+            let mut item = original.clone();
+            item.status = WorkStatus::Scheduled;
+            item.notes.push(format!(
+                "{} scheduled for execution after approval gates passed",
+                now_utc().to_rfc3339()
+            ));
+            self.repository.upsert_work_item(&item).await?;
+            scheduled += 1;
+
+            let mut event = ConductorEvent::new(
+                "execution.scheduled",
+                format!("scheduled {} for execution", item.title),
+                json!({
+                    "work_item_id": item.id.to_string(),
+                    "target_service": item.target_service.clone(),
+                }),
+            );
+            event.work_item_id = Some(item.id);
+            event.status = Some("scheduled".to_string());
+            self.publish_event(event);
+        }
+
+        Ok(scheduled)
+    }
+
+    async fn upsert_self_test_regression_work_item(
+        &self,
+        report: &crate::validation::IndependentValidationReport,
+    ) -> Result<WorkItem> {
+        let dedupe_key = "conductor:self_test_regression";
+        let title = "Restore Conductor self-test baseline".to_string();
+        let summary = format!(
+            "Conductor self-tests are failing or incomplete. Latest result: {}.",
+            report.summary
+        );
+        let failure_details = report
+            .commands
+            .iter()
+            .filter(|command| command.status != "passed")
+            .cloned()
+            .collect::<Vec<_>>();
+        let note = format!(
+            "{} conductor self-test regression detected: {}",
+            now_utc().to_rfc3339(),
+            report.summary
+        );
+        let plan = json!({
+            "action": "restore_conductor_self_tests",
+            "repository": "conductor",
+            "self_test": {
+                "summary": report.summary,
+                "completeness": report.completeness,
+                "repo_path": report.repo_path,
+                "planned_commands": report.planned_commands,
+                "required_checks": report.required_checks,
+                "failure_reasons": failure_reasons(report),
+                "commands": failure_details,
+            }
+        });
+
+        if let Some(existing) = self
+            .repository
+            .find_work_item_by_dedupe_key(dedupe_key)
+            .await?
+        {
+            if existing.admin_override {
+                return Ok(existing);
+            }
+
+            let mut updated = existing.clone();
+            updated.title = title;
+            updated.summary = summary;
+            updated.target_service = Some("conductor".to_string());
+            updated.delivery_stage = DeliveryStage::Development;
+            updated.rollout_strategy = crate::models::RolloutStrategy::Direct;
+            updated.priority = 100;
+            updated.progress_pct = 0;
+            updated.execution_approved = false;
+            updated.approval_metadata = json!({});
+            updated.verification_required = true;
+            updated.tags = unique_strings(vec![
+                "conductor".to_string(),
+                "self_test".to_string(),
+                "regression".to_string(),
+                "quality".to_string(),
+            ]);
+            updated.plan = plan;
+            updated.depends_on = Vec::new();
+            updated.scheduled_for = None;
+            if !matches!(updated.status, WorkStatus::InOperation) {
+                updated.status = WorkStatus::Planned;
+            }
+            updated.notes.push(note);
+            updated.updated_at = now_utc();
+            self.repository.upsert_work_item(&updated).await?;
+            return Ok(updated);
+        }
+
+        let mut item = WorkItem::from_new(crate::models::NewWorkItem {
+            dedupe_key: Some(dedupe_key.to_string()),
+            title,
+            summary,
+            target_service: Some("conductor".to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: Vec::new(),
+            rollout_strategy: Some(crate::models::RolloutStrategy::Direct),
+            status: Some(WorkStatus::Planned),
+            priority: Some(100),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: false,
+            verification_required: Some(true),
+            tags: vec![
+                "conductor".to_string(),
+                "self_test".to_string(),
+                "regression".to_string(),
+                "quality".to_string(),
+            ],
+            plan,
+            depends_on: Vec::new(),
+            source: Some("self_test".to_string()),
+            scheduled_for: None,
+        });
+        item.notes.push(note);
+        self.repository.upsert_work_item(&item).await?;
+        Ok(item)
+    }
+
     pub async fn summary(&self) -> Result<DashboardSummary> {
         let services = self.repository.list_service_snapshots().await?;
         let repositories = self.repository.list_repository_snapshots().await?;
@@ -2268,8 +2670,12 @@ pub fn spawn_background_loops(service: ConductorService) {
         Duration::from_secs(service.config.discovery.refresh_interval_seconds.max(30));
     let planning_interval =
         Duration::from_secs(service.config.planning.refresh_interval_seconds.max(30));
+    let approval_interval =
+        Duration::from_secs(service.config.policy.ai_approval_interval_seconds.max(15));
     let execution_interval =
         Duration::from_secs(service.config.execution.refresh_interval_seconds.max(5));
+    let self_test_interval =
+        Duration::from_secs(service.config.self_test.refresh_interval_seconds.max(60));
     let refiner_sync_interval = Duration::from_secs(
         service
             .config
@@ -2352,6 +2758,37 @@ pub fn spawn_background_loops(service: ConductorService) {
         }
     });
 
+    if service.config.policy.ai_approvals_enabled && service.config.policy.require_admin_approval {
+        let approval_service = service.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            if let Err(error) = approval_service.run_ai_approval_cycle().await {
+                tracing::warn!(error = %error, "initial approval cycle failed");
+                let mut event = ConductorEvent::new(
+                    "approval.cycle.failed",
+                    format!("initial approval cycle failed: {}", error),
+                    json!({"error": error.to_string()}),
+                );
+                event.status = Some("failure".to_string());
+                approval_service.publish_event(event);
+            }
+            let mut ticker = tokio::time::interval(approval_interval);
+            loop {
+                ticker.tick().await;
+                if let Err(error) = approval_service.run_ai_approval_cycle().await {
+                    tracing::warn!(error = %error, "approval cycle failed");
+                    let mut event = ConductorEvent::new(
+                        "approval.cycle.failed",
+                        format!("approval cycle failed: {}", error),
+                        json!({"error": error.to_string()}),
+                    );
+                    event.status = Some("failure".to_string());
+                    approval_service.publish_event(event);
+                }
+            }
+        });
+    }
+
     let execution_service = service.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(10)).await;
@@ -2380,6 +2817,37 @@ pub fn spawn_background_loops(service: ConductorService) {
             }
         }
     });
+
+    if service.config.self_test.enabled {
+        let self_test_service = service.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            if let Err(error) = self_test_service.run_self_test_cycle().await {
+                tracing::warn!(error = %error, "initial self-test cycle failed");
+                let mut event = ConductorEvent::new(
+                    "self_test.failed",
+                    format!("initial self-test cycle failed: {}", error),
+                    json!({"error": error.to_string()}),
+                );
+                event.status = Some("failure".to_string());
+                self_test_service.publish_event(event);
+            }
+            let mut ticker = tokio::time::interval(self_test_interval);
+            loop {
+                ticker.tick().await;
+                if let Err(error) = self_test_service.run_self_test_cycle().await {
+                    tracing::warn!(error = %error, "self-test cycle failed");
+                    let mut event = ConductorEvent::new(
+                        "self_test.failed",
+                        format!("self-test cycle failed: {}", error),
+                        json!({"error": error.to_string()}),
+                    );
+                    event.status = Some("failure".to_string());
+                    self_test_service.publish_event(event);
+                }
+            }
+        });
+    }
 
     if atlassian_sync_is_configured(service.config.as_ref())
         && service.config.integrations.atlassian.sync_interval_seconds > 0
@@ -4493,6 +4961,105 @@ fn tracey_sync_is_enabled(config: &ConductorConfig) -> bool {
     config.integrations.tracey.enabled && config.integrations.tracey.sync_interval_seconds > 0
 }
 
+fn work_item_requires_ai_review(item: &WorkItem) -> bool {
+    !item.execution_approved
+        && matches!(
+            item.status,
+            WorkStatus::Planned | WorkStatus::Scheduled | WorkStatus::OnHold
+        )
+}
+
+fn approval_dependency_blockers(item: &WorkItem, work_items: &[WorkItem]) -> Vec<String> {
+    let mut blockers = Vec::new();
+    for reference in &item.depends_on {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            continue;
+        }
+        if item.matches_reference(reference) {
+            blockers.push(format!("{reference} (self_dependency)"));
+            continue;
+        }
+        let Some(dependency) = work_items
+            .iter()
+            .find(|candidate| candidate.matches_reference(reference))
+        else {
+            blockers.push(format!("{reference} (missing)"));
+            continue;
+        };
+        if !matches!(dependency.status, WorkStatus::Success) {
+            let label = dependency
+                .dedupe_key
+                .clone()
+                .unwrap_or_else(|| dependency.id.to_string());
+            blockers.push(format!("{label} ({})", dependency.status.as_str()));
+        }
+    }
+    blockers
+}
+
+fn conductor_self_test_service(
+    config: &ConductorConfig,
+    discovered: Option<&ServiceSnapshot>,
+) -> ServiceSnapshot {
+    if let Some(service) = discovered {
+        let mut service = service.clone();
+        if service
+            .repo_path
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            service.repo_path = Some(
+                config
+                    .discovery
+                    .repo_hints
+                    .conductor_repo
+                    .display()
+                    .to_string(),
+            );
+        }
+        return service;
+    }
+
+    ServiceSnapshot {
+        service_key: "conductor".to_string(),
+        display_name: "Conductor".to_string(),
+        kind: "control_plane".to_string(),
+        role_name: "conductor".to_string(),
+        playbooks: Vec::new(),
+        host_targets: Vec::new(),
+        hosts: Vec::new(),
+        namespace: None,
+        service_name: Some("conductor".to_string()),
+        deployment_environment: Some(DeliveryStage::Development),
+        internal_url: None,
+        public_url: None,
+        repo_path: Some(
+            config
+                .discovery
+                .repo_hints
+                .conductor_repo
+                .display()
+                .to_string(),
+        ),
+        repo_url: None,
+        repo_branch: None,
+        health: crate::models::ServiceHealth::Unknown,
+        capabilities: vec![
+            "improvement_planning".to_string(),
+            "workflow_governance".to_string(),
+            "execution_control".to_string(),
+            "dashboard".to_string(),
+        ],
+        dependencies: Vec::new(),
+        storage_paths: Vec::new(),
+        raw_defaults: json!({}),
+        probe: json!({}),
+        discovered_at: now_utc(),
+        updated_at: now_utc(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4509,7 +5076,8 @@ mod tests {
         routing::{get, post},
     };
     use serde_json::{Value, json};
-    use std::sync::Arc;
+    use std::{fs, sync::Arc};
+    use tempfile::tempdir;
     use tokio::net::TcpListener;
 
     async fn spawn_mock_refiner() -> (String, tokio::task::JoinHandle<()>) {
@@ -4616,6 +5184,38 @@ mod tests {
             axum::serve(listener, app)
                 .await
                 .expect("serve refiner mock");
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    async fn spawn_mock_gail(approved: bool) -> (String, tokio::task::JoinHandle<()>) {
+        async fn health() -> Json<Value> {
+            Json(json!({"ok": true, "service": "gail"}))
+        }
+
+        let app = Router::new()
+            .route("/healthz", get(health))
+            .route(
+                "/v1/llm/complete",
+                post(move |Json(_request): Json<Value>| async move {
+                    Json(json!({
+                        "request_id": "approval-1",
+                        "text": if approved {
+                            "{\"approved\":true,\"confidence\":0.93,\"risk_level\":\"medium\",\"reason\":\"Scoped change with clear verification and no destructive actions.\",\"required_actions\":[],\"schedule_now\":true}"
+                        } else {
+                            "{\"approved\":false,\"confidence\":0.88,\"risk_level\":\"high\",\"reason\":\"Scope is too broad for autonomous execution.\",\"required_actions\":[\"narrow the change\"],\"schedule_now\":false}"
+                        },
+                        "provider": "test-provider",
+                        "model": "test-model",
+                        "latency_ms": 12
+                    }))
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind gail");
+        let addr = listener.local_addr().expect("gail local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve gail mock");
         });
         (format!("http://{}", addr), handle)
     }
@@ -5226,5 +5826,132 @@ mod tests {
         refiner_handle.abort();
         tracey_handle.abort();
         continuum_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn ai_approval_cycle_approves_and_schedules_reviewed_work() {
+        let (gail_base_url, gail_handle) = spawn_mock_gail(true).await;
+
+        let mut config = ConductorConfig::default();
+        config.execution.enabled = false;
+        config.integrations.atlassian.enabled = false;
+        config.integrations.gail.base_url = Some(gail_base_url);
+        config.policy.ai_approvals_enabled = true;
+        config.policy.ai_approval_max_items_per_cycle = 10;
+
+        let repository = Arc::new(MemoryRepository::new());
+        let service_snapshot = ServiceSnapshot {
+            service_key: "gail".to_string(),
+            display_name: "Gail".to_string(),
+            kind: "tenant_service".to_string(),
+            role_name: "continuum_tenant_gail".to_string(),
+            playbooks: vec![],
+            host_targets: vec![],
+            hosts: vec![],
+            namespace: Some("gail".to_string()),
+            service_name: Some("gail".to_string()),
+            deployment_environment: Some(DeliveryStage::Development),
+            internal_url: None,
+            public_url: None,
+            repo_path: Some("/tmp/gail".to_string()),
+            repo_url: None,
+            repo_branch: None,
+            health: crate::models::ServiceHealth::Healthy,
+            capabilities: vec!["crypto_trading".to_string()],
+            dependencies: vec![],
+            storage_paths: vec![],
+            raw_defaults: json!({}),
+            probe: json!({}),
+            discovered_at: now_utc(),
+            updated_at: now_utc(),
+        };
+        repository
+            .replace_service_snapshots(&[service_snapshot])
+            .await
+            .expect("services");
+
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("gail:trading".to_string()),
+            title: "Improve Gail trading".to_string(),
+            summary: "Tighten Gail's crypto trading controls".to_string(),
+            target_service: Some("gail".to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: vec![],
+            rollout_strategy: Some(RolloutStrategy::Direct),
+            status: Some(WorkStatus::Planned),
+            priority: Some(90),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: false,
+            verification_required: Some(true),
+            tags: vec!["gail".to_string(), "trading".to_string()],
+            plan: json!({"action": "tighten_trading_controls"}),
+            depends_on: vec![],
+            source: Some("planner".to_string()),
+            scheduled_for: None,
+        });
+        repository.upsert_work_item(&item).await.expect("work item");
+
+        let http = build_http_client(2).expect("http client");
+        let service = ConductorService::new(config, repository.clone(), http);
+        let approved = service
+            .run_ai_approval_cycle()
+            .await
+            .expect("approval cycle");
+        assert_eq!(approved, 1);
+
+        let updated = repository
+            .get_work_item(item.id)
+            .await
+            .expect("fetch")
+            .expect("updated");
+        assert!(updated.execution_approved);
+        assert_eq!(updated.status, WorkStatus::Scheduled);
+        assert_eq!(
+            updated.approval_metadata["verdict"].as_str(),
+            Some("approved")
+        );
+
+        gail_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn self_test_cycle_queues_regression_work_item_on_failure() {
+        let repo_dir = tempdir().expect("tempdir");
+        fs::write(
+            repo_dir.path().join("Cargo.toml"),
+            "[package]\nname = \"conductor-self-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("cargo");
+        fs::create_dir_all(repo_dir.path().join("src")).expect("src");
+        fs::write(
+            repo_dir.path().join("src").join("main.rs"),
+            "fn   main( ) { println!(\"broken formatting\"); }\n",
+        )
+        .expect("main");
+
+        let mut config = ConductorConfig::default();
+        config.execution.enabled = false;
+        config.integrations.atlassian.enabled = false;
+        config.self_test.enabled = true;
+        config.self_test.auto_queue_regression_work_item = true;
+        config.validation.max_commands = 1;
+        config.discovery.repo_hints.conductor_repo = repo_dir.path().to_path_buf();
+
+        let repository = Arc::new(MemoryRepository::new());
+        let http = build_http_client(10).expect("http client");
+        let service = ConductorService::new(config, repository.clone(), http);
+
+        let healthy = service.run_self_test_cycle().await.expect("self test");
+        assert!(!healthy);
+
+        let work_item = repository
+            .find_work_item_by_dedupe_key("conductor:self_test_regression")
+            .await
+            .expect("lookup")
+            .expect("regression work item");
+        assert_eq!(work_item.target_service.as_deref(), Some("conductor"));
+        assert!(!work_item.execution_approved);
+        assert_eq!(work_item.status, WorkStatus::Planned);
     }
 }

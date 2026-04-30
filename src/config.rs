@@ -17,6 +17,7 @@ pub struct ConductorConfig {
     pub discovery: DiscoveryConfig,
     pub delivery: DeliveryConfig,
     pub validation: ValidationConfig,
+    pub self_test: SelfTestConfig,
     pub integrations: IntegrationsConfig,
     pub planning: PlanningConfig,
     pub execution: ExecutionConfig,
@@ -120,6 +121,14 @@ pub struct ValidationConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+pub struct SelfTestConfig {
+    pub enabled: bool,
+    pub refresh_interval_seconds: u64,
+    pub auto_queue_regression_work_item: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ExternalServiceConfig {
     pub enabled: bool,
     pub base_url: Option<String>,
@@ -182,6 +191,11 @@ pub struct PolicyConfig {
     pub require_verification: bool,
     pub require_refiner_strict_mode: bool,
     pub allow_external_repo_execution: bool,
+    pub ai_approvals_enabled: bool,
+    pub ai_approval_interval_seconds: u64,
+    pub ai_approval_workflow: String,
+    pub ai_approval_min_confidence: f64,
+    pub ai_approval_max_items_per_cycle: usize,
     pub protected_services: Vec<String>,
     pub protected_repo_roots: Vec<PathBuf>,
     pub blocked_action_keywords: Vec<String>,
@@ -197,6 +211,7 @@ impl Default for ConductorConfig {
             discovery: DiscoveryConfig::default(),
             delivery: DeliveryConfig::default(),
             validation: ValidationConfig::default(),
+            self_test: SelfTestConfig::default(),
             integrations: IntegrationsConfig::default(),
             planning: PlanningConfig::default(),
             execution: ExecutionConfig::default(),
@@ -351,6 +366,16 @@ impl Default for ValidationConfig {
     }
 }
 
+impl Default for SelfTestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            refresh_interval_seconds: 900,
+            auto_queue_regression_work_item: true,
+        }
+    }
+}
+
 impl Default for PlanningConfig {
     fn default() -> Self {
         Self {
@@ -392,7 +417,13 @@ impl Default for PolicyConfig {
             require_verification: true,
             require_refiner_strict_mode: true,
             allow_external_repo_execution: true,
+            ai_approvals_enabled: true,
+            ai_approval_interval_seconds: 60,
+            ai_approval_workflow: "conductor_safe_approval".to_string(),
+            ai_approval_min_confidence: 0.7,
+            ai_approval_max_items_per_cycle: 20,
             protected_services: vec![
+                "conductor".to_string(),
                 "gail".to_string(),
                 "refiner".to_string(),
                 "aarnn".to_string(),
@@ -449,6 +480,10 @@ impl ConductorConfig {
         }
         self.validation.max_output_bytes = self.validation.max_output_bytes.clamp(256, 65_536);
         self.validation.max_commands = self.validation.max_commands.clamp(1, 20);
+        if self.self_test.refresh_interval_seconds == 0 {
+            self.self_test.refresh_interval_seconds = 900;
+        }
+        self.self_test.refresh_interval_seconds = self.self_test.refresh_interval_seconds.max(60);
         if self.planning.refresh_interval_seconds == 0 {
             self.planning.refresh_interval_seconds = 240;
         }
@@ -518,11 +553,29 @@ impl ConductorConfig {
         normalize_external_service(&mut self.integrations.aarnn);
         normalize_external_service(&mut self.integrations.ollama);
         normalize_atlassian(&mut self.integrations.atlassian);
+        if self.policy.ai_approval_interval_seconds == 0 {
+            self.policy.ai_approval_interval_seconds = 60;
+        }
+        self.policy.ai_approval_interval_seconds = self.policy.ai_approval_interval_seconds.max(15);
+        if self.policy.ai_approval_workflow.trim().is_empty() {
+            self.policy.ai_approval_workflow = "conductor_safe_approval".to_string();
+        } else {
+            self.policy.ai_approval_workflow = self.policy.ai_approval_workflow.trim().to_string();
+        }
+        if !self.policy.ai_approval_min_confidence.is_finite() {
+            self.policy.ai_approval_min_confidence = 0.7;
+        }
+        self.policy.ai_approval_min_confidence =
+            self.policy.ai_approval_min_confidence.clamp(0.0, 1.0);
+        if self.policy.ai_approval_max_items_per_cycle == 0 {
+            self.policy.ai_approval_max_items_per_cycle = 20;
+        }
         normalize_unique_strings(&mut self.policy.protected_services);
         normalize_unique_strings(&mut self.policy.blocked_action_keywords);
         normalize_paths(&mut self.policy.protected_repo_roots);
         if self.policy.protected_repo_roots.is_empty() {
             self.policy.protected_repo_roots = vec![
+                self.discovery.repo_hints.conductor_repo.clone(),
                 self.discovery.repo_hints.gail_repo.clone(),
                 self.discovery.repo_hints.tracey_repo.clone(),
                 self.discovery.repo_hints.continuum_repo.clone(),

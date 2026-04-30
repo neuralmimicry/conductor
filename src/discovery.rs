@@ -188,6 +188,15 @@ impl MutableService {
             resolve_repo_path(config, &self.service_key, &self.vars, local_repositories)
                 .filter(|path| path.exists());
         let repo_metadata = repo_path.as_deref().map(repo_metadata).unwrap_or_default();
+        if let Some(repo_path) = repo_path.as_deref() {
+            if let Some(repository) = local_repositories
+                .iter()
+                .find(|repository| repository.local_path == repo_path)
+            {
+                self.capabilities
+                    .extend(repository.signals.capabilities.iter().cloned());
+            }
+        }
         self.repo_path = repo_path.map(|path| path.display().to_string());
 
         let namespace = pick_string(
@@ -1279,6 +1288,7 @@ fn analyze_repository(path: &Path, name: &str) -> RepositorySignals {
     let requirements_txt = read_text_if_exists(&path.join("requirements.txt"));
     let package_json = read_text_if_exists(&path.join("package.json"));
     let go_mod = read_text_if_exists(&path.join("go.mod"));
+    let readme = read_text_if_exists(&path.join("README.md"));
     let cmake_lists = read_text_if_exists(&path.join("CMakeLists.txt"))
         .or_else(|| read_text_if_exists(&path.join("nmc_client").join("CMakeLists.txt")));
 
@@ -1408,6 +1418,7 @@ fn analyze_repository(path: &Path, name: &str) -> RepositorySignals {
         capabilities.insert("kubernetes".to_string());
     }
     capabilities.extend(repository_capabilities_by_name(name));
+    infer_repository_capabilities_from_files(path, readme.as_deref(), &mut capabilities);
 
     signals.runtime_type =
         if path.join("src").join("lib.rs").exists() && !path.join("src").join("main.rs").exists() {
@@ -1846,6 +1857,33 @@ fn infer_capabilities(
             capabilities.insert("model_runtime".to_string());
         }
         _ => {}
+    }
+}
+
+fn infer_repository_capabilities_from_files(
+    path: &Path,
+    readme: Option<&str>,
+    capabilities: &mut BTreeSet<String>,
+) {
+    let readme = readme.unwrap_or_default().to_ascii_lowercase();
+    let has_trading_module = path.join("src").join("trading").exists();
+    let has_backtest_module = path
+        .join("src")
+        .join("trading")
+        .join("backtest.rs")
+        .exists();
+
+    if has_trading_module
+        || readme.contains("/v1/trading/")
+        || readme.contains("crypto-trading")
+        || readme.contains("crypto trading")
+    {
+        capabilities.insert("crypto_trading".to_string());
+        capabilities.insert("trading_api".to_string());
+    }
+
+    if has_backtest_module || readme.contains("backtest") || readme.contains("backtesting") {
+        capabilities.insert("backtesting".to_string());
     }
 }
 
@@ -2456,5 +2494,28 @@ mod tests {
         assert_eq!(signals.language.as_deref(), Some("Rust"));
         assert!(signals.frameworks.contains(&"axum".to_string()));
         assert!(signals.has_container);
+    }
+
+    #[test]
+    fn analyze_repository_detects_trading_capabilities() {
+        let temp = tempdir().expect("tempdir");
+        fs::write(temp.path().join("Cargo.toml"), "[package]\nname='gail'\n").expect("cargo");
+        fs::write(
+            temp.path().join("README.md"),
+            "Endpoints:\n- GET /v1/trading/status\n- POST /v1/trading/evaluate\n",
+        )
+        .expect("readme");
+        fs::create_dir_all(temp.path().join("src").join("trading")).expect("trading dir");
+        fs::write(temp.path().join("src").join("main.rs"), "fn main() {}\n").expect("main");
+        fs::write(
+            temp.path().join("src").join("trading").join("backtest.rs"),
+            "// backtest\n",
+        )
+        .expect("backtest");
+
+        let signals = analyze_repository(temp.path(), "gail");
+        assert!(signals.capabilities.contains(&"crypto_trading".to_string()));
+        assert!(signals.capabilities.contains(&"trading_api".to_string()));
+        assert!(signals.capabilities.contains(&"backtesting".to_string()));
     }
 }
