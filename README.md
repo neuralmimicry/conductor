@@ -2,6 +2,12 @@
 
 Rust control-plane service for the NeuralMimicry stack. Conductor discovers the deployed topology from the SwarmHPC Ansible playbooks, scans the mounted NeuralMimicry repositories, optionally enriches that inventory from the GitHub organisation, probes the live service surfaces for Gail, Tracey, Continuum, Refiner, and AARNN, persists state in Postgres, and drives an improvement queue through an admin dashboard and API.
 
+Lifecycle placement is explicit:
+
+- Conductor owns `plan` and `govern`.
+- Refiner owns `code`, `build`, `test`, and `iterate`.
+- Continuum owns `release` and `operate`.
+
 ## What It Does
 
 - Parses the SwarmHPC Ansible tree, including inventory groups, `group_vars`, `host_vars`, and tenant playbooks, to infer the deployed topology.
@@ -30,7 +36,7 @@ Rust control-plane service for the NeuralMimicry stack. Conductor discovers the 
 
 ## Current Boundaries
 
-- Conductor now executes approved, scheduled, dependency-satisfied work items through Refiner's planning and job APIs.
+- Conductor now executes approved, scheduled, dependency-satisfied work items through Refiner's dedicated `/api/execution/plan` surface and job APIs.
 - Execution selection now respects `scheduled_for`, uses DB-backed claims to avoid duplicate dispatch, and supports `dry_run` and `emergency_stop` controls.
 - AI-approved work items are automatically moved into `scheduled` status and the execution loop is triggered immediately when capacity is available.
 - Successful stage verification can auto-promote the work item to the next delivery stage.

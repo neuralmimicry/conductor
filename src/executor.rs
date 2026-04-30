@@ -22,6 +22,8 @@ use crate::{
 
 pub type ExecutionEventCallback = Arc<dyn Fn(ConductorEvent) + Send + Sync>;
 
+const REFINER_EXECUTION_PLAN_PATH: &str = "/api/execution/plan";
+
 fn emit_event(callback: Option<&ExecutionEventCallback>, event: ConductorEvent) {
     if let Some(publish) = callback {
         publish(event);
@@ -372,7 +374,7 @@ async fn dispatch_claimed_work_item_inner(
         &client,
         config,
         &refiner_base_url,
-        "/api/playground/plan",
+        REFINER_EXECUTION_PLAN_PATH,
         &json!({
             "prompt": prompt,
             "provider": config.execution.llm_provider,
@@ -1635,7 +1637,7 @@ mod tests {
         storage::memory::MemoryRepository,
         validation::{IndependentValidationReport, ValidationCommandResult},
     };
-    use axum::{Json, Router, routing::get};
+    use axum::{Json, Router, routing::{get, post}};
     use chrono::Duration as ChronoDuration;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -1695,6 +1697,68 @@ mod tests {
         let addr = listener.local_addr().expect("github addr");
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve github");
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    async fn spawn_mock_refiner_execution_surface() -> (String, tokio::task::JoinHandle<()>) {
+        async fn health() -> Json<Value> {
+            Json(json!({"status": "ok"}))
+        }
+
+        async fn execution_plan() -> Json<Value> {
+            Json(json!({
+                "summary": "Stabilise the release gate.",
+                "steps": [
+                    "Audit the failing verification seam.",
+                    "Extract the delivery helper.",
+                    "Update the targeted tests.",
+                    "Run the focused verification suite."
+                ],
+                "requirements_text": "Overview: Stabilise the release gate.\n\nRequirements Register:\n- REQ-001: Fix the failing verification path.\n- REQ-002: Preserve rollout metadata.\n- REQ-003: Add or update targeted tests.\n- REQ-004: Document the execution boundary.\n",
+                "project_name": "Release Stabiliser",
+                "job_payload": {
+                    "project_iterations": 4,
+                    "project_max_steps": 12,
+                    "source": "execution"
+                }
+            }))
+        }
+
+        async fn estimate() -> Json<Value> {
+            Json(json!({"estimated_tokens": 512}))
+        }
+
+        async fn submit_job() -> Json<Value> {
+            Json(json!({"job_id": "job-123"}))
+        }
+
+        async fn job_detail(_: axum::extract::Path<String>) -> Json<Value> {
+            Json(json!({
+                "status": "completed",
+                "stages": [
+                    {"name": "plan", "status": "completed"},
+                    {"name": "apply", "status": "completed"},
+                    {"name": "verify", "status": "completed"}
+                ]
+            }))
+        }
+
+        let app = Router::new()
+            .route("/api/health", get(health))
+            .route(REFINER_EXECUTION_PLAN_PATH, post(execution_plan))
+            .route("/api/jobs/estimate", post(estimate))
+            .route("/api/jobs", post(submit_job))
+            .route("/api/jobs/{job_id}", get(job_detail));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind refiner execution surface");
+        let addr = listener.local_addr().expect("refiner execution addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve refiner execution surface");
         });
         (format!("http://{}", addr), handle)
     }
@@ -1970,6 +2034,69 @@ mod tests {
 
         assert_eq!(executed.len(), 1);
         assert_eq!(executed[0].status, ExecutionStatus::Blocked);
+    }
+
+    #[tokio::test]
+    async fn execute_specific_work_item_uses_execution_plan_surface() {
+        let (refiner_url, refiner_handle) = spawn_mock_refiner_execution_surface().await;
+        let mut config = ConductorConfig::default();
+        config.integrations.refiner.base_url = Some(refiner_url);
+        config.integrations.refiner.timeout_seconds = 2;
+        config.validation.enabled = false;
+
+        let repository = Arc::new(MemoryRepository::new());
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("stabilize:release-gate".to_string()),
+            title: "Stabilise release gate".to_string(),
+            summary: "Fix the failing verification seam".to_string(),
+            target_service: None,
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: vec![],
+            rollout_strategy: Some(RolloutStrategy::Canary),
+            status: Some(WorkStatus::Scheduled),
+            priority: Some(90),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "stabilize_release_gate"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        repository
+            .upsert_work_item(&item)
+            .await
+            .expect("insert work item");
+
+        let execution = execute_specific_work_item(repository.as_ref(), &config, item.id, false, None)
+            .await
+            .expect("execution");
+
+        assert_eq!(execution.status, ExecutionStatus::Success);
+        assert_eq!(
+            execution
+                .request_payload
+                .get("requirements_text")
+                .and_then(Value::as_str),
+            Some(
+                "Overview: Stabilise the release gate.\n\nRequirements Register:\n- REQ-001: Fix the failing verification path.\n- REQ-002: Preserve rollout metadata.\n- REQ-003: Add or update targeted tests.\n- REQ-004: Document the execution boundary.\n"
+            )
+        );
+        assert_eq!(
+            execution.request_payload.get("source").and_then(Value::as_str),
+            Some("execution")
+        );
+        assert_eq!(
+            execution
+                .request_payload
+                .get("project_iterations")
+                .and_then(Value::as_u64),
+            Some(4)
+        );
+
+        refiner_handle.abort();
     }
 
     #[tokio::test]

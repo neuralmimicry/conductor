@@ -2,10 +2,11 @@
 
 ## Scope
 
-This target architecture covers the three codebases reviewed in this workspace:
+This target architecture covers the four codebases reviewed in this workspace:
 
 - `rag_demo` as Refiner
 - `conductor` as Conductor
+- `nmc` as Continuum
 - `gail` as Gail
 
 The goal is to keep their current strengths, remove duplicated cross-cutting logic, and move the stack closer to the layered-agent model in the supplied image without collapsing service boundaries.
@@ -14,13 +15,15 @@ The goal is to keep their current strengths, remove duplicated cross-cutting log
 
 1. Keep product workflows in Refiner.
 2. Keep topology, governance, planning, approval, and task-graph ownership in Conductor.
-3. Keep provider routing, AI-runtime orchestration, transcription, neuromorphic routing, and AER ownership in Gail.
-4. Use Postgres for control-plane state and NFS-backed persistent storage for large mutable artifacts.
-5. Preserve current features and intent:
+3. Keep release/operate ownership, deployment/runtime state, worker scaling, and platform APIs in Continuum.
+4. Keep provider routing, AI-runtime orchestration, transcription, neuromorphic routing, and AER ownership in Gail.
+5. Use Postgres for control-plane state and NFS-backed persistent storage for large mutable artifacts.
+6. Preserve current features and intent:
    - Refiner remains the user-facing execution/product surface.
    - Conductor remains the adaptive improvement/governance surface.
+   - Continuum remains the release/operate control plane.
    - Gail remains the shared AI runtime.
-6. De-duplicate routing policy and execution interfaces instead of re-implementing them per repo.
+7. De-duplicate routing policy and execution interfaces instead of re-implementing them per repo.
 
 ## Source Of Truth For Infrastructure
 
@@ -59,6 +62,15 @@ Relevant files already in use:
 | Integration Layer: model providers / specialists | Gail | Provider and neuromorphic integration stays in Gail. |
 | Output Layer | Refiner + Conductor | Refiner returns workflow/job output; Conductor returns governance state and audit. |
 
+Lifecycle mapping from the software-delivery image stays direct:
+
+| Lifecycle stage | Target owner | Notes |
+| --- | --- | --- |
+| Plan | Conductor | Backlog derivation, prioritisation, approvals, and execution readiness. |
+| Govern | Conductor | Policy, audit, staged delivery gates, DORA read model. |
+| Code / Build / Test / Iterate | Refiner | Project-solver execution, assistant planning, workspaces, and job verification flow. |
+| Release / Operate | Continuum | Deployment/runtime state, Refiner scaling, VM/vcluster infrastructure, Tracey fleet operations. |
+
 ## Repo Ownership
 
 ### Refiner (`rag_demo`)
@@ -78,6 +90,14 @@ Relevant files already in use:
 | Governance | Improvement queue, task graph, approvals, scheduling, policy gates, audit trail | Direct provider routing or prompt orchestration |
 | Execution control | Refiner job submission for approved work items, execution polling, verification status, admin execution APIs | Direct code mutation outside Refiner’s workflow boundary |
 | Data | Postgres system of record for snapshots, work items, executions, cycles, trend samples | Large mutable workspaces or AI provider metrics |
+
+### Continuum (`nmc`)
+
+| Area | Owns | Must not own |
+| --- | --- | --- |
+| Release / operate | Refiner deployment/scale APIs, VM and vcluster lifecycle, Tracey fleet state, node recruitment, operator docs | Product-specific prompt orchestration or backlog governance |
+| Platform control plane | Runtime status, cluster and resource views, release/rollout execution surfaces, infrastructure-backed workspaces | Cross-service approval policy or direct code mutation planning |
+| Data | Cluster-backed resources plus Continuum's own state/snapshot stores | Refiner product memory or Conductor's governance ledger |
 
 ### Gail (`gail`)
 
@@ -105,6 +125,7 @@ Relevant files already in use:
 | --- | --- | --- |
 | Refiner | Auth/shared identity today; target: session index, job index, TODO/schedule state, collaboration-room metadata | `job_data`, workspaces, cloned repos, solver artifacts, session history/event logs, RAG files |
 | Conductor | `conductor` DB for topology, backlog, executions, trends | `conductor-data` only for optional exported reports/debug artifacts |
+| Continuum | Existing Continuum state roots, snapshots, optional Postgres-backed Tracey history, and cluster resource state | Runtime docs assets, state snapshots, and other platform artefacts |
 | Gail | None required for current runtime | `/app/data` for provider metrics, model inventory, future prompt/cache artifacts |
 
 ## Target Runtime Workflows
@@ -125,6 +146,12 @@ Relevant files already in use:
 4. Approved, dependency-satisfied work items are executed through Refiner’s job APIs.
 5. Refiner performs the code-change workflow.
 6. Conductor stores execution policy, submitted payload, job status, and verification outcome in Postgres.
+
+### 4. Release and operate loop
+
+1. Continuum owns deployment/runtime surfaces such as Refiner scale, VM workspaces, vclusters, and Tracey fleet operations.
+2. Refiner consumes Continuum for platform actions rather than embedding those concerns into Conductor.
+3. Conductor observes those release/operate surfaces through discovery, probes, and traceability links instead of becoming the runtime control plane itself.
 
 ### 3. Shared AI runtime loop
 

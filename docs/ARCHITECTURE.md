@@ -27,7 +27,7 @@ The main loops are:
    - Respects `scheduled_for` and instance-safe dispatch leases.
    - Evaluates policy gates, including stage prerequisites and production rollout restrictions.
    - Supports `dry_run` preview mode and `emergency_stop` execution halts.
-   - Submits approved work into Refiner's planning and job APIs.
+   - Submits approved work into Refiner's dedicated `/api/execution/plan` surface and job APIs.
    - Polls execution status, runs bounded project-native validation commands where possible, stores verification results, and can auto-promote the work item after successful validation.
 5. Summary loop
    - Aggregates stage totals, rollout totals, external reference totals, and DORA metrics from persisted work-item, traceability-link, and production-execution history.
@@ -114,6 +114,12 @@ Key rules:
 - Successful verification can auto-advance the work item and reset approval state for the next stage.
 - DORA metrics are calculated from persisted `production` executions, not from planner timestamps.
 
+Lifecycle ownership across the estate stays explicit:
+
+- Conductor owns the `plan` and `govern` stages.
+- Refiner owns the code-change execution stages (`code`, `build`, `test`, `iterate`).
+- Continuum owns `release` and `operate`, including deployment/runtime state and scale.
+
 ## External Systems
 
 ### Gail
@@ -126,11 +132,11 @@ Used for local runtime and rollout detail. Conductor reuses Tracey `/status` and
 
 ### Continuum
 
-Represents the broader control plane and the estate view of the Tracey swarm. Conductor now reuses Continuum health, Tracey fleet, agent, analytics, and assessment surfaces so swarm-level Tracey evidence is sourced from the existing monitoring plane instead of being reimplemented inside Conductor.
+Represents the broader control plane and the estate view of the Tracey swarm. Conductor now reuses Continuum health, Tracey fleet, agent, analytics, assessment, and deployment/runtime surfaces so `release` and `operate` evidence stays anchored in the existing monitoring plane instead of being reimplemented inside Conductor.
 
 ### Refiner
 
-Treated as the code-generation and workflow execution target. Conductor now uses Refiner as the governed execution surface for approved work items while keeping repository mutation inside Refiner's workflow boundary, reuses Refiner's job, requirements, and workspace APIs to enrich traceability with execution-native evidence, and prefers the dedicated `refiner.neuralmimicry.ai` public edge when it is available while safely falling back to the shared API edge or discovered internal service URL.
+Treated as the code-generation and workflow execution target. Conductor now uses Refiner's dedicated `/api/execution/plan` surface plus its job APIs for approved work items while keeping repository mutation inside Refiner's workflow boundary, reuses Refiner's job, requirements, and workspace APIs to enrich traceability with execution-native evidence, and prefers the dedicated `refiner.neuralmimicry.ai` public edge when it is available while safely falling back to the shared API edge or discovered internal service URL.
 
 ### AARNN
 

@@ -407,7 +407,7 @@ pub fn detect_findings(
                     ],
                     plan: json!({
                         "action": "integrate_refiner_jobs",
-                        "paths": ["/api/jobs", "/api/playground/plan"],
+                        "paths": ["/api/jobs", "/api/execution/plan"],
                     }),
                     depends_on: Vec::new(),
                 },
