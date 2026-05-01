@@ -1637,7 +1637,10 @@ mod tests {
         storage::memory::MemoryRepository,
         validation::{IndependentValidationReport, ValidationCommandResult},
     };
-    use axum::{Json, Router, routing::{get, post}};
+    use axum::{
+        Json, Router,
+        routing::{get, post},
+    };
     use chrono::Duration as ChronoDuration;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -2070,9 +2073,10 @@ mod tests {
             .await
             .expect("insert work item");
 
-        let execution = execute_specific_work_item(repository.as_ref(), &config, item.id, false, None)
-            .await
-            .expect("execution");
+        let execution =
+            execute_specific_work_item(repository.as_ref(), &config, item.id, false, None)
+                .await
+                .expect("execution");
 
         assert_eq!(execution.status, ExecutionStatus::Success);
         assert_eq!(
@@ -2085,7 +2089,10 @@ mod tests {
             )
         );
         assert_eq!(
-            execution.request_payload.get("source").and_then(Value::as_str),
+            execution
+                .request_payload
+                .get("source")
+                .and_then(Value::as_str),
             Some("execution")
         );
         assert_eq!(
