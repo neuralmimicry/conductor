@@ -87,6 +87,27 @@ integrations:
     base_url: "${AARNN_BASE_URL}"
     bearer_token: "${AARNN_BEARER_TOKEN}"
     timeout_seconds: 10
+  grafana:
+    enabled: true
+    base_url: "${GRAFANA_BASE_URL}"
+    bearer_token: "${GRAFANA_BEARER_TOKEN}"
+    username: "${GRAFANA_USERNAME}"
+    password: "${GRAFANA_PASSWORD}"
+    timeout_seconds: 10
+  prometheus:
+    enabled: true
+    base_url: "${PROMETHEUS_BASE_URL}"
+    bearer_token: "${PROMETHEUS_BEARER_TOKEN}"
+    username: "${PROMETHEUS_USERNAME}"
+    password: "${PROMETHEUS_PASSWORD}"
+    timeout_seconds: 10
+  postgres:
+    enabled: true
+    connection_string: "${POSTGRES_CONNECTION_STRING}"
+    timeout_seconds: 5
+  shared_storage:
+    enabled: true
+    mount_path: "${SHARED_STORAGE_MOUNT_PATH}"
   atlassian:
     enabled: true
     base_url: "${ATLASSIAN_BASE_URL}"

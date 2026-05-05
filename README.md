@@ -1,6 +1,6 @@
 # Conductor
 
-Rust control-plane service for the NeuralMimicry stack. Conductor discovers the deployed topology from the SwarmHPC Ansible playbooks, scans the mounted NeuralMimicry repositories, optionally enriches that inventory from the GitHub organisation, probes the live service surfaces for Gail, Tracey, Continuum, Refiner, and AARNN, persists state in Postgres, and drives an improvement queue through an admin dashboard and API.
+Rust control-plane service for the NeuralMimicry stack. Conductor discovers the deployed topology from the SwarmHPC Ansible playbooks, scans the mounted NeuralMimicry repositories, optionally enriches that inventory from the GitHub organisation, probes the live service surfaces for Gail, Tracey, Continuum, Refiner, AARNN, Grafana, Prometheus, shared Postgres, and mounted shared storage, persists state in Postgres, and drives an improvement queue through an admin dashboard and API.
 
 Lifecycle placement is explicit:
 
@@ -13,7 +13,7 @@ Lifecycle placement is explicit:
 - Parses the SwarmHPC Ansible tree, including inventory groups, `group_vars`, `host_vars`, and tenant playbooks, to infer the deployed topology.
 - Builds a first-class repository inventory from the mounted local estate under `/home/pbisaacs/Developer/neuralmimicry`, the mounted SwarmHPC rollout repository, and optional GitHub organisation metadata.
 - Resolves repository URLs and branches from Ansible defaults, local git metadata, and explicit repo hints for cross-checking.
-- Probes live endpoints to classify health, capture surfaced capabilities, and persist snapshots, including Gail orchestration and trading status when available.
+- Probes live endpoints and shared data-plane surfaces to classify health, capture surfaced capabilities, and persist snapshots, including Gail orchestration/trading status, Prometheus scrape coverage, Grafana health, Postgres pressure, and shared-storage capacity when available.
 - Infers deployment environments from the existing SwarmHPC tenant environment variables where they are present.
 - Derives typed findings, evidence, and provenance records from repository inventory, service topology, runtime probes, and trend summaries.
 - Runs an improvement-planning loop that turns evidence-backed findings into graph-aware work items.
@@ -55,7 +55,7 @@ Lifecycle placement is explicit:
 
 1. Create a Postgres database and export `CONDUCTOR_DATABASE_URL`.
 2. Export `CONDUCTOR_LOCAL_REPO_ROOT` and `CONDUCTOR_ANSIBLE_ROOT` if your mounted repository estate or Ansible workspace live somewhere other than the default local paths. When running the container image, mount the NeuralMimicry checkout and the SwarmHPC checkout into those paths.
-3. Optionally export `CONDUCTOR_ADMIN_TOKEN`, the upstream base URLs / bearer tokens, and Atlassian credentials if ticket/page lifecycle operations should be enabled. For NeuralMimicry service integrations, prefer Customers-issued service-account bearer tokens scoped to the target service.
+3. Optionally export `CONDUCTOR_ADMIN_TOKEN`, the upstream base URLs / bearer tokens, shared Postgres connection string, shared-storage mount path, and Atlassian credentials if ticket/page lifecycle operations should be enabled. For NeuralMimicry service integrations, prefer Customers-issued service-account bearer tokens scoped to the target service.
 4. Start the service:
 
 ```bash

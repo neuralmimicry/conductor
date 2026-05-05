@@ -148,6 +148,10 @@ fn service_metrics(service: &ServiceSnapshot) -> Map<String, Value> {
     match service.service_key.as_str() {
         "tracey" => tracey_metrics(service),
         "continuum" => continuum_metrics(service),
+        "prometheus" => prometheus_metrics(service),
+        "grafana" => grafana_metrics(service),
+        "postgres" => postgres_metrics(service),
+        "shared-storage" => shared_storage_metrics(service),
         _ => generic_metrics(service),
     }
 }
@@ -273,6 +277,207 @@ fn continuum_metrics(service: &ServiceSnapshot) -> Map<String, Value> {
         &mut metrics,
         "preferred_gpus",
         pick_metric(&adaptive_flattened, &["preferred", "gpu"]),
+    );
+    metrics
+}
+
+fn prometheus_metrics(service: &ServiceSnapshot) -> Map<String, Value> {
+    let root = service
+        .probe
+        .get("metrics")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let targets = root.get("targets").cloned().unwrap_or_else(|| json!({}));
+    let active_targets_total = targets
+        .get("active_targets_total")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let down_targets_total = targets
+        .get("down_targets_total")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let jobs_with_failures = targets
+        .get("jobs_with_failures")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let job_count = targets
+        .get("jobs")
+        .and_then(Value::as_array)
+        .map(|jobs| jobs.len() as u64)
+        .unwrap_or(0);
+    let down_target_ratio = if active_targets_total > 0 {
+        down_targets_total as f64 / active_targets_total as f64
+    } else {
+        0.0
+    };
+    let failing_job_ratio = if job_count > 0 {
+        jobs_with_failures as f64 / job_count as f64
+    } else {
+        0.0
+    };
+
+    let mut metrics = generic_metrics(service);
+    metrics.insert(
+        "pressure_score".to_string(),
+        json!(down_target_ratio.max(failing_job_ratio)),
+    );
+    metrics.insert("down_target_ratio".to_string(), json!(down_target_ratio));
+    metrics.insert("failing_job_ratio".to_string(), json!(failing_job_ratio));
+    metrics.insert(
+        "active_target_count".to_string(),
+        json!(normalize_signal(active_targets_total as f64)),
+    );
+    metrics
+}
+
+fn grafana_metrics(service: &ServiceSnapshot) -> Map<String, Value> {
+    let root = service
+        .probe
+        .get("metrics")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let database_status_ok = root
+        .get("database_status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status.eq_ignore_ascii_case("ok"));
+    let datasource_count = root
+        .get("datasource_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let dashboard_count = root
+        .get("dashboard_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let coverage_gap = if datasource_count == 0 || dashboard_count == 0 {
+        1.0
+    } else {
+        0.0
+    };
+
+    let mut metrics = generic_metrics(service);
+    metrics.insert(
+        "pressure_score".to_string(),
+        json!(if database_status_ok {
+            coverage_gap
+        } else {
+            1.0
+        }),
+    );
+    metrics.insert(
+        "database_status_severity".to_string(),
+        json!(if database_status_ok { 0.0 } else { 1.0 }),
+    );
+    metrics.insert(
+        "datasource_count".to_string(),
+        json!(normalize_signal(datasource_count as f64)),
+    );
+    metrics.insert(
+        "dashboard_count".to_string(),
+        json!(normalize_signal(dashboard_count as f64)),
+    );
+    metrics
+}
+
+fn postgres_metrics(service: &ServiceSnapshot) -> Map<String, Value> {
+    let root = service
+        .probe
+        .get("metrics")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let database = root.get("database").cloned().unwrap_or_else(|| json!({}));
+    let connection_utilization = database
+        .get("connection_utilization")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let waiting_connections = database
+        .get("waiting_connections")
+        .map(extract_number)
+        .unwrap_or(0.0);
+    let idle_in_transaction = database
+        .get("idle_in_transaction")
+        .map(extract_number)
+        .unwrap_or(0.0);
+    let deadlocks = database.get("deadlocks").map(extract_number).unwrap_or(0.0);
+
+    let mut metrics = generic_metrics(service);
+    metrics.insert(
+        "pressure_score".to_string(),
+        json!(
+            connection_utilization
+                .max(waiting_connections)
+                .max(idle_in_transaction)
+        ),
+    );
+    metrics.insert(
+        "connection_utilization".to_string(),
+        json!(connection_utilization),
+    );
+    metrics.insert(
+        "waiting_connection_pressure".to_string(),
+        json!(waiting_connections),
+    );
+    metrics.insert(
+        "idle_in_transaction_pressure".to_string(),
+        json!(idle_in_transaction),
+    );
+    metrics.insert("deadlock_pressure".to_string(), json!(deadlocks));
+    metrics
+}
+
+fn shared_storage_metrics(service: &ServiceSnapshot) -> Map<String, Value> {
+    let root = service
+        .probe
+        .get("metrics")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let filesystem = root.get("filesystem").cloned().unwrap_or_else(|| json!({}));
+    let usage_ratio = filesystem
+        .get("usage_ratio")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let inode_usage_ratio = filesystem
+        .get("inode_usage_ratio")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let read_only = filesystem
+        .get("read_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let expected_subdirectories = root
+        .get("expected_subdirectories")
+        .and_then(Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let missing_subdirectories = root
+        .get("missing_subdirectories")
+        .and_then(Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let missing_subdirectory_ratio = if expected_subdirectories > 0 {
+        missing_subdirectories as f64 / expected_subdirectories as f64
+    } else {
+        0.0
+    };
+
+    let mut metrics = generic_metrics(service);
+    metrics.insert(
+        "pressure_score".to_string(),
+        json!(
+            usage_ratio
+                .max(inode_usage_ratio)
+                .max(missing_subdirectory_ratio)
+                .max(if read_only { 1.0 } else { 0.0 })
+        ),
+    );
+    metrics.insert("storage_usage_pressure".to_string(), json!(usage_ratio));
+    metrics.insert("inode_usage_pressure".to_string(), json!(inode_usage_ratio));
+    metrics.insert(
+        "missing_subdirectory_ratio".to_string(),
+        json!(missing_subdirectory_ratio),
+    );
+    metrics.insert(
+        "read_only_severity".to_string(),
+        json!(if read_only { 1.0 } else { 0.0 }),
     );
     metrics
 }
@@ -460,5 +665,53 @@ mod tests {
             }
         });
         assert!(pressure_score(&value) >= 0.72);
+    }
+
+    #[test]
+    fn collects_shared_storage_pressure_metrics() {
+        let service = ServiceSnapshot {
+            service_key: "shared-storage".to_string(),
+            display_name: "Shared Storage".to_string(),
+            kind: "storage".to_string(),
+            role_name: "qc01_shared_storage".to_string(),
+            playbooks: vec![],
+            host_targets: vec![],
+            hosts: vec![],
+            namespace: None,
+            service_name: None,
+            deployment_environment: None,
+            internal_url: None,
+            public_url: None,
+            repo_path: None,
+            repo_url: None,
+            repo_branch: None,
+            health: crate::models::ServiceHealth::Healthy,
+            capabilities: vec!["persistent_storage".to_string()],
+            dependencies: vec![],
+            storage_paths: vec!["/home/continuum-shared-storage".to_string()],
+            raw_defaults: json!({}),
+            probe: json!({
+                "metrics": {
+                    "filesystem": {
+                        "usage_ratio": 0.87,
+                        "inode_usage_ratio": 0.12,
+                        "read_only": false
+                    },
+                    "expected_subdirectories": ["postgres", "prometheus"],
+                    "missing_subdirectories": ["postgres"]
+                }
+            }),
+            discovered_at: now_utc(),
+            updated_at: now_utc(),
+        };
+
+        let metrics = collect_metric_samples(uuid::Uuid::new_v4(), &[service]);
+        let payload = metrics
+            .first()
+            .and_then(|sample| sample.metrics.get("storage_usage_pressure"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+
+        assert!(payload >= 0.87);
     }
 }

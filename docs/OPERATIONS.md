@@ -23,7 +23,12 @@ Important environment variables:
 - `CONTINUUM_BASE_URL`
 - `REFINER_BASE_URL`
 - `AARNN_BASE_URL`
+- `GRAFANA_BASE_URL`
+- `PROMETHEUS_BASE_URL`
+- `POSTGRES_CONNECTION_STRING` when the shared estate Postgres instance should be probed independently of `CONDUCTOR_DATABASE_URL`
+- `SHARED_STORAGE_MOUNT_PATH` when the shared NFS export is mounted somewhere other than the discovered default path
 - Optional bearer token variables for each upstream
+- Optional username/password variables for Grafana and Prometheus if the public edge is protected and in-cluster routing is unavailable
 - `ATLASSIAN_BASE_URL`
 - `ATLASSIAN_USERNAME`
 - `ATLASSIAN_API_TOKEN`
@@ -78,6 +83,10 @@ Important Refiner and Tracey sync controls in `config/conductor.yaml`:
 - `integrations.tracey.sync_interval_seconds`: background cadence for Tracey-backed runtime, rollout, rollback, and incident-signal sync. Set to `0` to disable runtime correlation refresh.
 - `CONTINUUM_BASE_URL`: may point either at the native Continuum root or the public monitoring path. Conductor now normalises the NeuralMimicry public edge to `/services/health/monitoring` automatically when needed and reuses Continuum for Tracey fleet, analytics, and assessment correlation.
 - `REFINER_BASE_URL`: may stay unset for in-cluster execution, but when public routing is required Conductor now prefers `https://refiner.neuralmimicry.ai`, then the shared `https://api.neuralmimicry.ai` edge, then the discovered service URL.
+- `integrations.grafana`: probes Grafana health plus dashboard/datasource inventory and will fall back from the public edge to the discovered cluster URL when needed.
+- `integrations.prometheus`: probes Prometheus runtime and target coverage so service-specific scrape failures can become improvement findings.
+- `integrations.postgres.connection_string`: optional dedicated shared-instance DSN; when unset Conductor falls back to `CONDUCTOR_DATABASE_URL`.
+- `integrations.shared_storage.mount_path`: optional mounted shared-storage root. Set this explicitly when Conductor runs outside the storage host or when the NFS export is mounted at a non-default path.
 
 ## Running Locally
 

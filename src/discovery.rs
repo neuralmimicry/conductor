@@ -1682,6 +1682,7 @@ fn kind_for_service(service_key: &str, role: &str) -> String {
         "tracey" => "host_agent".to_string(),
         "swarmhpc" => "deployment_automation".to_string(),
         "postgres" => "database".to_string(),
+        "shared-storage" => "storage".to_string(),
         "prometheus" | "grafana" => "observability".to_string(),
         "ollama" => "llm_runtime".to_string(),
         _ if role.starts_with("continuum_tenant_") => "tenant_service".to_string(),
@@ -1990,6 +1991,11 @@ fn infer_capabilities(
         "postgres" => {
             capabilities.insert("relational_storage".to_string());
         }
+        "shared-storage" => capabilities.extend(
+            ["persistent_storage", "shared_storage", "nfs"]
+                .into_iter()
+                .map(ToString::to_string),
+        ),
         "ollama" => {
             capabilities.insert("model_runtime".to_string());
         }
@@ -2393,6 +2399,7 @@ fn purpose_for_service(service: &ServiceSnapshot) -> String {
         "tracey" => "telemetry_and_runtime_analysis".to_string(),
         "aarnn" => "neuromorphic_runtime".to_string(),
         "swarmhpc" => "deployment_automation_and_rollout".to_string(),
+        "shared-storage" => "shared_persistent_storage".to_string(),
         "customers" => "identity_and_session_service".to_string(),
         "billing" => "commercial_service".to_string(),
         _ => "runtime_service".to_string(),
@@ -2401,8 +2408,10 @@ fn purpose_for_service(service: &ServiceSnapshot) -> String {
 
 fn criticality_for_service(service: &ServiceSnapshot) -> String {
     match service.service_key.as_str() {
-        "conductor" | "continuum" | "refiner" | "gail" | "tracey" | "postgres" | "customers"
-        | "billing" | "aarnn" | "swarmhpc" => "critical".to_string(),
+        "conductor" | "continuum" | "refiner" | "gail" | "tracey" | "postgres"
+        | "shared-storage" | "customers" | "billing" | "aarnn" | "swarmhpc" => {
+            "critical".to_string()
+        }
         _ if service.public_url.is_some() || service.capabilities.contains(&"auth".to_string()) => {
             "high".to_string()
         }

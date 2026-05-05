@@ -96,6 +96,10 @@ pub struct IntegrationsConfig {
     pub refiner: ExternalServiceConfig,
     pub aarnn: ExternalServiceConfig,
     pub ollama: ExternalServiceConfig,
+    pub grafana: ExternalServiceConfig,
+    pub prometheus: ExternalServiceConfig,
+    pub postgres: PostgresIntegrationConfig,
+    pub shared_storage: SharedStorageIntegrationConfig,
     pub atlassian: AtlassianConfig,
 }
 
@@ -137,6 +141,21 @@ pub struct ExternalServiceConfig {
     pub password: Option<String>,
     pub timeout_seconds: u64,
     pub sync_interval_seconds: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PostgresIntegrationConfig {
+    pub enabled: bool,
+    pub connection_string: Option<String>,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SharedStorageIntegrationConfig {
+    pub enabled: bool,
+    pub mount_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -308,6 +327,10 @@ impl Default for IntegrationsConfig {
             refiner: ExternalServiceConfig::default(),
             aarnn: ExternalServiceConfig::default(),
             ollama: ExternalServiceConfig::default(),
+            grafana: ExternalServiceConfig::default(),
+            prometheus: ExternalServiceConfig::default(),
+            postgres: PostgresIntegrationConfig::default(),
+            shared_storage: SharedStorageIntegrationConfig::default(),
             atlassian: AtlassianConfig::default(),
         }
     }
@@ -334,6 +357,25 @@ impl Default for ExternalServiceConfig {
             password: None,
             timeout_seconds: 5,
             sync_interval_seconds: 0,
+        }
+    }
+}
+
+impl Default for PostgresIntegrationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            connection_string: None,
+            timeout_seconds: 5,
+        }
+    }
+}
+
+impl Default for SharedStorageIntegrationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mount_path: None,
         }
     }
 }
@@ -600,6 +642,10 @@ impl ConductorConfig {
         normalize_external_service(&mut self.integrations.refiner);
         normalize_external_service(&mut self.integrations.aarnn);
         normalize_external_service(&mut self.integrations.ollama);
+        normalize_external_service(&mut self.integrations.grafana);
+        normalize_external_service(&mut self.integrations.prometheus);
+        normalize_postgres_integration(&mut self.integrations.postgres);
+        normalize_shared_storage_integration(&mut self.integrations.shared_storage);
         normalize_atlassian(&mut self.integrations.atlassian);
         if self.policy.ai_approval_interval_seconds == 0 {
             self.policy.ai_approval_interval_seconds = 60;
@@ -701,11 +747,26 @@ fn normalize_atlassian(config: &mut AtlassianConfig) {
     }
 }
 
+fn normalize_postgres_integration(config: &mut PostgresIntegrationConfig) {
+    normalize_optional_string(&mut config.connection_string);
+    if config.timeout_seconds == 0 {
+        config.timeout_seconds = 5;
+    }
+}
+
+fn normalize_shared_storage_integration(config: &mut SharedStorageIntegrationConfig) {
+    normalize_optional_path(&mut config.mount_path);
+}
+
 fn normalize_optional_string(value: &mut Option<String>) {
     *value = value
         .take()
         .map(|item| item.trim().to_string())
         .filter(|item| !item.is_empty());
+}
+
+fn normalize_optional_path(value: &mut Option<PathBuf>) {
+    *value = value.take().filter(|path| !path.as_os_str().is_empty());
 }
 
 fn normalize_unique_strings(values: &mut Vec<String>) {
