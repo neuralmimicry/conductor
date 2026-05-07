@@ -659,38 +659,20 @@ async fn probe_continuum(
 }
 
 async fn probe_refiner(
-    client: &Client,
+    _client: &Client,
     config: &ConductorConfig,
     service: &ServiceSnapshot,
 ) -> Result<ProbeResult> {
     let external = &config.integrations.refiner;
-    let base_url = resolve_base_url(service, external)
+    let refiner_client = refiner::RefinerClient::from_sources(external, Some(service))
+        .await?
         .ok_or_else(|| anyhow!("no Refiner base URL available"))?;
-    let health = get_json(
-        client,
-        &base_url,
-        "/api/health",
-        external.bearer_token.as_deref(),
-    )
-    .await?;
-    let capabilities = get_json(
-        client,
-        &base_url,
-        "/api/capabilities",
-        external.bearer_token.as_deref(),
-    )
-    .await
-    .ok();
-    let orchestration = get_json(
-        client,
-        &base_url,
-        "/api/admin/ai-orchestration?limit=8",
-        external.bearer_token.as_deref(),
-    )
-    .await
-    .ok();
+    refiner_client.login_if_configured().await?;
+    let health = refiner_client.get_health().await?;
+    let capabilities = refiner_client.get_capabilities().await.ok();
+    let orchestration = refiner_client.get_ai_orchestration(8).await.ok();
     Ok(ProbeResult {
-        endpoint: Some(base_url),
+        endpoint: Some(refiner_client.base_url().to_string()),
         summary: "Refiner control-room API retrieved".to_string(),
         metrics: json!({
             "health": health,
@@ -1678,7 +1660,13 @@ pub(crate) async fn decode_json(response: reqwest::Response) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, routing::get};
+    use axum::{
+        Json, Router,
+        extract::Query,
+        http::{HeaderMap, StatusCode, header},
+        response::{IntoResponse, Response},
+        routing::{get, post},
+    };
     use tokio::net::TcpListener;
 
     async fn spawn_mock_github(
@@ -1715,6 +1703,105 @@ mod tests {
         (format!("http://{}", addr), handle)
     }
 
+    fn sample_refiner_service(base_url: String) -> ServiceSnapshot {
+        ServiceSnapshot {
+            service_key: "refiner".to_string(),
+            display_name: "Refiner".to_string(),
+            kind: "tenant_service".to_string(),
+            role_name: "continuum_tenant_refiner".to_string(),
+            playbooks: vec![],
+            host_targets: vec![],
+            hosts: vec![],
+            namespace: None,
+            service_name: None,
+            deployment_environment: None,
+            internal_url: None,
+            public_url: Some(base_url),
+            repo_path: None,
+            repo_url: None,
+            repo_branch: None,
+            health: ServiceHealth::Unknown,
+            capabilities: vec![],
+            dependencies: vec![],
+            storage_paths: vec![],
+            raw_defaults: json!({}),
+            probe: json!({}),
+            discovered_at: crate::models::now_utc(),
+            updated_at: crate::models::now_utc(),
+        }
+    }
+
+    fn has_refiner_session(headers: &HeaderMap) -> bool {
+        headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("refiner_session=ok"))
+    }
+
+    async fn spawn_mock_refiner_control_room() -> (String, tokio::task::JoinHandle<()>) {
+        async fn health() -> Json<Value> {
+            Json(json!({"status": "ok"}))
+        }
+
+        async fn login() -> Response {
+            (
+                [(header::SET_COOKIE, "refiner_session=ok; Path=/; HttpOnly")],
+                Json(json!({"status": "ok"})),
+            )
+                .into_response()
+        }
+
+        async fn capabilities(headers: HeaderMap) -> Response {
+            if !has_refiner_session(&headers) {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"error": "unauthorized"})),
+                )
+                    .into_response();
+            }
+            Json(json!({
+                "workflows": [{"id": "project_solver"}],
+                "skills_catalog": {"total": 1},
+            }))
+            .into_response()
+        }
+
+        async fn ai_orchestration(
+            headers: HeaderMap,
+            Query(params): Query<BTreeMap<String, String>>,
+        ) -> Response {
+            if !has_refiner_session(&headers) {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"error": "unauthorized"})),
+                )
+                    .into_response();
+            }
+            Json(json!({
+                "enabled": true,
+                "provider_count": 1,
+                "limit": params.get("limit").and_then(|value| value.parse::<usize>().ok()),
+            }))
+            .into_response()
+        }
+
+        let app = Router::new()
+            .route("/api/health", get(health))
+            .route("/api/login", post(login))
+            .route("/api/capabilities", get(capabilities))
+            .route("/api/admin/ai-orchestration", get(ai_orchestration));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind refiner mock");
+        let addr = listener.local_addr().expect("refiner mock addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve refiner mock");
+        });
+        (format!("http://{}", addr), handle)
+    }
+
     #[tokio::test]
     async fn fetch_latest_github_actions_evidence_reports_success() {
         let (base_url, handle) = spawn_mock_github("success").await;
@@ -1741,6 +1828,38 @@ mod tests {
                 .and_then(|run| run.conclusion.as_deref()),
             Some("success")
         );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn refiner_probe_uses_configured_login_for_control_room_surfaces() {
+        let (base_url, handle) = spawn_mock_refiner_control_room().await;
+        let mut config = ConductorConfig::default();
+        config.integrations.refiner.enabled = true;
+        config.integrations.refiner.base_url = Some(base_url.clone());
+        config.integrations.refiner.username = Some("admin".to_string());
+        config.integrations.refiner.password = Some("secret".to_string());
+        config.integrations.refiner.timeout_seconds = 2;
+
+        let service = sample_refiner_service(base_url.clone());
+        let client = build_http_client(2).expect("client");
+
+        let probe = probe_service(&client, &config, &service)
+            .await
+            .expect("refiner probe");
+
+        assert_eq!(probe.endpoint.as_deref(), Some(base_url.as_str()));
+        assert_eq!(probe.metrics["health"]["status"].as_str(), Some("ok"));
+        assert_eq!(
+            probe.metrics["capabilities"]["workflows"][0]["id"].as_str(),
+            Some("project_solver")
+        );
+        assert_eq!(
+            probe.metrics["ai_orchestration"]["provider_count"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(probe.metrics["ai_orchestration"]["limit"].as_u64(), Some(8));
 
         handle.abort();
     }

@@ -71,6 +71,20 @@ impl RefinerClient {
         format!("{}/api/jobs/{}/workspace", self.base_url, job_id.trim())
     }
 
+    pub async fn get_health(&self) -> Result<Value> {
+        self.get_json("/api/health").await
+    }
+
+    pub async fn get_capabilities(&self) -> Result<Value> {
+        self.get_json("/api/capabilities").await
+    }
+
+    pub async fn get_ai_orchestration(&self, limit: usize) -> Result<Value> {
+        let limit = limit.clamp(1, 100);
+        self.get_json(&format!("/api/admin/ai-orchestration?limit={limit}"))
+            .await
+    }
+
     pub async fn login_if_configured(&self) -> Result<()> {
         let (Some(username), Some(password)) = (
             self.username
