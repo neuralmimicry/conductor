@@ -24,6 +24,7 @@ impl RefinerClient {
         if !config.enabled {
             return Ok(None);
         }
+
         let client = Client::builder()
             .use_rustls_tls()
             .cookie_store(true)
@@ -31,16 +32,22 @@ impl RefinerClient {
                 config.timeout_seconds.max(1),
             ))
             .build()?;
+
         let base_url = select_live_base_url(&client, config, service)
             .await?
             .ok_or_else(|| anyhow!("no Refiner base URL configured or discovered"))?;
-        Ok(Some(Self {
+
+        let refiner = Self {
             client,
             base_url,
             bearer_token: config.bearer_token.clone(),
             username: config.username.clone(),
             password: config.password.clone(),
-        }))
+        };
+
+        refiner.login_if_configured().await?;
+
+        Ok(Some(refiner))
     }
 
     pub fn base_url(&self) -> &str {
