@@ -209,7 +209,7 @@ impl ConductorService {
                     .find(|service| service.service_key == target)
             });
             let policy = evaluate_work_item(&self.config, original, target_service);
-            if !matches!(policy.verdict, crate::models::PolicyVerdict::NeedsApproval) {
+            if matches!(policy.verdict, crate::models::PolicyVerdict::Blocked) {
                 continue;
             }
             if metadata_verdict(&original.approval_metadata) == Some("denied")
@@ -5910,6 +5910,101 @@ mod tests {
         assert_eq!(
             updated.approval_metadata["verdict"].as_str(),
             Some("approved")
+        );
+
+        gail_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn ai_approval_cycle_reviews_policy_allowed_unapproved_work() {
+        let (gail_base_url, gail_handle) = spawn_mock_gail(true).await;
+
+        let mut config = ConductorConfig::default();
+        config.execution.enabled = false;
+        config.integrations.atlassian.enabled = false;
+        config.integrations.gail.base_url = Some(gail_base_url);
+        config.policy.protected_services = vec![];
+        config.policy.protected_repo_roots = vec![];
+        config.policy.ai_approvals_enabled = true;
+
+        let repository = Arc::new(MemoryRepository::new());
+        let service_snapshot = ServiceSnapshot {
+            service_key: "conductor".to_string(),
+            display_name: "Conductor".to_string(),
+            kind: "tenant_service".to_string(),
+            role_name: "continuum_tenant_conductor".to_string(),
+            playbooks: vec![],
+            host_targets: vec![],
+            hosts: vec![],
+            namespace: Some("conductor".to_string()),
+            service_name: Some("conductor".to_string()),
+            deployment_environment: Some(DeliveryStage::Development),
+            internal_url: None,
+            public_url: None,
+            repo_path: Some(
+                config
+                    .discovery
+                    .repo_hints
+                    .conductor_repo
+                    .display()
+                    .to_string(),
+            ),
+            repo_url: None,
+            repo_branch: None,
+            health: crate::models::ServiceHealth::Healthy,
+            capabilities: vec!["self_governance".to_string()],
+            dependencies: vec![],
+            storage_paths: vec![],
+            raw_defaults: json!({}),
+            probe: json!({}),
+            discovered_at: now_utc(),
+            updated_at: now_utc(),
+        };
+        repository
+            .replace_service_snapshots(&[service_snapshot])
+            .await
+            .expect("services");
+
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("conductor:self-test".to_string()),
+            title: "Restore Conductor self-test baseline".to_string(),
+            summary: "Conductor self-tests are failing or incomplete.".to_string(),
+            target_service: Some("conductor".to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: vec![],
+            rollout_strategy: Some(RolloutStrategy::Direct),
+            status: Some(WorkStatus::Planned),
+            priority: Some(100),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: false,
+            verification_required: Some(true),
+            tags: vec!["conductor".to_string(), "quality".to_string()],
+            plan: json!({"action": "restore_self_test_baseline"}),
+            depends_on: vec![],
+            source: Some("planner".to_string()),
+            scheduled_for: None,
+        });
+        repository.upsert_work_item(&item).await.expect("work item");
+
+        let http = build_http_client(2).expect("http client");
+        let service = ConductorService::new(config, repository.clone(), http);
+        let approved = service
+            .run_ai_approval_cycle()
+            .await
+            .expect("approval cycle");
+        assert_eq!(approved, 1);
+
+        let updated = repository
+            .get_work_item(item.id)
+            .await
+            .expect("fetch")
+            .expect("updated");
+        assert!(updated.execution_approved);
+        assert_eq!(updated.status, WorkStatus::Scheduled);
+        assert_eq!(
+            updated.approval_metadata["policy"]["verdict"].as_str(),
+            Some("allowed")
         );
 
         gail_handle.abort();
