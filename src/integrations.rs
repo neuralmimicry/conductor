@@ -312,8 +312,8 @@ pub(crate) fn resolve_base_url(
         .base_url
         .clone()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| service.public_url.clone())
         .or_else(|| service.internal_url.clone())
+        .or_else(|| service.public_url.clone())
         .map(|value| value.trim_end_matches('/').to_string())
 }
 
@@ -322,8 +322,8 @@ fn base_url_candidates(service: &ServiceSnapshot, external: &ExternalServiceConf
     let mut seen = BTreeSet::new();
     for value in [
         external.base_url.as_deref(),
-        service.public_url.as_deref(),
         service.internal_url.as_deref(),
+        service.public_url.as_deref(),
     ] {
         let Some(candidate) = value else {
             continue;
@@ -1862,5 +1862,78 @@ mod tests {
         assert_eq!(probe.metrics["ai_orchestration"]["limit"].as_u64(), Some(8));
 
         handle.abort();
+    }
+
+    #[test]
+    fn resolve_base_url_prefers_internal_before_public() {
+        let service = ServiceSnapshot {
+            service_key: "prometheus".to_string(),
+            display_name: "Prometheus".to_string(),
+            kind: "observability".to_string(),
+            role_name: "continuum_tenant_prometheus".to_string(),
+            playbooks: vec![],
+            host_targets: vec![],
+            hosts: vec![],
+            namespace: None,
+            service_name: None,
+            deployment_environment: None,
+            internal_url: Some("http://prometheus.prometheus.svc.cluster.local:9090".to_string()),
+            public_url: Some("https://prometheus.neuralmimicry.ai".to_string()),
+            repo_path: None,
+            repo_url: None,
+            repo_branch: None,
+            health: ServiceHealth::Unknown,
+            capabilities: vec![],
+            dependencies: vec![],
+            storage_paths: vec![],
+            raw_defaults: json!({}),
+            probe: json!({}),
+            discovered_at: crate::models::now_utc(),
+            updated_at: crate::models::now_utc(),
+        };
+        let external = ExternalServiceConfig::default();
+        assert_eq!(
+            resolve_base_url(&service, &external).as_deref(),
+            Some("http://prometheus.prometheus.svc.cluster.local:9090")
+        );
+    }
+
+    #[test]
+    fn base_url_candidates_keep_external_first_then_internal_then_public() {
+        let service = ServiceSnapshot {
+            service_key: "prometheus".to_string(),
+            display_name: "Prometheus".to_string(),
+            kind: "observability".to_string(),
+            role_name: "continuum_tenant_prometheus".to_string(),
+            playbooks: vec![],
+            host_targets: vec![],
+            hosts: vec![],
+            namespace: None,
+            service_name: None,
+            deployment_environment: None,
+            internal_url: Some("http://prometheus.prometheus.svc.cluster.local:9090".to_string()),
+            public_url: Some("https://prometheus.neuralmimicry.ai".to_string()),
+            repo_path: None,
+            repo_url: None,
+            repo_branch: None,
+            health: ServiceHealth::Unknown,
+            capabilities: vec![],
+            dependencies: vec![],
+            storage_paths: vec![],
+            raw_defaults: json!({}),
+            probe: json!({}),
+            discovered_at: crate::models::now_utc(),
+            updated_at: crate::models::now_utc(),
+        };
+        let mut external = ExternalServiceConfig::default();
+        external.base_url = Some("http://127.0.0.1:9090".to_string());
+        assert_eq!(
+            base_url_candidates(&service, &external),
+            vec![
+                "http://127.0.0.1:9090".to_string(),
+                "http://prometheus.prometheus.svc.cluster.local:9090".to_string(),
+                "https://prometheus.neuralmimicry.ai".to_string(),
+            ]
+        );
     }
 }
