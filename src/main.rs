@@ -13,6 +13,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 #[derive(Debug, Parser)]
 #[command(name = "conductor")]
 #[command(about = "AI conductor for the NeuralMimicry Continuum stack")]
+#[command(version)]
 struct Cli {
     #[arg(
         long,
@@ -24,10 +25,16 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let app_version = env!("CARGO_PKG_VERSION");
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     fmt().with_env_filter(filter).with_target(false).init();
 
     let cli = Cli::parse();
+    tracing::info!(
+        version = app_version,
+        config = %cli.config.display(),
+        "Conductor starting"
+    );
     let config = ConductorConfig::load(&cli.config)?;
     tokio::fs::create_dir_all(&config.storage.root_dir).await?;
 
@@ -39,7 +46,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let router = build_router(service);
     let listener = tokio::net::TcpListener::bind(config.server.bind_addr.as_str()).await?;
-    tracing::info!(bind_addr = %config.server.bind_addr, "Conductor listening");
+    tracing::info!(
+        version = app_version,
+        bind_addr = %config.server.bind_addr,
+        "Conductor listening"
+    );
     axum::serve(listener, router).await?;
     Ok(())
 }

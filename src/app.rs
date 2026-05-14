@@ -13,6 +13,7 @@ use axum::{
 use futures::stream;
 use serde::Deserialize;
 use serde_json::json;
+use tower_http::services::ServeDir;
 use uuid::Uuid;
 
 use crate::{
@@ -45,6 +46,7 @@ pub fn build_router(service: ConductorService) -> Router {
         .route("/", get(root))
         .route("/healthz", get(health))
         .route("/dashboard", get(dashboard))
+        .nest_service("/assets", ServeDir::new("assets"))
         .route("/api/v1/summary", get(summary))
         .route("/api/v1/findings", get(findings))
         .route("/api/v1/findings/{id}", get(get_finding))
@@ -114,7 +116,10 @@ async fn health() -> Json<serde_json::Value> {
 }
 
 async fn dashboard(State(service): State<ConductorService>) -> impl IntoResponse {
-    render_dashboard(&service.config.server.dashboard_title)
+    render_dashboard(
+        &service.config.server.dashboard_title,
+        env!("CARGO_PKG_VERSION"),
+    )
 }
 
 async fn summary(
