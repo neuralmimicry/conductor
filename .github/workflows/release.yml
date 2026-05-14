@@ -130,51 +130,36 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
-
       - name: Ensure packaging tools
         shell: bash
         run: |
           set -euo pipefail
+          if ! command -v podman >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends podman
+          fi
           if ! command -v dpkg-deb >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends dpkg
           fi
 
-      - name: Set release version
-        run: bash scripts/set-release-version.sh "${{ needs.version.outputs.app_version }}"
-
-      - name: Build release binary
-        run: cargo build --locked --release -j 1
-
-      - name: Verify release binary version
+      - name: Build Debian package in bookworm toolchain container
         shell: bash
         run: |
           set -euo pipefail
-          binary_version="$(target/release/conductor --version | sed -nE 's/^[^ ]+ ([^ ]+).*$/\1/p')"
-          if [[ -z "${binary_version}" ]]; then
-            echo "Unable to read release binary version" >&2
-            exit 2
-          fi
-          if [[ "${binary_version}" != "${{ needs.version.outputs.app_version }}" ]]; then
-            echo "Binary version mismatch: expected ${{ needs.version.outputs.app_version }}, got ${binary_version}" >&2
-            exit 2
-          fi
-
-      - name: Build Debian package
-        run: |
-          bash scripts/build-deb.sh \
-            --version "${{ needs.version.outputs.app_version }}" \
-            --deb-version "${{ needs.version.outputs.deb_version }}" \
-            --arch "${{ matrix.deb_arch }}" \
-            --binary target/release/conductor \
-            --out-dir dist
+          image_ref="conductor-release-build-${{ matrix.deb_arch }}:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          container_name="conductor-release-build-${{ matrix.deb_arch }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          podman build \
+            --target source-deb \
+            --build-arg "CONDUCTOR_VERSION=${{ needs.version.outputs.app_version }}" \
+            -f Containerfile \
+            -t "${image_ref}" \
+            .
+          podman create --name "${container_name}" "${image_ref}" >/dev/null
+          mkdir -p dist
+          podman cp "${container_name}:/out/conductor_${{ needs.version.outputs.deb_version }}_${{ matrix.deb_arch }}.deb" dist/
+          podman rm "${container_name}" >/dev/null
+          podman rmi "${image_ref}" >/dev/null
 
       - name: Inspect Debian package
         run: dpkg-deb --info "dist/conductor_${{ needs.version.outputs.deb_version }}_${{ matrix.deb_arch }}.deb"
