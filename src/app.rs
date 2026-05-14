@@ -956,6 +956,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dashboard_includes_neuralmimicry_header_and_version() {
+        let app = build_router(test_service());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("dashboard body");
+        let html = String::from_utf8(body.to_vec()).expect("utf-8 html");
+        assert!(html.contains("NeuralMimicry"));
+        assert!(html.contains("/assets/neuralmimicryicon512.png"));
+        assert!(html.contains(&format!("Conductor v{}", env!("CARGO_PKG_VERSION"))));
+    }
+
+    #[tokio::test]
     async fn execution_stream_requires_auth_when_token_is_configured() {
         let app = build_router(test_service());
         let response = app
