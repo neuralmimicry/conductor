@@ -921,6 +921,14 @@ impl ConductorRepository for PostgresRepository {
         rows.into_iter().map(map_improvement_cycle).collect()
     }
 
+    async fn count_improvement_cycles(&self) -> Result<usize> {
+        let row = sqlx::query("SELECT COUNT(*) AS total FROM improvement_cycles")
+            .fetch_one(&self.pool)
+            .await?;
+        let total: i64 = row.try_get("total")?;
+        Ok(total.max(0) as usize)
+    }
+
     async fn insert_conductor_event(&self, event: &ConductorEvent) -> Result<()> {
         sqlx::query(
             r#"

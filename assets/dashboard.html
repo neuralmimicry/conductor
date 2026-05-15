@@ -298,10 +298,22 @@
 const state = {
   token: localStorage.getItem('conductor_admin_token') || '',
   selectedWorkItemId: localStorage.getItem('conductor_selected_work_item') || '',
+  servicesCache: null,
+  servicesFetchedAt: 0,
+  cyclesCache: null,
+  cyclesFetchedAt: 0,
+  graphCache: null,
+  graphFetchedAt: 0,
 };
+const LIVE_REFRESH_MIN_MS = 1500;
+const SERVICES_REFRESH_MS = 10000;
+const CYCLES_REFRESH_MS = 10000;
+const GRAPH_REFRESH_MS = 30000;
 let eventSource = null;
 let eventRetryTimer = null;
 let reloadTimer = null;
+let loadInFlight = false;
+let loadQueued = false;
 const els = {
   token: document.getElementById('token'), saveToken: document.getElementById('save-token'), clearToken: document.getElementById('clear-token'),
   authStatus: document.getElementById('auth-status'), summaryCards: document.getElementById('summary-cards'), workItems: document.getElementById('work-items'),
@@ -345,9 +357,20 @@ function eventStreamUrl() {
   const query = params.toString();
   return `/api/v1/executions/stream${query ? `?${query}` : ''}`;
 }
-function scheduleLoad(delay = 150) {
+function scheduleLoad(delay = LIVE_REFRESH_MIN_MS) {
   if (reloadTimer) clearTimeout(reloadTimer);
-  reloadTimer = setTimeout(() => { load(); }, delay);
+  reloadTimer = setTimeout(() => { load(); }, Math.max(delay, LIVE_REFRESH_MIN_MS));
+}
+function shouldRefresh(lastFetchedAt, refreshWindowMs) {
+  return !lastFetchedAt || (Date.now() - lastFetchedAt) >= refreshWindowMs;
+}
+function resetDashboardCaches() {
+  state.servicesCache = null;
+  state.servicesFetchedAt = 0;
+  state.cyclesCache = null;
+  state.cyclesFetchedAt = 0;
+  state.graphCache = null;
+  state.graphFetchedAt = 0;
 }
 function connectEventStream() {
   if (eventSource || typeof EventSource === 'undefined') {
@@ -365,7 +388,7 @@ function connectEventStream() {
     } catch (_error) {
       updateEventBadge('Live feed update received', 'ok');
     }
-    scheduleLoad(120);
+    scheduleLoad(LIVE_REFRESH_MIN_MS);
   };
   eventSource.onerror = () => {
     closeEventStream();
@@ -568,48 +591,82 @@ async function runSelectedTraceabilityAction(path, body) {
     const payload = await fetchJson(path, { method: 'POST', body: JSON.stringify(body || {}) });
     const message = payload.result?.upstream_action || payload.sync?.links?.length || 'updated';
     updateEventBadge(`Traceability action complete: ${message}`, 'ok');
-    await load();
+    resetDashboardCaches();
+    await load(true);
   } catch (error) {
     updateAuthBadge(error.message);
   }
 }
-async function load() {
+async function load(force = false) {
+  if (loadInFlight) {
+    loadQueued = true;
+    return;
+  }
+  loadInFlight = true;
+  if (reloadTimer) {
+    clearTimeout(reloadTimer);
+    reloadTimer = null;
+  }
   try {
+    const refreshServices = force || !state.servicesCache || shouldRefresh(state.servicesFetchedAt, SERVICES_REFRESH_MS);
+    const refreshCycles = force || !state.cyclesCache || shouldRefresh(state.cyclesFetchedAt, CYCLES_REFRESH_MS);
+    const refreshGraph = force || !state.graphCache || shouldRefresh(state.graphFetchedAt, GRAPH_REFRESH_MS);
     const traceabilityPromise = state.selectedWorkItemId
       ? fetchJson(`/api/v1/work-items/${state.selectedWorkItemId}/traceability`).catch((error) => ({ __error: error.message }))
       : Promise.resolve(null);
     const [summary, services, workItems, cycles, traceability, graph] = await Promise.all([
       fetchJson('/api/v1/summary'),
-      fetchJson('/api/v1/services'),
+      refreshServices ? fetchJson('/api/v1/services') : Promise.resolve(state.servicesCache),
       fetchJson('/api/v1/work-items'),
-      fetchJson('/api/v1/cycles?limit=10'),
+      refreshCycles ? fetchJson('/api/v1/cycles?limit=10') : Promise.resolve(state.cyclesCache),
       traceabilityPromise,
-      fetchJson('/api/v1/traceability/graph'),
+      refreshGraph ? fetchJson('/api/v1/traceability/graph') : Promise.resolve(state.graphCache),
     ]);
+    if (refreshServices) {
+      state.servicesCache = services;
+      state.servicesFetchedAt = Date.now();
+    }
+    if (refreshCycles) {
+      state.cyclesCache = cycles;
+      state.cyclesFetchedAt = Date.now();
+    }
+    if (refreshGraph) {
+      state.graphCache = graph;
+      state.graphFetchedAt = Date.now();
+    }
     const items = workItems.work_items || workItems;
     if (state.selectedWorkItemId && !(items || []).some((item) => item.id === state.selectedWorkItemId)) {
       state.selectedWorkItemId = '';
       localStorage.removeItem('conductor_selected_work_item');
     }
-    renderSummary(summary); renderExternalSummary(summary, graph.graph || graph); renderServices(services.services || services); renderWorkItems(items); renderCycles(cycles.cycles || cycles); renderTraceability(traceability?.traceability || null, traceability?.__error); updateAuthBadge();
+    const servicesPayload = state.servicesCache || services;
+    const cyclesPayload = state.cyclesCache || cycles;
+    const graphPayload = state.graphCache || graph;
+    renderSummary(summary); renderExternalSummary(summary, graphPayload.graph || graphPayload); renderServices(servicesPayload.services || servicesPayload); renderWorkItems(items); renderCycles(cyclesPayload.cycles || cyclesPayload); renderTraceability(traceability?.traceability || null, traceability?.__error); updateAuthBadge();
     connectEventStream();
   } catch (error) {
     closeEventStream();
     updateEventBadge('Live feed offline', '');
     updateAuthBadge(error.message);
+  } finally {
+    loadInFlight = false;
+    if (loadQueued) {
+      loadQueued = false;
+      scheduleLoad(LIVE_REFRESH_MIN_MS);
+    }
   }
 }
-els.saveToken.addEventListener('click', () => { state.token = els.token.value.trim(); localStorage.setItem('conductor_admin_token', state.token); closeEventStream(); load(); });
-els.clearToken.addEventListener('click', () => { state.token = ''; els.token.value = ''; localStorage.removeItem('conductor_admin_token'); closeEventStream(); load(); });
-els.refresh.addEventListener('click', load);
-els.runDiscovery.addEventListener('click', async () => { try { await fetchJson('/api/v1/discovery/run', { method: 'POST' }); await load(); } catch (error) { updateAuthBadge(error.message); } });
-els.runPlanning.addEventListener('click', async () => { try { await fetchJson('/api/v1/planning/run', { method: 'POST' }); await load(); } catch (error) { updateAuthBadge(error.message); } });
-els.runExecution.addEventListener('click', async () => { try { await fetchJson('/api/v1/execution/run', { method: 'POST' }); await load(); } catch (error) { updateAuthBadge(error.message); } });
+els.saveToken.addEventListener('click', () => { state.token = els.token.value.trim(); localStorage.setItem('conductor_admin_token', state.token); closeEventStream(); resetDashboardCaches(); load(true); });
+els.clearToken.addEventListener('click', () => { state.token = ''; els.token.value = ''; localStorage.removeItem('conductor_admin_token'); closeEventStream(); resetDashboardCaches(); load(true); });
+els.refresh.addEventListener('click', () => { resetDashboardCaches(); load(true); });
+els.runDiscovery.addEventListener('click', async () => { try { await fetchJson('/api/v1/discovery/run', { method: 'POST' }); resetDashboardCaches(); await load(true); } catch (error) { updateAuthBadge(error.message); } });
+els.runPlanning.addEventListener('click', async () => { try { await fetchJson('/api/v1/planning/run', { method: 'POST' }); resetDashboardCaches(); await load(true); } catch (error) { updateAuthBadge(error.message); } });
+els.runExecution.addEventListener('click', async () => { try { await fetchJson('/api/v1/execution/run', { method: 'POST' }); resetDashboardCaches(); await load(true); } catch (error) { updateAuthBadge(error.message); } });
 els.syncSelected.addEventListener('click', async () => { await runSelectedTraceabilityAction(`/api/v1/work-items/${state.selectedWorkItemId}/links/sync`, { systems: ['refiner', 'tracey', 'jira', 'confluence'] }); });
 els.createJira.addEventListener('click', async () => { await runSelectedTraceabilityAction(`/api/v1/work-items/${state.selectedWorkItemId}/links/jira`, {}); });
 els.publishConfluence.addEventListener('click', async () => { await runSelectedTraceabilityAction(`/api/v1/work-items/${state.selectedWorkItemId}/links/confluence`, {}); });
 window.addEventListener('beforeunload', closeEventStream);
-load();
+load(true);
 </script>
 </body>
 </html>

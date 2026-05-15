@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
+use futures::future;
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -1285,9 +1286,8 @@ async fn production_github_actions_evidence(
         }
     };
 
-    let mut last_missing = None;
-    for branch in branches {
-        match fetch_latest_github_actions_evidence(
+    let branch_checks = future::join_all(branches.iter().cloned().map(|branch| async {
+        let result = fetch_latest_github_actions_evidence(
             &client,
             config,
             &owner,
@@ -1295,8 +1295,14 @@ async fn production_github_actions_evidence(
             &branch,
             &workflow_file,
         )
-        .await
-        {
+        .await;
+        (branch, result)
+    }))
+    .await;
+
+    let mut last_missing = None;
+    for (branch, result) in branch_checks {
+        match result {
             Ok(evidence) if evidence.succeeded => return Some(evidence),
             Ok(evidence) if evidence.run.is_some() => return Some(evidence),
             Ok(evidence) => last_missing = Some(evidence),

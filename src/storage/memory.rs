@@ -422,6 +422,10 @@ impl ConductorRepository for MemoryRepository {
         Ok(cycles)
     }
 
+    async fn count_improvement_cycles(&self) -> Result<usize> {
+        Ok(self.cycles.read().await.len())
+    }
+
     async fn insert_conductor_event(&self, event: &ConductorEvent) -> Result<()> {
         let mut guard = self.events.write().await;
         guard.push(event.clone());

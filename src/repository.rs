@@ -98,6 +98,7 @@ pub trait ConductorRepository: Send + Sync {
 
     async fn insert_improvement_cycle(&self, cycle: &ImprovementCycle) -> anyhow::Result<()>;
     async fn list_improvement_cycles(&self, limit: usize) -> anyhow::Result<Vec<ImprovementCycle>>;
+    async fn count_improvement_cycles(&self) -> anyhow::Result<usize>;
     async fn insert_conductor_event(&self, event: &ConductorEvent) -> anyhow::Result<()>;
     async fn list_conductor_events(&self, limit: usize) -> anyhow::Result<Vec<ConductorEvent>>;
 }

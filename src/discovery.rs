@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
+use futures::{StreamExt, stream};
 use regex::Regex;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
@@ -27,6 +28,8 @@ pub struct DiscoveryOutput {
     pub repositories: Vec<RepositorySnapshot>,
     pub run: DiscoveryRun,
 }
+
+const DISCOVERY_PROBE_CONCURRENCY: usize = 8;
 
 #[derive(Clone, Debug)]
 struct PlaybookDocument {
@@ -700,17 +703,23 @@ pub async fn discover_and_probe(
     }
 
     if config.discovery.probe_services {
-        for service in &mut services {
-            match probe_service(client, config, service).await {
-                Ok(probe) => apply_probe(service, probe),
-                Err(error) => {
-                    let error_text = error.to_string();
-                    service.health = classify_probe_error(&error_text);
-                    service.updated_at = now_utc();
-                    service.probe = json!({"error": error_text});
+        services = stream::iter(services.into_iter())
+            .map(|mut service| async move {
+                match probe_service(client, config, &service).await {
+                    Ok(probe) => apply_probe(&mut service, probe),
+                    Err(error) => {
+                        let error_text = error.to_string();
+                        service.health = classify_probe_error(&error_text);
+                        service.updated_at = now_utc();
+                        service.probe = json!({"error": error_text});
+                    }
                 }
-            }
-        }
+                service
+            })
+            .buffer_unordered(DISCOVERY_PROBE_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        services.sort_by(|left, right| left.service_key.cmp(&right.service_key));
 
         for service in &services {
             if matches!(

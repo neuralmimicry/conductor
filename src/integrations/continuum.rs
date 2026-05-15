@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use futures::future;
 use reqwest::Client;
 use serde_json::Value;
 
@@ -161,16 +162,21 @@ pub async fn select_live_base_url(
         return Ok(None);
     }
 
-    let mut attempts = Vec::new();
-    for candidate in candidates {
-        match super::get_json(
+    let checks = future::join_all(candidates.iter().cloned().map(|candidate| async move {
+        let result = super::get_json(
             client,
             &candidate,
             "/health",
             config.bearer_token.as_deref(),
         )
-        .await
-        {
+        .await;
+        (candidate, result)
+    }))
+    .await;
+
+    let mut attempts = Vec::new();
+    for (candidate, result) in checks {
+        match result {
             Ok(payload) if payload_looks_like_continuum_health(&payload) => {
                 return Ok(Some(candidate));
             }

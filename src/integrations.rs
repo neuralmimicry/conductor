@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
+use futures::future;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -401,29 +402,35 @@ async fn probe_gail(
     let external = &config.integrations.gail;
     let base_url =
         resolve_base_url(service, external).ok_or_else(|| anyhow!("no Gail base URL available"))?;
-    let health = get_json(
-        client,
-        &base_url,
-        "/healthz",
-        external.bearer_token.as_deref(),
-    )
-    .await?;
-    let orchestration = get_json(
-        client,
-        &base_url,
-        "/v1/status/orchestration?limit=8",
-        external.bearer_token.as_deref(),
-    )
-    .await
-    .ok();
-    let trading = get_json(
-        client,
-        &base_url,
-        "/v1/trading/status",
-        external.bearer_token.as_deref(),
-    )
-    .await
-    .ok();
+    let (health, orchestration, trading) = tokio::join!(
+        get_json(
+            client,
+            &base_url,
+            "/healthz",
+            external.bearer_token.as_deref(),
+        ),
+        async {
+            get_json(
+                client,
+                &base_url,
+                "/v1/status/orchestration?limit=8",
+                external.bearer_token.as_deref(),
+            )
+            .await
+            .ok()
+        },
+        async {
+            get_json(
+                client,
+                &base_url,
+                "/v1/trading/status",
+                external.bearer_token.as_deref(),
+            )
+            .await
+            .ok()
+        }
+    );
+    let health = health?;
     Ok(ProbeResult {
         endpoint: Some(base_url),
         summary: if orchestration.is_some() && trading.is_some() {
@@ -450,40 +457,47 @@ async fn probe_tracey(
     let external = &config.integrations.tracey;
     let base_url = resolve_base_url(service, external)
         .ok_or_else(|| anyhow!("no Tracey base URL available"))?;
-    let health = match get_json(
-        client,
-        &base_url,
-        "/health",
-        external.bearer_token.as_deref(),
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(_) => {
+    let (health, status, loader_status) = tokio::join!(
+        async {
+            match get_json(
+                client,
+                &base_url,
+                "/health",
+                external.bearer_token.as_deref(),
+            )
+            .await
+            {
+                Ok(value) => Ok(value),
+                Err(_) => {
+                    get_json(
+                        client,
+                        &base_url,
+                        "/ready",
+                        external.bearer_token.as_deref(),
+                    )
+                    .await
+                }
+            }
+        },
+        get_json(
+            client,
+            &base_url,
+            "/status",
+            external.bearer_token.as_deref(),
+        ),
+        async {
             get_json(
                 client,
                 &base_url,
-                "/ready",
+                "/loader/status",
                 external.bearer_token.as_deref(),
             )
-            .await?
+            .await
+            .ok()
         }
-    };
-    let status = get_json(
-        client,
-        &base_url,
-        "/status",
-        external.bearer_token.as_deref(),
-    )
-    .await?;
-    let loader_status = get_json(
-        client,
-        &base_url,
-        "/loader/status",
-        external.bearer_token.as_deref(),
-    )
-    .await
-    .ok();
+    );
+    let health = health?;
+    let status = status?;
     Ok(ProbeResult {
         endpoint: Some(base_url),
         summary: if loader_status.is_some() {
@@ -578,69 +592,85 @@ async fn probe_continuum(
     let base_url = continuum::select_live_base_url(client, external, Some(service))
         .await?
         .ok_or_else(|| anyhow!("no Continuum base URL available"))?;
-    let health = get_json(
-        client,
-        &base_url,
-        "/health",
-        external.bearer_token.as_deref(),
-    )
-    .await?;
-    let adaptive = get_json(
-        client,
-        &base_url,
-        "/tracey/adaptive",
-        external.bearer_token.as_deref(),
-    )
-    .await
-    .ok();
-    let agents = get_json(
-        client,
-        &base_url,
-        "/tracey/agents",
-        external.bearer_token.as_deref(),
-    )
-    .await
-    .ok();
-    let fleet = get_json(
-        client,
-        &base_url,
-        "/tracey/fleet",
-        external.bearer_token.as_deref(),
-    )
-    .await
-    .ok();
-    let analytics = get_json(
-        client,
-        &base_url,
-        "/tracey/analytics?window_seconds=7200&bucket_seconds=120&log_limit=25",
-        external.bearer_token.as_deref(),
-    )
-    .await
-    .ok();
-    let assessment = get_json(
-        client,
-        &base_url,
-        "/tracey/assessment/fleet",
-        external.bearer_token.as_deref(),
-    )
-    .await
-    .ok();
-    let clusters = get_json(
-        client,
-        &base_url,
-        "/k8s/list",
-        external.bearer_token.as_deref(),
-    )
-    .await
-    .ok();
-    let refiner = get_json(
-        client,
-        &base_url,
-        "/k8s/refiner/status",
-        external.bearer_token.as_deref(),
-    )
-    .await
-    .ok();
+    let (health, adaptive, agents, fleet, analytics, assessment, clusters, refiner) = tokio::join!(
+        get_json(
+            client,
+            &base_url,
+            "/health",
+            external.bearer_token.as_deref(),
+        ),
+        async {
+            get_json(
+                client,
+                &base_url,
+                "/tracey/adaptive",
+                external.bearer_token.as_deref(),
+            )
+            .await
+            .ok()
+        },
+        async {
+            get_json(
+                client,
+                &base_url,
+                "/tracey/agents",
+                external.bearer_token.as_deref(),
+            )
+            .await
+            .ok()
+        },
+        async {
+            get_json(
+                client,
+                &base_url,
+                "/tracey/fleet",
+                external.bearer_token.as_deref(),
+            )
+            .await
+            .ok()
+        },
+        async {
+            get_json(
+                client,
+                &base_url,
+                "/tracey/analytics?window_seconds=7200&bucket_seconds=120&log_limit=25",
+                external.bearer_token.as_deref(),
+            )
+            .await
+            .ok()
+        },
+        async {
+            get_json(
+                client,
+                &base_url,
+                "/tracey/assessment/fleet",
+                external.bearer_token.as_deref(),
+            )
+            .await
+            .ok()
+        },
+        async {
+            get_json(
+                client,
+                &base_url,
+                "/k8s/list",
+                external.bearer_token.as_deref(),
+            )
+            .await
+            .ok()
+        },
+        async {
+            get_json(
+                client,
+                &base_url,
+                "/k8s/refiner/status",
+                external.bearer_token.as_deref(),
+            )
+            .await
+            .ok()
+        }
+    );
+    let health = health?;
     Ok(ProbeResult {
         endpoint: Some(base_url),
         summary: "Continuum control-plane surfaces retrieved".to_string(),
@@ -668,9 +698,12 @@ async fn probe_refiner(
         .await?
         .ok_or_else(|| anyhow!("no Refiner base URL available"))?;
     refiner_client.login_if_configured().await?;
-    let health = refiner_client.get_health().await?;
-    let capabilities = refiner_client.get_capabilities().await.ok();
-    let orchestration = refiner_client.get_ai_orchestration(8).await.ok();
+    let (health, capabilities, orchestration) = tokio::join!(
+        refiner_client.get_health(),
+        async { refiner_client.get_capabilities().await.ok() },
+        async { refiner_client.get_ai_orchestration(8).await.ok() },
+    );
+    let health = health?;
     Ok(ProbeResult {
         endpoint: Some(refiner_client.base_url().to_string()),
         summary: "Refiner control-room API retrieved".to_string(),
@@ -691,29 +724,35 @@ async fn probe_aarnn(
     let external = &config.integrations.aarnn;
     let base_url = resolve_base_url(service, external)
         .ok_or_else(|| anyhow!("no AARNN base URL available"))?;
-    let runtime_status = get_json(
-        client,
-        &base_url,
-        "/api/runtime/status",
-        external.bearer_token.as_deref(),
-    )
-    .await?;
-    let cluster_status = get_json(
-        client,
-        &base_url,
-        "/api/status",
-        external.bearer_token.as_deref(),
-    )
-    .await
-    .ok();
-    let activity = get_json(
-        client,
-        &base_url,
-        "/api/activity",
-        external.bearer_token.as_deref(),
-    )
-    .await
-    .ok();
+    let (runtime_status, cluster_status, activity) = tokio::join!(
+        get_json(
+            client,
+            &base_url,
+            "/api/runtime/status",
+            external.bearer_token.as_deref(),
+        ),
+        async {
+            get_json(
+                client,
+                &base_url,
+                "/api/status",
+                external.bearer_token.as_deref(),
+            )
+            .await
+            .ok()
+        },
+        async {
+            get_json(
+                client,
+                &base_url,
+                "/api/activity",
+                external.bearer_token.as_deref(),
+            )
+            .await
+            .ok()
+        }
+    );
+    let runtime_status = runtime_status?;
     Ok(ProbeResult {
         endpoint: Some(base_url),
         summary: "AARNN runtime and cluster status retrieved".to_string(),
@@ -732,106 +771,126 @@ async fn probe_grafana(
     service: &ServiceSnapshot,
 ) -> Result<ProbeResult> {
     let external = &config.integrations.grafana;
-    let mut last_error = None;
-    for base_url in base_url_candidates(service, external) {
-        match get_json_with_auth(client, &base_url, "/api/health", external).await {
-            Ok(health) => {
-                if health.get("database").is_none() && health.get("version").is_none() {
-                    last_error = Some(anyhow!("invalid Grafana health payload"));
-                    continue;
-                }
+    let candidates = base_url_candidates(service, external);
+    if candidates.is_empty() {
+        return Err(anyhow!("no Grafana base URL available"));
+    }
 
-                let datasources =
+    let checks = future::join_all(candidates.iter().cloned().map(|base_url| async move {
+        let result: Result<ProbeResult> = async {
+            let health = get_json_with_auth(client, &base_url, "/api/health", external).await?;
+            if health.get("database").is_none() && health.get("version").is_none() {
+                return Err(anyhow!("invalid Grafana health payload"));
+            }
+
+            let (datasources, dashboards) = tokio::join!(
+                async {
                     get_json_with_auth(client, &base_url, "/api/datasources", external)
                         .await
-                        .ok();
-                let dashboards = get_json_with_auth_query(
-                    client,
-                    &base_url,
-                    "/api/search",
-                    &[("type", "dash-db"), ("limit", "1000")],
-                    external,
-                )
-                .await
-                .ok();
+                        .ok()
+                },
+                async {
+                    get_json_with_auth_query(
+                        client,
+                        &base_url,
+                        "/api/search",
+                        &[("type", "dash-db"), ("limit", "1000")],
+                        external,
+                    )
+                    .await
+                    .ok()
+                }
+            );
 
-                let datasource_count = datasources
-                    .as_ref()
-                    .and_then(Value::as_array)
-                    .map(|items| items.len())
-                    .unwrap_or(0);
-                let dashboard_count = dashboards
-                    .as_ref()
-                    .and_then(Value::as_array)
-                    .map(|items| items.len())
-                    .unwrap_or(0);
-                let datasource_sample = datasources
-                    .as_ref()
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .take(10)
-                            .map(|item| {
-                                json!({
-                                    "uid": item.get("uid"),
-                                    "name": item.get("name"),
-                                    "type": item.get("type"),
-                                    "is_default": item.get("isDefault"),
-                                })
+            let datasource_count = datasources
+                .as_ref()
+                .and_then(Value::as_array)
+                .map(|items| items.len())
+                .unwrap_or(0);
+            let dashboard_count = dashboards
+                .as_ref()
+                .and_then(Value::as_array)
+                .map(|items| items.len())
+                .unwrap_or(0);
+            let datasource_sample = datasources
+                .as_ref()
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .take(10)
+                        .map(|item| {
+                            json!({
+                                "uid": item.get("uid"),
+                                "name": item.get("name"),
+                                "type": item.get("type"),
+                                "is_default": item.get("isDefault"),
                             })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let dashboard_sample = dashboards
-                    .as_ref()
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .take(10)
-                            .map(|item| {
-                                json!({
-                                    "uid": item.get("uid"),
-                                    "title": item.get("title"),
-                                    "folder": item.get("folderTitle"),
-                                    "type": item.get("type"),
-                                })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let dashboard_sample = dashboards
+                .as_ref()
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .take(10)
+                        .map(|item| {
+                            json!({
+                                "uid": item.get("uid"),
+                                "title": item.get("title"),
+                                "folder": item.get("folderTitle"),
+                                "type": item.get("type"),
                             })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let database_status = health
-                    .get("database")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let database_status = health
+                .get("database")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
 
-                return Ok(ProbeResult {
-                    endpoint: Some(base_url),
-                    summary: format!(
-                        "Grafana health retrieved with {} datasource(s) and {} dashboard(s)",
-                        datasource_count, dashboard_count
-                    ),
-                    metrics: json!({
-                        "health": health,
-                        "database_status": database_status,
-                        "datasource_count": datasource_count,
-                        "dashboard_count": dashboard_count,
-                        "datasources": datasource_sample,
-                        "dashboards": dashboard_sample,
-                    }),
-                    health: if database_status.eq_ignore_ascii_case("ok") {
-                        ServiceHealth::Healthy
-                    } else {
-                        ServiceHealth::Degraded
-                    },
-                });
-            }
-            Err(error) => last_error = Some(error),
+            Ok(ProbeResult {
+                endpoint: Some(base_url.clone()),
+                summary: format!(
+                    "Grafana health retrieved with {} datasource(s) and {} dashboard(s)",
+                    datasource_count, dashboard_count
+                ),
+                metrics: json!({
+                    "health": health,
+                    "database_status": database_status,
+                    "datasource_count": datasource_count,
+                    "dashboard_count": dashboard_count,
+                    "datasources": datasource_sample,
+                    "dashboards": dashboard_sample,
+                }),
+                health: if database_status.eq_ignore_ascii_case("ok") {
+                    ServiceHealth::Healthy
+                } else {
+                    ServiceHealth::Degraded
+                },
+            })
+        }
+        .await;
+        (base_url, result)
+    }))
+    .await;
+
+    let mut attempts = Vec::new();
+    for (base_url, result) in checks {
+        match result {
+            Ok(probe) => return Ok(probe),
+            Err(error) => attempts.push(format!("{base_url}: {error}")),
         }
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow!("no Grafana base URL available")))
+    Err(anyhow!(
+        "no Grafana base URL available ({})",
+        attempts.join("; ")
+    ))
 }
 
 async fn probe_prometheus(
@@ -840,97 +899,92 @@ async fn probe_prometheus(
     service: &ServiceSnapshot,
 ) -> Result<ProbeResult> {
     let external = &config.integrations.prometheus;
-    let mut last_error = None;
-    for base_url in base_url_candidates(service, external) {
-        let runtime =
-            match get_json_with_auth(client, &base_url, "/api/v1/status/runtimeinfo", external)
-                .await
-            {
-                Ok(payload) => payload,
-                Err(error) => {
-                    last_error = Some(error);
-                    continue;
-                }
-            };
-        let runtime_data = match prometheus_payload_data(&runtime, "/api/v1/status/runtimeinfo") {
-            Ok(value) => value.clone(),
-            Err(error) => {
-                last_error = Some(error);
-                continue;
-            }
-        };
-
-        let targets_payload = match get_json_with_auth_query(
-            client,
-            &base_url,
-            "/api/v1/targets",
-            &[("state", "any")],
-            external,
-        )
-        .await
-        {
-            Ok(payload) => payload,
-            Err(error) => {
-                last_error = Some(error);
-                continue;
-            }
-        };
-        let targets_data = match prometheus_payload_data(&targets_payload, "/api/v1/targets") {
-            Ok(value) => value,
-            Err(error) => {
-                last_error = Some(error);
-                continue;
-            }
-        };
-
-        let (jobs, active_targets_total, dropped_targets_total, down_targets_total) =
-            summarize_prometheus_targets(targets_data);
-        let jobs_with_failures = jobs.values().filter(|job| job.down_targets > 0).count();
-        let job_summaries = jobs
-            .into_iter()
-            .map(|(job_name, summary)| {
-                let down_ratio = if summary.total_targets > 0 {
-                    summary.down_targets as f64 / summary.total_targets as f64
-                } else {
-                    0.0
-                };
-                json!({
-                    "job": job_name,
-                    "service_key": summary.service_key,
-                    "total_targets": summary.total_targets,
-                    "healthy_targets": summary.healthy_targets,
-                    "down_targets": summary.down_targets,
-                    "down_ratio": down_ratio,
-                    "last_errors": summary.last_errors.into_iter().collect::<Vec<_>>(),
-                })
-            })
-            .collect::<Vec<_>>();
-
-        return Ok(ProbeResult {
-            endpoint: Some(base_url),
-            summary: format!(
-                "Prometheus runtime retrieved with {} active target(s); {} target(s) are down",
-                active_targets_total, down_targets_total
-            ),
-            metrics: json!({
-                "runtimeinfo": runtime_data,
-                "targets": {
-                    "active_targets_total": active_targets_total,
-                    "dropped_targets_total": dropped_targets_total,
-                    "down_targets_total": down_targets_total,
-                    "jobs_with_failures": jobs_with_failures,
-                    "jobs": job_summaries,
-                }
-            }),
-            health: if active_targets_total == 0 {
-                ServiceHealth::Degraded
-            } else {
-                ServiceHealth::Healthy
-            },
-        });
+    let candidates = base_url_candidates(service, external);
+    if candidates.is_empty() {
+        return Err(anyhow!("no Prometheus base URL available"));
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow!("no Prometheus base URL available")))
+    let checks = future::join_all(candidates.iter().cloned().map(|base_url| async move {
+        let result: Result<ProbeResult> = async {
+            let (runtime_result, targets_result) = tokio::join!(
+                get_json_with_auth(client, &base_url, "/api/v1/status/runtimeinfo", external),
+                get_json_with_auth_query(
+                    client,
+                    &base_url,
+                    "/api/v1/targets",
+                    &[("state", "any")],
+                    external,
+                ),
+            );
+            let runtime = runtime_result?;
+            let runtime_data = prometheus_payload_data(&runtime, "/api/v1/status/runtimeinfo")?;
+
+            let targets_payload = targets_result?;
+            let targets_data = prometheus_payload_data(&targets_payload, "/api/v1/targets")?;
+
+            let (jobs, active_targets_total, dropped_targets_total, down_targets_total) =
+                summarize_prometheus_targets(targets_data);
+            let jobs_with_failures = jobs.values().filter(|job| job.down_targets > 0).count();
+            let job_summaries = jobs
+                .into_iter()
+                .map(|(job_name, summary)| {
+                    let down_ratio = if summary.total_targets > 0 {
+                        summary.down_targets as f64 / summary.total_targets as f64
+                    } else {
+                        0.0
+                    };
+                    json!({
+                        "job": job_name,
+                        "service_key": summary.service_key,
+                        "total_targets": summary.total_targets,
+                        "healthy_targets": summary.healthy_targets,
+                        "down_targets": summary.down_targets,
+                        "down_ratio": down_ratio,
+                        "last_errors": summary.last_errors.into_iter().collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            Ok(ProbeResult {
+                endpoint: Some(base_url.clone()),
+                summary: format!(
+                    "Prometheus runtime retrieved with {} active target(s); {} target(s) are down",
+                    active_targets_total, down_targets_total
+                ),
+                metrics: json!({
+                    "runtimeinfo": runtime_data,
+                    "targets": {
+                        "active_targets_total": active_targets_total,
+                        "dropped_targets_total": dropped_targets_total,
+                        "down_targets_total": down_targets_total,
+                        "jobs_with_failures": jobs_with_failures,
+                        "jobs": job_summaries,
+                    }
+                }),
+                health: if active_targets_total == 0 {
+                    ServiceHealth::Degraded
+                } else {
+                    ServiceHealth::Healthy
+                },
+            })
+        }
+        .await;
+        (base_url, result)
+    }))
+    .await;
+
+    let mut attempts = Vec::new();
+    for (base_url, result) in checks {
+        match result {
+            Ok(probe) => return Ok(probe),
+            Err(error) => attempts.push(format!("{base_url}: {error}")),
+        }
+    }
+
+    Err(anyhow!(
+        "no Prometheus base URL available ({})",
+        attempts.join("; ")
+    ))
 }
 
 async fn probe_postgres(
@@ -1251,41 +1305,52 @@ async fn probe_generic(
     external: &ExternalServiceConfig,
     service: &ServiceSnapshot,
 ) -> Result<ProbeResult> {
-    let mut last_error = None;
-    for base_url in base_url_candidates(service, external) {
-        let probe = match get_json_with_auth(client, &base_url, "/healthz", external).await {
-            Ok(value) => Ok((value, "/healthz")),
-            Err(error) => match get_json_with_auth(client, &base_url, "/health", external).await {
-                Ok(value) => Ok((value, "/health")),
-                Err(_) => {
-                    match get_json_with_auth(client, &base_url, "/api/tags", external).await {
-                        Ok(value) => Ok((value, "/api/tags")),
-                        Err(_) => Err(error),
-                    }
-                }
-            },
-        };
+    let candidates = base_url_candidates(service, external);
+    if candidates.is_empty() {
+        return Err(anyhow!("no base URL available"));
+    }
 
-        match probe {
-            Ok((health, path_used)) => {
-                return Ok(ProbeResult {
-                    endpoint: Some(base_url),
-                    summary: format!(
-                        "{} health surface retrieved via {}",
-                        service.display_name, path_used
-                    ),
-                    metrics: json!({
-                        "health": health,
-                        "path_used": path_used,
-                    }),
-                    health: ServiceHealth::Healthy,
-                });
-            }
-            Err(error) => last_error = Some(error),
+    let checks = future::join_all(candidates.iter().cloned().map(|base_url| async move {
+        let result: Result<ProbeResult> = async {
+            let (healthz_result, health_result, tags_result) = tokio::join!(
+                get_json_with_auth(client, &base_url, "/healthz", external),
+                get_json_with_auth(client, &base_url, "/health", external),
+                get_json_with_auth(client, &base_url, "/api/tags", external),
+            );
+            let probe = match (healthz_result, health_result, tags_result) {
+                (Ok(value), _, _) => Ok((value, "/healthz")),
+                (Err(_), Ok(value), _) => Ok((value, "/health")),
+                (Err(_), Err(_), Ok(value)) => Ok((value, "/api/tags")),
+                (Err(error), _, _) => Err(error),
+            }?;
+
+            Ok(ProbeResult {
+                endpoint: Some(base_url.clone()),
+                summary: format!(
+                    "{} health surface retrieved via {}",
+                    service.display_name, probe.1
+                ),
+                metrics: json!({
+                    "health": probe.0,
+                    "path_used": probe.1,
+                }),
+                health: ServiceHealth::Healthy,
+            })
+        }
+        .await;
+        (base_url, result)
+    }))
+    .await;
+
+    let mut attempts = Vec::new();
+    for (base_url, result) in checks {
+        match result {
+            Ok(probe) => return Ok(probe),
+            Err(error) => attempts.push(format!("{base_url}: {error}")),
         }
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow!("no base URL available")))
+    Err(anyhow!("no base URL available ({})", attempts.join("; ")))
 }
 
 pub async fn gail_plan_summary(
@@ -1310,40 +1375,47 @@ pub async fn gail_plan_summary(
         "Summarize the three highest-leverage reliability, performance, and self-improvement actions for this topology. Use concise bullets only. Topology summary: {}",
         topology_summary
     );
-    let completion = post_json(
-        client,
-        &base_url,
-        "/v1/llm/complete",
-        config.integrations.gail.bearer_token.as_deref(),
-        &json!({
-            "workflow": config.planning.gail_workflow,
-            "role": "planner",
-            "messages": [
-                {"role": "system", "content": "You are the NeuralMimicry Conductor planner. Focus on reliability, latency, resource use, and safe self-improvement."},
-                {"role": "user", "content": prompt}
-            ],
-            "include_configured": true,
-            "selection_mode": "best",
-            "max_candidates": 3,
-            "timeout_seconds": 30
-        }),
-    )
-    .await
-    .ok();
-
-    let neuromorphic = post_json(
-        client,
-        &base_url,
-        "/v1/neuromorphic/analyze",
-        config.integrations.gail.bearer_token.as_deref(),
-        &json!({
-            "workflow": config.planning.gail_workflow,
-            "role": "researcher",
-            "text": prompt,
-        }),
-    )
-    .await
-    .ok();
+    let completion_prompt = prompt.clone();
+    let neuromorphic_prompt = prompt;
+    let (completion, neuromorphic) = tokio::join!(
+        async {
+            post_json(
+                client,
+                &base_url,
+                "/v1/llm/complete",
+                config.integrations.gail.bearer_token.as_deref(),
+                &json!({
+                    "workflow": config.planning.gail_workflow,
+                    "role": "planner",
+                    "messages": [
+                        {"role": "system", "content": "You are the NeuralMimicry Conductor planner. Focus on reliability, latency, resource use, and safe self-improvement."},
+                        {"role": "user", "content": completion_prompt}
+                    ],
+                    "include_configured": true,
+                    "selection_mode": "best",
+                    "max_candidates": 3,
+                    "timeout_seconds": 30
+                }),
+            )
+            .await
+            .ok()
+        },
+        async {
+            post_json(
+                client,
+                &base_url,
+                "/v1/neuromorphic/analyze",
+                config.integrations.gail.bearer_token.as_deref(),
+                &json!({
+                    "workflow": config.planning.gail_workflow,
+                    "role": "researcher",
+                    "text": neuromorphic_prompt,
+                }),
+            )
+            .await
+            .ok()
+        }
+    );
 
     if completion.is_none() && neuromorphic.is_none() {
         return Ok(None);

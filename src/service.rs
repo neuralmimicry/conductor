@@ -7,6 +7,7 @@ use std::{
 use anyhow::Result;
 use axum::http::HeaderMap;
 use chrono::Duration as ChronoDuration;
+use futures::{StreamExt, stream};
 use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
@@ -48,6 +49,8 @@ pub struct ConductorService {
     pub http: Client,
     pub events: broadcast::Sender<ConductorEvent>,
 }
+
+const EXTERNAL_SYNC_CONCURRENCY: usize = 8;
 
 impl ConductorService {
     pub fn new(
@@ -1100,8 +1103,32 @@ impl ConductorService {
                     .any(|requested| requested.eq_ignore_ascii_case(system))
         };
 
-        if should_sync("refiner") {
-            let (links, link_errors) = self.sync_refiner_traceability_links(work_item_id).await?;
+        let sync_refiner = should_sync("refiner");
+        let sync_tracey = should_sync("tracey");
+        let work_item_id_for_refiner = work_item_id.clone();
+        let work_item_id_for_tracey = work_item_id.clone();
+        let (refiner_sync, tracey_sync) = tokio::join!(
+            async {
+                if sync_refiner {
+                    self.sync_refiner_traceability_links(work_item_id_for_refiner)
+                        .await
+                        .map(Some)
+                } else {
+                    Ok(None)
+                }
+            },
+            async {
+                if sync_tracey {
+                    self.sync_tracey_traceability_links(work_item_id_for_tracey)
+                        .await
+                        .map(Some)
+                } else {
+                    Ok(None)
+                }
+            }
+        );
+
+        if let Some((links, link_errors)) = refiner_sync? {
             if !links.is_empty() {
                 synced_systems.push("refiner".to_string());
                 synced_links.extend(links);
@@ -1109,8 +1136,7 @@ impl ConductorService {
             errors.extend(link_errors);
         }
 
-        if should_sync("tracey") {
-            let (links, link_errors) = self.sync_tracey_traceability_links(work_item_id).await?;
+        if let Some((links, link_errors)) = tracey_sync? {
             if !links.is_empty() {
                 synced_systems.push("tracey".to_string());
                 synced_links.extend(links);
@@ -1138,8 +1164,19 @@ impl ConductorService {
 
             if !links_to_sync.is_empty() {
                 let clients = self.atlassian_clients()?;
-                for link in links_to_sync {
-                    match self.refresh_traceability_link(&link, &clients).await {
+                let refresh_results = stream::iter(links_to_sync.into_iter())
+                    .map(|link| {
+                        let clients = clients.clone();
+                        async move {
+                            let refreshed = self.refresh_traceability_link(&link, &clients).await;
+                            (link, refreshed)
+                        }
+                    })
+                    .buffer_unordered(EXTERNAL_SYNC_CONCURRENCY)
+                    .collect::<Vec<_>>()
+                    .await;
+                for (link, refreshed) in refresh_results {
+                    match refreshed {
                         Ok(updated) => {
                             synced_systems.push(updated.system.to_ascii_lowercase());
                             synced_links.push(updated);
@@ -1252,65 +1289,99 @@ impl ConductorService {
             }
         }
 
-        let mut synced = Vec::new();
-        for execution in executions {
-            let Some(work_item) = work_items_by_id.get(&execution.work_item_id) else {
-                continue;
-            };
-            let Some(job_id) = execution.refiner_job_id.as_deref() else {
-                continue;
-            };
+        #[derive(Default)]
+        struct RefinerSyncOutcome {
+            links: Vec<TraceabilityLink>,
+            errors: Vec<String>,
+        }
 
-            let mut job_detail = None;
-            let mut requirements_progress = None;
-            let mut requirements_summary = None;
-            let mut workspace = None;
-            let mut sync_error = None;
+        let work_items_by_id = Arc::new(work_items_by_id);
+        let outcomes = stream::iter(executions.into_iter())
+            .map(|execution| {
+                let work_items_by_id = Arc::clone(&work_items_by_id);
+                let refiner_client = refiner_client.clone();
+                async move {
+                    let Some(work_item) = work_items_by_id.get(&execution.work_item_id).cloned()
+                    else {
+                        return RefinerSyncOutcome::default();
+                    };
+                    let Some(job_id) = execution.refiner_job_id.clone() else {
+                        return RefinerSyncOutcome::default();
+                    };
 
-            if let Some(client) = refiner_client.as_ref() {
-                match client.get_job(job_id).await {
-                    Ok(detail) => {
-                        job_detail = Some(detail);
-                        match client.get_requirements_progress(job_id).await {
-                            Ok(progress) => requirements_progress = Some(progress),
-                            Err(error) => errors.push(format!(
-                                "refiner job {} requirements progress: {}",
-                                job_id, error
-                            )),
-                        }
-                        match client.get_requirements_summary(job_id).await {
-                            Ok(summary) => requirements_summary = Some(summary),
-                            Err(error) => errors.push(format!(
-                                "refiner job {} requirements summary: {}",
-                                job_id, error
-                            )),
-                        }
-                        match client.get_workspace(job_id).await {
-                            Ok(payload) => workspace = Some(payload),
+                    let mut job_detail = None;
+                    let mut requirements_progress = None;
+                    let mut requirements_summary = None;
+                    let mut workspace = None;
+                    let mut sync_error = None;
+                    let mut outcome = RefinerSyncOutcome::default();
+
+                    if let Some(client) = refiner_client.as_ref() {
+                        match client.get_job(&job_id).await {
+                            Ok(detail) => {
+                                job_detail = Some(detail);
+                                let (progress, summary, workspace_payload) = tokio::join!(
+                                    client.get_requirements_progress(&job_id),
+                                    client.get_requirements_summary(&job_id),
+                                    client.get_workspace(&job_id),
+                                );
+                                match progress {
+                                    Ok(value) => requirements_progress = Some(value),
+                                    Err(error) => outcome.errors.push(format!(
+                                        "refiner job {} requirements progress: {}",
+                                        job_id, error
+                                    )),
+                                }
+                                match summary {
+                                    Ok(value) => requirements_summary = Some(value),
+                                    Err(error) => outcome.errors.push(format!(
+                                        "refiner job {} requirements summary: {}",
+                                        job_id, error
+                                    )),
+                                }
+                                match workspace_payload {
+                                    Ok(value) => workspace = Some(value),
+                                    Err(error) => outcome.errors.push(format!(
+                                        "refiner job {} workspace: {}",
+                                        job_id, error
+                                    )),
+                                }
+                            }
                             Err(error) => {
-                                errors.push(format!("refiner job {} workspace: {}", job_id, error))
+                                let message = error.to_string();
+                                outcome
+                                    .errors
+                                    .push(format!("refiner job {}: {}", job_id, message));
+                                sync_error = Some(message);
                             }
                         }
                     }
-                    Err(error) => {
-                        let message = error.to_string();
-                        errors.push(format!("refiner job {}: {}", job_id, message));
-                        sync_error = Some(message);
-                    }
-                }
-            }
 
-            for request in build_refiner_traceability_requests(
-                refiner_client.as_ref(),
-                work_item,
-                &execution,
-                job_detail.as_ref(),
-                requirements_progress.as_ref(),
-                requirements_summary.as_ref(),
-                workspace.as_ref(),
-                sync_error.as_deref(),
-            ) {
-                let link = TraceabilityLink::from_new(Some(work_item.id), request);
+                    outcome.links = build_refiner_traceability_requests(
+                        refiner_client.as_ref(),
+                        &work_item,
+                        &execution,
+                        job_detail.as_ref(),
+                        requirements_progress.as_ref(),
+                        requirements_summary.as_ref(),
+                        workspace.as_ref(),
+                        sync_error.as_deref(),
+                    )
+                    .into_iter()
+                    .map(|request| TraceabilityLink::from_new(Some(work_item.id), request))
+                    .collect();
+
+                    outcome
+                }
+            })
+            .buffer_unordered(EXTERNAL_SYNC_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut synced = Vec::new();
+        for outcome in outcomes {
+            errors.extend(outcome.errors);
+            for link in outcome.links {
                 self.repository.upsert_traceability_link(&link).await?;
                 synced.push(link);
             }
@@ -1402,17 +1473,19 @@ impl ConductorService {
         let mut runtime_source_kind = "probe_snapshot".to_string();
         if let Some(client) = tracey_client.as_ref() {
             let mut live_runtime = false;
-            match client.status().await {
-                Ok(live_status) => {
-                    status = Some(live_status);
+            let (live_status, live_loader_status) =
+                tokio::join!(client.status(), client.loader_status(),);
+            match live_status {
+                Ok(value) => {
+                    status = Some(value);
                     live_runtime = true;
                 }
                 Err(error) => errors.push(format!("tracey status: {}", error)),
             }
-            match client.loader_status().await {
-                Ok(live_loader_status) => {
-                    if live_loader_status.is_some() {
-                        loader_status = live_loader_status;
+            match live_loader_status {
+                Ok(value) => {
+                    if value.is_some() {
+                        loader_status = value;
                         live_runtime = true;
                     }
                 }
@@ -1439,38 +1512,44 @@ impl ConductorService {
         if let Some(client) = continuum_client.as_ref() {
             let mut live_continuum = false;
             continuum_snapshot.base_url = Some(client.base_url().to_string());
-
-            match client.health().await {
-                Ok(health) => {
-                    continuum_snapshot.health = Some(health);
+            let (health, agents, fleet, analytics, assessment) = tokio::join!(
+                client.health(),
+                client.tracey_agents(),
+                client.tracey_fleet(),
+                client.tracey_analytics(7200, 120, 25),
+                client.tracey_assessment_fleet(),
+            );
+            match health {
+                Ok(value) => {
+                    continuum_snapshot.health = Some(value);
                     live_continuum = true;
                 }
                 Err(error) => errors.push(format!("continuum health: {}", error)),
             }
-            match client.tracey_agents().await {
-                Ok(agents) => {
-                    continuum_snapshot.agents = Some(agents);
+            match agents {
+                Ok(value) => {
+                    continuum_snapshot.agents = Some(value);
                     live_continuum = true;
                 }
                 Err(error) => errors.push(format!("continuum tracey agents: {}", error)),
             }
-            match client.tracey_fleet().await {
-                Ok(fleet) => {
-                    continuum_snapshot.fleet = Some(fleet);
+            match fleet {
+                Ok(value) => {
+                    continuum_snapshot.fleet = Some(value);
                     live_continuum = true;
                 }
                 Err(error) => errors.push(format!("continuum tracey fleet: {}", error)),
             }
-            match client.tracey_analytics(7200, 120, 25).await {
-                Ok(analytics) => {
-                    continuum_snapshot.analytics = Some(analytics);
+            match analytics {
+                Ok(value) => {
+                    continuum_snapshot.analytics = Some(value);
                     live_continuum = true;
                 }
                 Err(error) => errors.push(format!("continuum tracey analytics: {}", error)),
             }
-            match client.tracey_assessment_fleet().await {
-                Ok(assessment) => {
-                    continuum_snapshot.assessment = Some(assessment);
+            match assessment {
+                Ok(value) => {
+                    continuum_snapshot.assessment = Some(value);
                     live_continuum = true;
                 }
                 Err(error) => errors.push(format!("continuum tracey assessment: {}", error)),
@@ -1839,7 +1918,7 @@ impl ConductorService {
             .await?
             .into_iter()
             .next();
-        let cycles_total = self.repository.list_improvement_cycles(200).await?.len();
+        let cycles_total = self.repository.count_improvement_cycles().await?;
         let executions = self.repository.list_work_executions(1000).await?;
         let links = self
             .repository
