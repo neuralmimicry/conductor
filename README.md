@@ -1,5 +1,13 @@
 # Conductor
 
+## Sponsor NeuralMimicry
+
+Conductor is the open-source estate control-plane for NeuralMimicry — scanning deployed topology, deriving evidence-backed findings, governing a work-item queue, and driving a staged delivery pipeline through to production. NeuralMimicry is an independent open-source initiative and we rely on community support to sustain this work.
+
+**[☕ Support us on Crowdfunder](https://www.crowdfunder.co.uk/p/qr/aWggxwPW?utm_campaign=sharemodal&utm_medium=referral&utm_source=shortlink)**
+
+---
+
 Rust control-plane service for the NeuralMimicry stack. Conductor discovers the deployed topology from the SwarmHPC Ansible playbooks, scans the mounted NeuralMimicry repositories, optionally enriches that inventory from the GitHub organisation, probes the live service surfaces for Gail, Tracey, Continuum, Refiner, AARNN, Grafana, Prometheus, shared Postgres, and mounted shared storage, persists state in Postgres, and drives an improvement queue through an admin dashboard and API.
 
 Lifecycle placement is explicit:
