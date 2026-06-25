@@ -19,7 +19,7 @@ Lifecycle placement is explicit:
 ## What It Does
 
 - Parses the SwarmHPC Ansible tree, including inventory groups, `group_vars`, `host_vars`, and tenant playbooks, to infer the deployed topology.
-- Builds a first-class repository inventory from the mounted local estate under `/home/pbisaacs/Developer/neuralmimicry`, the mounted SwarmHPC rollout repository, and optional GitHub organisation metadata.
+- Builds a first-class repository inventory from the mounted local estate under `${NM_LOCAL_REPO_ROOT}`, the mounted SwarmHPC rollout repository, and optional GitHub organisation metadata.
 - Resolves repository URLs and branches from Ansible defaults, local git metadata, and explicit repo hints for cross-checking.
 - Probes live endpoints and shared data-plane surfaces to classify health, capture surfaced capabilities, and persist snapshots, including Gail orchestration/trading status, Prometheus scrape coverage, Grafana health, Postgres pressure, and shared-storage capacity when available.
 - Infers deployment environments from the existing SwarmHPC tenant environment variables where they are present.
@@ -125,14 +125,14 @@ Read APIs are protected by default. Set `allow_dashboard_without_token` to `true
 
 ## Local Paths Assumed By Default
 
-- Ansible: `/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible`
-- SwarmHPC repo: `/home/pbisaacs/Developer/swarmhpc/swarmhpc`
-- Local repository estate: `/home/pbisaacs/Developer/neuralmimicry`
-- Gail: `/home/pbisaacs/Developer/neuralmimicry/gail`
-- Tracey: `/home/pbisaacs/Developer/neuralmimicry/tracey`
-- Continuum: `/home/pbisaacs/Developer/neuralmimicry/nmc`
-- Refiner: `/home/pbisaacs/Developer/neuralmimicry/rag_demo`
-- AARNN: `/home/pbisaacs/Developer/neuralmimicry/aarnn_rust`
+- Ansible: `${SWARMHPC_ROOT}/swarmhpc/ansible`
+- SwarmHPC repo: `${SWARMHPC_ROOT}/swarmhpc`
+- Local repository estate: `${NM_LOCAL_REPO_ROOT}`
+- Gail: `${NM_LOCAL_REPO_ROOT}/gail`
+- Tracey: `${NM_LOCAL_REPO_ROOT}/tracey`
+- Continuum: `${NM_LOCAL_REPO_ROOT}/nmc`
+- Refiner: `${NM_LOCAL_REPO_ROOT}/rag_demo`
+- AARNN: `${NM_LOCAL_REPO_ROOT}/aarnn_rust`
 
 ## Documentation
 

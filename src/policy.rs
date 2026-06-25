@@ -402,7 +402,7 @@ mod tests {
             deployment_environment: Some(DeliveryStage::Production),
             internal_url: None,
             public_url: None,
-            repo_path: Some("/home/pbisaacs/Developer/neuralmimicry/gail".to_string()),
+            repo_path: Some(std::env::temp_dir().join("test_nm_gail").display().to_string()),
             repo_url: None,
             repo_branch: None,
             health: ServiceHealth::Healthy,

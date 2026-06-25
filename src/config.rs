@@ -3,6 +3,24 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Returns the NeuralMimicry local repo root from `CONDUCTOR_LOCAL_REPO_ROOT`
+/// (or `NM_LOCAL_REPO_ROOT`), falling back to `/opt/neuralmimicry`.
+fn nm_local_repo_root() -> PathBuf {
+    std::env::var("CONDUCTOR_LOCAL_REPO_ROOT")
+        .or_else(|_| std::env::var("NM_LOCAL_REPO_ROOT"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/opt/neuralmimicry"))
+}
+
+/// Returns the SwarmHPC Ansible root from `CONDUCTOR_ANSIBLE_ROOT`
+/// (or `NM_SWARMHPC_ANSIBLE_ROOT`), falling back to `/opt/swarmhpc/ansible`.
+fn nm_ansible_root() -> PathBuf {
+    std::env::var("CONDUCTOR_ANSIBLE_ROOT")
+        .or_else(|_| std::env::var("NM_SWARMHPC_ANSIBLE_ROOT"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/opt/swarmhpc/ansible"))
+}
+
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -281,8 +299,8 @@ impl Default for DatabaseConfig {
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
-            ansible_root: PathBuf::from("/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible"),
-            local_repo_root: PathBuf::from("/home/pbisaacs/Developer/neuralmimicry"),
+            ansible_root: nm_ansible_root(),
+            local_repo_root: nm_local_repo_root(),
             refresh_interval_seconds: 180,
             probe_services: true,
             service_timeout_seconds: 5,
@@ -308,12 +326,12 @@ impl Default for GitHubDiscoveryConfig {
 impl Default for RepoHints {
     fn default() -> Self {
         Self {
-            conductor_repo: PathBuf::from("/home/pbisaacs/Developer/neuralmimicry/conductor"),
-            gail_repo: PathBuf::from("/home/pbisaacs/Developer/neuralmimicry/gail"),
-            tracey_repo: PathBuf::from("/home/pbisaacs/Developer/neuralmimicry/tracey"),
-            continuum_repo: PathBuf::from("/home/pbisaacs/Developer/neuralmimicry/nmc"),
-            refiner_repo: PathBuf::from("/home/pbisaacs/Developer/neuralmimicry/rag_demo"),
-            aarnn_repo: PathBuf::from("/home/pbisaacs/Developer/neuralmimicry/aarnn_rust"),
+            conductor_repo: nm_local_repo_root().join("conductor"),
+            gail_repo: nm_local_repo_root().join("gail"),
+            tracey_repo: nm_local_repo_root().join("tracey"),
+            continuum_repo: nm_local_repo_root().join("nmc"),
+            refiner_repo: nm_local_repo_root().join("rag_demo"),
+            aarnn_repo: nm_local_repo_root().join("aarnn_rust"),
         }
     }
 }
@@ -511,12 +529,10 @@ impl ConductorConfig {
             self.discovery.refresh_interval_seconds = 180;
         }
         if self.discovery.ansible_root.as_os_str().is_empty() {
-            self.discovery.ansible_root =
-                PathBuf::from("/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible");
+            self.discovery.ansible_root = nm_ansible_root();
         }
         if self.discovery.local_repo_root.as_os_str().is_empty() {
-            self.discovery.local_repo_root =
-                PathBuf::from("/home/pbisaacs/Developer/neuralmimicry");
+            self.discovery.local_repo_root = nm_local_repo_root();
         }
         if self
             .discovery

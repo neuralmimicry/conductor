@@ -1,0 +1,127 @@
+TASK [Define required staged SwarmHPC Ansible files for Conductor discovery] 
+ok: [spirit]
+
+TASK [Check staged SwarmHPC Ansible files after initial staging] 
+ok: [spirit] => (item=/home/continuum-shared-storage/tenant-builds/src/swarmhpc/swarmhpc/ansible/continuum_tenant_conductor_site.yml)
+ok: [spirit] => (item=/home/continuum-shared-storage/tenant-builds/src/swarmhpc/swarmhpc/ansible/roles/continuum_tenant_k8s_app/tasks/main.yml)
+ok: [spirit] => (item=/home/continuum-shared-storage/tenant-builds/src/swarmhpc/swarmhpc/ansible/roles/continuum_tenant_k8s_app/templates/conductor-stack.yaml.j2)
+
+TASK [Derive staged SwarmHPC Ansible packaging validity] 
+ok: [spirit]
+
+TASK [Assert local SwarmHPC Ansible fallback source is available] *
+skipping: [spirit]
+
+TASK [Remove invalid staged SwarmHPC source tree] *
+skipping: [spirit]
+
+TASK [Recreate staged SwarmHPC Ansible host path from local fallback] *
+skipping: [spirit]
+
+TASK [Synchronize local SwarmHPC Ansible source tree from fallback] *
+skipping: [spirit]
+
+TASK [Fix ownership of fallback-staged SwarmHPC Ansible source tree] 
+skipping: [spirit]
+
+TASK [Recheck staged SwarmHPC Ansible files after final staging] 
+ok: [spirit] => (item=/home/continuum-shared-storage/tenant-builds/src/swarmhpc/swarmhpc/ansible/continuum_tenant_conductor_site.yml)
+ok: [spirit] => (item=/home/continuum-shared-storage/tenant-builds/src/swarmhpc/swarmhpc/ansible/roles/continuum_tenant_k8s_app/tasks/main.yml)
+ok: [spirit] => (item=/home/continuum-shared-storage/tenant-builds/src/swarmhpc/swarmhpc/ansible/roles/continuum_tenant_k8s_app/templates/conductor-stack.yaml.j2)
+
+TASK [Assert staged SwarmHPC Ansible source is available for Conductor discovery] *
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [Derive effective Conductor registry secret strategy] 
+ok: [spirit]
+
+TASK [Derive Conductor registry secret source namespaces] *
+skipping: [spirit]
+
+TASK [Check whether Conductor registry secret already exists in the target namespace] *
+skipping: [spirit]
+
+TASK [Probe source namespaces for a reusable Conductor registry secret] *
+skipping: [spirit]
+
+TASK [Derive effective Conductor registry secret sync facts] 
+skipping: [spirit]
+
+TASK [Report Conductor registry secret reuse decision] 
+skipping: [spirit]
+
+TASK [Assert Conductor image pull secret is available when GHCR auth is enabled] 
+skipping: [spirit]
+
+TASK [Resolve Conductor build temporary directory path] *
+ok: [spirit]
+
+TASK [Ensure Conductor build temporary directory exists] 
+ok: [spirit]
+
+TASK [Build effective Conductor container environment] 
+ok: [spirit]
+
+TASK [Build effective Conductor container build args] *
+ok: [spirit]
+
+TASK [Assert Conductor image build args include a release selector] *
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [Assert release token is available for Conductor release package fetches] 
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [Clear builder cache before Conductor image build] *
+changed: [spirit]
+
+TASK [Remove local Conductor image before rebuild] 
+changed: [spirit]
+
+TASK [Build Conductor container image] 
+changed: [spirit]
+
+TASK [Export Conductor container image as a docker archive] *
+changed: [spirit]
+
+TASK [Remove existing Conductor image from k3s before import] *
+changed: [spirit]
+
+TASK [Resolve Conductor Postgres pod] *
+ok: [spirit]
+
+TASK [Assert Conductor Postgres pod resolved] *
+ok: [spirit] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [Ensure Conductor Postgres role and database exist with the expected password] *
+changed: [spirit]
+
+TASK [Import Conductor image into k3s containerd] *
+changed: [spirit]
+
+TASK [Assert Conductor image is available in k3s containerd] 
+ok: [spirit]
+
+TASK [Remove Conductor image archive after import] 
+changed: [spirit]
+
+TASK [Apply conductor API proxy ingress (api.neuralmimicry.ai/services/health/monitoring → conductor)] 
+An exception occurred during task execution. To see the full traceback, use -vvv. The error was: ansible_collections.kubernetes.core.plugins.module_utils.k8s.exceptions.CoreException: Could not create API client: Invalid kube-config file. No configuration found.
+fatal: [spirit]: FAILED! => {"changed": false, "msg": "Could not create API client: Invalid kube-config file. No configuration found."}
+
+PLAY RECAP 
+spirit                     : ok=116  changed=10   unreachable=0    failed=1    skipped=53   rescued=0    ignored=0   
+
+pbisaacs@cortex:~/Developer/swarmhpc/swarmhpc/ansible$ 
+
