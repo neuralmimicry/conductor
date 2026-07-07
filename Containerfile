@@ -1,4 +1,4 @@
-FROM rust:1.88-bookworm AS source-deb
+FROM docker.io/library/rust:1.88-bookworm AS source-deb
 
 ARG CONDUCTOR_VERSION=source
 
@@ -33,7 +33,7 @@ RUN set -eu; \
         --binary target/release/conductor \
         --out-dir /out
 
-FROM debian:bookworm-slim
+FROM docker.io/library/debian:bookworm-slim
 
 ARG TARGETARCH
 ARG CONDUCTOR_VERSION=source
