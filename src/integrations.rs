@@ -1394,7 +1394,7 @@ pub async fn gail_plan_summary(
                     "include_configured": true,
                     "selection_mode": "best",
                     "max_candidates": 3,
-                    "timeout_seconds": 30
+                    "timeout_seconds": config.integrations.gail.timeout_seconds.max(30)
                 }),
             )
             .await

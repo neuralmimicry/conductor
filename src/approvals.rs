@@ -104,7 +104,7 @@ pub async fn request_ai_approval(
             "include_configured": true,
             "selection_mode": "best",
             "max_candidates": 5,
-            "timeout_seconds": 45,
+            "timeout_seconds": config.integrations.gail.timeout_seconds.max(45),
             "reasoning_effort": "high",
             "request_category": "approval_review",
             "messages": [
