@@ -22,6 +22,7 @@ RUN set -eu; \
         release_version="${CONDUCTOR_VERSION#v}"; \
         bash scripts/set-release-version.sh "${release_version}"; \
     fi; \
+    rustup component add rustfmt; \
     cargo build --locked --release -j 1; \
     package_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"; \
     deb_version="$(printf '%s' "${package_version}" | sed 's/-/~/g')"; \
@@ -46,11 +47,14 @@ ARG APP_UID=10001
 ARG APP_GID=10001
 
 COPY --from=source-deb /out/conductor_*.deb /tmp/source-conductor.deb
+COPY --from=source-deb /usr/local/cargo /usr/local/cargo
+COPY --from=source-deb /usr/local/rustup /usr/local/rustup
 
 RUN set -eu; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ansible \
+        build-essential \
         ca-certificates \
         curl \
         git \
@@ -146,11 +150,14 @@ RUN set -eu; \
     cp /etc/conductor/conductor.yaml /app/config/conductor.yaml; \
     cp -R /usr/share/conductor/assets/. /app/assets/; \
     cp -R /usr/share/conductor/migrations/. /app/migrations/; \
-    chown -R "${APP_UID}:${APP_GID}" /app /workspace /run/secrets/ansible; \
+    chown -R "${APP_UID}:${APP_GID}" /app /workspace /run/secrets/ansible /usr/local/cargo /usr/local/rustup; \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 USER ${APP_UID}:${APP_GID}
+ENV CARGO_HOME=/usr/local/cargo
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV PATH=/usr/local/cargo/bin:${PATH}
 ENV CONDUCTOR_CONFIG=/app/config/conductor.yaml
 ENV CONDUCTOR_LOCAL_REPO_ROOT=/workspace/neuralmimicry
 ENV CONDUCTOR_ANSIBLE_ROOT=/workspace/swarmhpc/swarmhpc/ansible
