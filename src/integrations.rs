@@ -1010,9 +1010,9 @@ async fn probe_postgres(
         let aggregate_row = sqlx::query(
             r#"
             SELECT
-                COALESCE(SUM(numbackends), 0)::bigint AS total_connections,
+                COALESCE(SUM(stats.numbackends), 0)::bigint AS total_connections,
                 COUNT(*)::bigint AS database_count,
-                COALESCE(MAX(CASE WHEN datname = current_database() THEN numbackends END), 0)::bigint
+                COALESCE(MAX(CASE WHEN stats.datname = current_database() THEN stats.numbackends END), 0)::bigint
                     AS current_database_connections
             FROM pg_stat_database AS stats
             JOIN pg_database AS databases
@@ -1057,7 +1057,7 @@ async fn probe_postgres(
 
         let top_databases = sqlx::query(
             r#"
-            SELECT stats.datname, stats.numbackends
+            SELECT stats.datname AS database_name, stats.numbackends
             FROM pg_stat_database AS stats
             JOIN pg_database AS databases
               ON databases.datname = stats.datname
@@ -1072,7 +1072,7 @@ async fn probe_postgres(
         .into_iter()
         .map(|row| {
             json!({
-                "database": row.try_get::<String, _>("datname").ok(),
+                "database": row.try_get::<String, _>("database_name").ok(),
                 "connections": row.try_get::<i64, _>("numbackends").ok(),
             })
         })
