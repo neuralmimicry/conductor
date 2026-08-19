@@ -26,6 +26,7 @@ use crate::{
         atlassian::AtlassianClients, continuum::ContinuumClient, refiner::RefinerClient,
         tracey::TraceyClient,
     },
+    metrics::{record_event_persistence, record_execution_cycle},
     models::{
         ConductorEvent, ConfluencePageLinkRequest, DashboardSummary, DeliveryStage, DiscoveryRun,
         DoraMetricsSummary, ExternalLinkOperationResult, FindingEvidence, FindingProvenance,
@@ -1696,6 +1697,7 @@ impl ConductorService {
             run_execution_cycle(self.repository.as_ref(), &self.config, Some(&callback)).await;
         match &result {
             Ok(executions) => {
+                record_execution_cycle(true);
                 let mut event = ConductorEvent::new(
                     "execution.cycle.completed",
                     format!(
@@ -1710,6 +1712,7 @@ impl ConductorService {
                 self.publish_event(event);
             }
             Err(error) => {
+                record_execution_cycle(false);
                 let mut event = ConductorEvent::new(
                     "execution.cycle.failed",
                     format!("execution cycle failed: {}", error),
@@ -2611,7 +2614,10 @@ fn persist_conductor_event_async(repository: Arc<dyn ConductorRepository>, event
         let mut delay_ms = 25u64;
         for attempt in 0..6 {
             match repository.insert_conductor_event(&event).await {
-                Ok(()) => return,
+                Ok(()) => {
+                    record_event_persistence(true);
+                    return;
+                }
                 Err(error) => {
                     if attempt < 5 && event_persistence_should_retry(&error) {
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -2626,6 +2632,7 @@ fn persist_conductor_event_async(repository: Arc<dyn ConductorRepository>, event
                         execution_id = ?event.execution_id,
                         "failed to persist conductor event"
                     );
+                    record_event_persistence(false);
                     return;
                 }
             }

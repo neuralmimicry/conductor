@@ -7,6 +7,7 @@ pub mod error;
 pub mod executor;
 pub mod findings;
 pub mod integrations;
+pub mod metrics;
 pub mod models;
 pub mod planner;
 pub mod policy;

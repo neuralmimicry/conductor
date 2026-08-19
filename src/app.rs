@@ -3,7 +3,7 @@ use std::{convert::Infallible, time::Duration};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode, header},
     response::{
         IntoResponse, Redirect,
         sse::{Event, KeepAlive, Sse},
@@ -45,6 +45,7 @@ pub fn build_router(service: ConductorService) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/healthz", get(health))
+        .route("/metrics", get(metrics))
         .route("/dashboard", get(dashboard))
         .nest_service("/assets", ServeDir::new("assets"))
         .route("/api/v1/summary", get(summary))
@@ -113,6 +114,14 @@ async fn health() -> Json<serde_json::Value> {
         "ok": true,
         "service": "conductor",
     }))
+}
+
+async fn metrics() -> (StatusCode, [(header::HeaderName, &'static str); 1], String) {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        crate::metrics::render_prometheus(),
+    )
 }
 
 async fn dashboard(State(service): State<ConductorService>) -> impl IntoResponse {

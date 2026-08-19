@@ -1014,8 +1014,10 @@ async fn probe_postgres(
                 COUNT(*)::bigint AS database_count,
                 COALESCE(MAX(CASE WHEN datname = current_database() THEN numbackends END), 0)::bigint
                     AS current_database_connections
-            FROM pg_stat_database
-            WHERE datistemplate = false
+            FROM pg_stat_database AS stats
+            JOIN pg_database AS databases
+              ON databases.datname = stats.datname
+            WHERE databases.datistemplate = false
             "#,
         )
         .fetch_one(&mut connection)
@@ -1055,10 +1057,12 @@ async fn probe_postgres(
 
         let top_databases = sqlx::query(
             r#"
-            SELECT datname, numbackends
-            FROM pg_stat_database
-            WHERE datistemplate = false
-            ORDER BY numbackends DESC, datname ASC
+            SELECT stats.datname, stats.numbackends
+            FROM pg_stat_database AS stats
+            JOIN pg_database AS databases
+              ON databases.datname = stats.datname
+            WHERE databases.datistemplate = false
+            ORDER BY stats.numbackends DESC, stats.datname ASC
             LIMIT 8
             "#,
         )
