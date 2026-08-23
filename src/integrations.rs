@@ -1376,14 +1376,14 @@ pub async fn gail_plan_summary(
         return Ok(None);
     };
     let prompt = format!(
-        "Summarize the three highest-leverage reliability, performance, and self-improvement actions for this topology. Use concise bullets only. Topology summary: {}",
+        "Return only valid JSON with this shape: {{\"actions\":[{{\"title\":\"...\",\"reason\":\"...\"}}]}}. Include the three highest-leverage reliability, performance, and self-improvement actions for this topology. Keep each title and reason concise. Topology summary: {}",
         topology_summary
     );
     let completion_prompt = prompt.clone();
     let neuromorphic_prompt = prompt;
     let (completion, neuromorphic) = tokio::join!(
         async {
-            post_json(
+            post_json_with_timeout(
                 client,
                 &base_url,
                 "/v1/llm/complete",
@@ -1398,8 +1398,10 @@ pub async fn gail_plan_summary(
                     "include_configured": true,
                     "selection_mode": "best",
                     "max_candidates": 3,
-                    "timeout_seconds": config.integrations.gail.timeout_seconds.max(30)
+                    "timeout_seconds": config.integrations.gail.timeout_seconds.max(30),
+                    "request_category": "planner_json"
                 }),
+                config.integrations.gail.timeout_seconds.max(30),
             )
             .await
             .ok()
@@ -1705,6 +1707,29 @@ pub(crate) async fn post_json(
 ) -> Result<Value> {
     let mut request = client
         .post(format!("{}{}", base_url.trim_end_matches('/'), path))
+        .json(body);
+    if let Some(token) = bearer_token.filter(|value| !value.trim().is_empty()) {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    decode_json(response).await
+}
+
+/// Use a request-scoped timeout for integrations whose valid work can exceed
+/// the short discovery/probe timeout used by the shared client.  The timeout
+/// remains bounded by the integration's configured value and does not make
+/// unrelated discovery calls wait longer.
+pub(crate) async fn post_json_with_timeout(
+    client: &Client,
+    base_url: &str,
+    path: &str,
+    bearer_token: Option<&str>,
+    body: &Value,
+    timeout_seconds: u64,
+) -> Result<Value> {
+    let mut request = client
+        .post(format!("{}{}", base_url.trim_end_matches('/'), path))
+        .timeout(Duration::from_secs(timeout_seconds.max(1)))
         .json(body);
     if let Some(token) = bearer_token.filter(|value| !value.trim().is_empty()) {
         request = request.bearer_auth(token);
