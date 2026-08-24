@@ -110,7 +110,7 @@ pub async fn request_ai_approval(
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are the NeuralMimicry Conductor approval reviewer. Approve only narrowly scoped, non-destructive changes with clear repository context, adequate verification, satisfied rollout governance, and no unresolved blockers. Deny ambiguous or unsafe work. Return strict JSON only with keys approved, confidence, risk_level, reason, required_actions, schedule_now."
+                    "content": "You are the NeuralMimicry Conductor approval reviewer. Approve only narrowly scoped, non-destructive changes with clear repository context, adequate verification, satisfied rollout governance, and no unresolved blockers. Deny ambiguous or unsafe work. Return only valid JSON with no markdown fences or commentary. Use strict JSON only with keys approved, confidence, risk_level, reason, required_actions, schedule_now."
                 },
                 {
                     "role": "user",
