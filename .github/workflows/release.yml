@@ -141,7 +141,7 @@ jobs:
           # Some self-hosted runners retain Podman after its transitive
           # libraries have been removed.  Without GPGME the executable is
           # present but cannot start, which surfaces as an opaque exit 127.
-          if ! ldd "$(command -v podman)" 2>/dev/null | grep -q 'libgpgme\.so\.11 =>'; then
+          if ! podman --version >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends libgpgme11t64 || \
               sudo apt-get install -y --no-install-recommends libgpgme11
