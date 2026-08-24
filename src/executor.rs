@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
+use chrono::Duration as ChronoDuration;
 use futures::future;
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
@@ -14,7 +15,7 @@ use crate::{
     },
     models::{
         ConductorEvent, DeliveryStage, ExecutionStatus, PolicyVerdict, RepositorySnapshot,
-        RolloutStrategy, ServiceSnapshot, WorkExecution, WorkItem, WorkStatus,
+        RolloutStrategy, ServiceSnapshot, WorkExecution, WorkItem, WorkItemPatch, WorkStatus,
     },
     policy::{evaluate_work_item, policy_evaluation_to_value},
     repository::ConductorRepository,
@@ -24,6 +25,64 @@ use crate::{
 pub type ExecutionEventCallback = Arc<dyn Fn(ConductorEvent) + Send + Sync>;
 
 const REFINER_EXECUTION_PLAN_PATH: &str = "/api/execution/plan";
+
+async fn reconcile_stale_executions(
+    repository: &dyn ConductorRepository,
+    config: &ConductorConfig,
+    event_callback: Option<&ExecutionEventCallback>,
+) -> Result<usize> {
+    let now = crate::models::now_utc();
+    let stale_after = ChronoDuration::seconds(config.execution.claim_ttl_seconds.max(60) as i64);
+    let executions = repository.list_work_executions(10_000).await?;
+    let mut reconciled = 0;
+
+    for mut execution in executions {
+        if execution.status.is_terminal() || execution.updated_at + stale_after > now {
+            continue;
+        }
+
+        let age_seconds = (now - execution.updated_at).num_seconds().max(0);
+        let message = format!(
+            "execution {} was reconciled as failed after {} seconds without a heartbeat",
+            execution.id, age_seconds
+        );
+        execution.error = Some(message.clone());
+        execution.mark_status(ExecutionStatus::Failure);
+        repository.upsert_work_execution(&execution).await?;
+
+        if let Some(item) = repository.get_work_item(execution.work_item_id).await?
+            && item.last_execution_id == Some(execution.id)
+        {
+            let _ = repository
+                .patch_work_item(
+                    item.id,
+                    WorkItemPatch {
+                        status: Some(WorkStatus::Failure),
+                        note: Some(message.clone()),
+                        ..WorkItemPatch::default()
+                    },
+                )
+                .await?;
+        }
+
+        emit_execution_event(
+            event_callback,
+            "execution.stale_reconciled",
+            message.clone(),
+            None,
+            Some(&execution),
+            Some("failure"),
+            json!({
+                "reason": "heartbeat_timeout",
+                "age_seconds": age_seconds,
+                "stale_after_seconds": stale_after.num_seconds(),
+            }),
+        );
+        reconciled += 1;
+    }
+
+    Ok(reconciled)
+}
 
 fn emit_event(callback: Option<&ExecutionEventCallback>, event: ConductorEvent) {
     if let Some(publish) = callback {
@@ -82,6 +141,8 @@ pub async fn run_execution_cycle(
         );
         return Ok(Vec::new());
     }
+
+    reconcile_stale_executions(repository, config, event_callback).await?;
 
     let work_items = repository
         .claim_scheduled_work_items(
@@ -142,6 +203,8 @@ pub async fn execute_specific_work_item(
         )
         .await;
     }
+
+    reconcile_stale_executions(repository, config, event_callback).await?;
 
     let claimed = repository
         .claim_work_item_for_execution(
@@ -2231,6 +2294,77 @@ mod tests {
             .expect("item");
         assert_eq!(stored.status, WorkStatus::Scheduled);
         assert!(stored.claim_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn execution_cycle_reconciles_stale_execution_and_releases_capacity() {
+        let repository = Arc::new(MemoryRepository::new());
+        let mut config = ConductorConfig::default();
+        config.execution.enabled = true;
+        config.execution.dry_run = false;
+        config.execution.claim_ttl_seconds = 60;
+
+        let mut item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("stale:execution".to_string()),
+            title: "Stale execution".to_string(),
+            summary: "Recover an execution left behind by a stopped process".to_string(),
+            target_service: Some("conductor".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
+            status: Some(WorkStatus::InOperation),
+            priority: Some(50),
+            progress_pct: Some(20),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        let mut execution = WorkExecution::new(
+            item.id,
+            item.target_service.clone(),
+            item.delivery_stage,
+            item.rollout_strategy,
+        );
+        let stale_at = crate::models::now_utc() - ChronoDuration::seconds(120);
+        execution.started_at = stale_at;
+        execution.updated_at = stale_at;
+        item.last_execution_id = Some(execution.id);
+
+        repository.upsert_work_item(&item).await.expect("work item");
+        repository
+            .upsert_work_execution(&execution)
+            .await
+            .expect("execution");
+
+        let executed = run_execution_cycle(repository.as_ref(), &config, None)
+            .await
+            .expect("execution cycle");
+
+        assert!(executed.is_empty());
+        let recovered = repository
+            .list_work_executions(10)
+            .await
+            .expect("execution list")
+            .pop()
+            .expect("recovered execution");
+        assert_eq!(recovered.status, ExecutionStatus::Failure);
+        assert!(
+            recovered
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("without a heartbeat"))
+        );
+        let recovered_item = repository
+            .get_work_item(item.id)
+            .await
+            .expect("work item lookup")
+            .expect("recovered work item");
+        assert_eq!(recovered_item.status, WorkStatus::Failure);
     }
 
     #[tokio::test]
