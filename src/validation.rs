@@ -292,6 +292,12 @@ async fn run_command(
         .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Discovery mounts source repositories read-only. Keep Cargo's build
+    // output on Conductor's writable data volume instead of creating target/
+    // beside the source and turning validation into a false failure.
+    if program == "cargo" {
+        process.env("CARGO_TARGET_DIR", "/app/data/validation-target");
+    }
     if let Some(path) = repo_path {
         process.current_dir(path);
     }

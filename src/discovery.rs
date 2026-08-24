@@ -1118,8 +1118,19 @@ fn load_global_vars(root: &Path) -> Result<BTreeMap<String, Value>> {
         if !subdir.exists() {
             continue;
         }
-        for entry in WalkDir::new(subdir).min_depth(1).max_depth(2) {
-            let entry = entry?;
+        for entry in WalkDir::new(subdir)
+            .min_depth(1)
+            .max_depth(2)
+            .into_iter()
+            .filter_entry(|entry| !is_transient_sync_path(entry.path()))
+        {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!(error = %error, "skipping unreadable Ansible variable path during discovery");
+                    continue;
+                }
+            };
             if entry.file_type().is_file() && is_yaml_file(entry.path()) {
                 files.push(entry.into_path());
             }
@@ -1141,8 +1152,19 @@ fn load_global_vars(root: &Path) -> Result<BTreeMap<String, Value>> {
 
 fn load_playbooks(root: &Path) -> Result<Vec<PlaybookDocument>> {
     let mut files = Vec::new();
-    for entry in WalkDir::new(root).min_depth(1).max_depth(3) {
-        let entry = entry?;
+    for entry in WalkDir::new(root)
+        .min_depth(1)
+        .max_depth(3)
+        .into_iter()
+        .filter_entry(|entry| !is_transient_sync_path(entry.path()))
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(error = %error, "skipping unreadable Ansible playbook path during discovery");
+                continue;
+            }
+        };
         if !entry.file_type().is_file() || !is_yaml_file(entry.path()) {
             continue;
         }
@@ -1162,6 +1184,15 @@ fn load_playbooks(root: &Path) -> Result<Vec<PlaybookDocument>> {
         }
     }
     Ok(docs)
+}
+
+fn is_transient_sync_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .starts_with(".~tmp~")
+    })
 }
 
 fn append_playbook_documents(
