@@ -139,6 +139,13 @@ jobs:
             sudo apt-get install -y --no-install-recommends dpkg
           fi
           if command -v podman >/dev/null 2>&1 && podman --version >/dev/null 2>&1; then
+            # Some self-hosted runners do not start a user systemd session.
+            # Give rootless Podman a private runtime directory instead of
+            # relying on the absent /run/user/<uid> path.
+            podman_runtime_dir="${RUNNER_TEMP}/podman-runtime"
+            mkdir -p "${podman_runtime_dir}"
+            chmod 700 "${podman_runtime_dir}"
+            echo "XDG_RUNTIME_DIR=${podman_runtime_dir}" >>"${GITHUB_ENV}"
             echo "CONTAINER_RUNTIME=podman" >>"${GITHUB_ENV}"
           elif command -v docker >/dev/null 2>&1 && env -u DOCKER_HOST docker info >/dev/null 2>&1; then
             echo "CONTAINER_RUNTIME=docker" >>"${GITHUB_ENV}"
