@@ -1398,6 +1398,8 @@ pub async fn gail_plan_summary(
                     "include_configured": true,
                     "selection_mode": "best",
                     "max_candidates": 3,
+                    "max_tokens": 512,
+                    "temperature": 0.0,
                     "timeout_seconds": config.integrations.gail.timeout_seconds.max(30),
                     "request_category": "planner_json"
                 }),

@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::{
     findings::{DetectedFinding, detect_findings},
@@ -81,7 +81,10 @@ pub async fn run_planning_cycle(
             "health": service.health.as_str(),
             "dependencies": service.dependencies,
             "capabilities": service.capabilities,
-            "probe": service.probe,
+            // Service probes can contain full Prometheus payloads, logs, or
+            // large API responses. They are useful for discovery persistence,
+            // but must not be copied verbatim into the planner prompt.
+            "probe": compact_prompt_value(&service.probe, 0),
         })).collect::<Vec<_>>(),
         "repositories": repositories.iter().map(|repository| json!({
             "repo_key": repository.repo_key,
@@ -154,6 +157,65 @@ pub async fn run_planning_cycle(
 
     repository.insert_improvement_cycle(&cycle).await?;
     Ok(cycle)
+}
+
+/// Keep planner context bounded even when a service probe contains an
+/// accidentally unbounded response body. Findings and trend summaries carry
+/// the evidence needed for planning; this view only preserves the shape and a
+/// small sample of the probe for context.
+fn compact_prompt_value(value: &Value, depth: usize) -> Value {
+    const MAX_OBJECT_ENTRIES: usize = 24;
+    const MAX_ARRAY_ITEMS: usize = 6;
+    const MAX_STRING_CHARS: usize = 320;
+
+    match value {
+        Value::Object(object) if depth < 2 => {
+            let mut compact = Map::new();
+            for (key, child) in object.iter().take(MAX_OBJECT_ENTRIES) {
+                compact.insert(key.clone(), compact_prompt_value(child, depth + 1));
+            }
+            if object.len() > MAX_OBJECT_ENTRIES {
+                compact.insert(
+                    "_omitted_keys".to_string(),
+                    json!(object.len() - MAX_OBJECT_ENTRIES),
+                );
+            }
+            Value::Object(compact)
+        }
+        Value::Object(object) => json!({
+            "_kind": "object",
+            "_keys": object.len(),
+        }),
+        Value::Array(items) if depth < 2 => {
+            let compact = items
+                .iter()
+                .take(MAX_ARRAY_ITEMS)
+                .map(|child| compact_prompt_value(child, depth + 1))
+                .collect::<Vec<_>>();
+            if items.len() > MAX_ARRAY_ITEMS {
+                json!({
+                    "_kind": "array",
+                    "_length": items.len(),
+                    "_sample": compact,
+                })
+            } else {
+                Value::Array(compact)
+            }
+        }
+        Value::Array(items) => json!({
+            "_kind": "array",
+            "_length": items.len(),
+        }),
+        Value::String(text) => {
+            let truncated = text.chars().take(MAX_STRING_CHARS).collect::<String>();
+            if text.chars().count() > MAX_STRING_CHARS {
+                json!(format!("{truncated}…"))
+            } else {
+                Value::String(truncated)
+            }
+        }
+        other => other.clone(),
+    }
 }
 
 fn derive_recommendations(

@@ -1,3 +1,4 @@
+ARG TARGET_PAGE_SIZE=4k
 FROM docker.io/library/rust:1.88-bookworm AS source-deb
 
 ARG CONDUCTOR_VERSION=source
@@ -35,6 +36,8 @@ RUN set -eu; \
         --out-dir /out
 
 FROM docker.io/library/debian:bookworm-slim
+ARG TARGET_PAGE_SIZE
+LABEL org.opencontainers.image.page-size="${TARGET_PAGE_SIZE}"
 
 ARG TARGETARCH
 ARG CONDUCTOR_VERSION=source
