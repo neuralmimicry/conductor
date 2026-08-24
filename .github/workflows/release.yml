@@ -134,40 +134,37 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v podman >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends podman
-          fi
-          # Some self-hosted runners retain Podman after its transitive
-          # libraries have been removed.  Without GPGME the executable is
-          # present but cannot start, which surfaces as an opaque exit 127.
-          if ! podman --version >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends libgpgme11t64 || \
-              sudo apt-get install -y --no-install-recommends libgpgme11
-          fi
           if ! command -v dpkg-deb >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends dpkg
+          fi
+          if command -v podman >/dev/null 2>&1 && podman --version >/dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME=podman" >>"${GITHUB_ENV}"
+          elif command -v docker >/dev/null 2>&1 && env -u DOCKER_HOST docker info >/dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME=docker" >>"${GITHUB_ENV}"
+            echo "DOCKER_HOST=" >>"${GITHUB_ENV}"
+          else
+            echo "No usable Podman or Docker runtime is available" >&2
+            exit 1
           fi
 
       - name: Build Debian package in bookworm toolchain container
         shell: bash
         run: |
           set -euo pipefail
-          image_ref="conductor-release-build-${{ matrix.deb_arch }}:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          image_ref="localhost/conductor-release-build-${{ matrix.deb_arch }}:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           container_name="conductor-release-build-${{ matrix.deb_arch }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          podman build \
+          "${CONTAINER_RUNTIME}" build \
             --target source-deb \
             --build-arg "CONDUCTOR_VERSION=${{ needs.version.outputs.app_version }}" \
             -f Containerfile \
             -t "${image_ref}" \
             .
-          podman create --name "${container_name}" "${image_ref}" >/dev/null
+          "${CONTAINER_RUNTIME}" create --name "${container_name}" "${image_ref}" >/dev/null
           mkdir -p dist
-          podman cp "${container_name}:/out/conductor_${{ needs.version.outputs.deb_version }}_${{ matrix.deb_arch }}.deb" dist/
-          podman rm "${container_name}" >/dev/null
-          podman rmi "${image_ref}" >/dev/null
+          "${CONTAINER_RUNTIME}" cp "${container_name}:/out/conductor_${{ needs.version.outputs.deb_version }}_${{ matrix.deb_arch }}.deb" dist/
+          "${CONTAINER_RUNTIME}" rm "${container_name}" >/dev/null
+          "${CONTAINER_RUNTIME}" rmi "${image_ref}" >/dev/null
 
       - name: Inspect Debian package
         run: dpkg-deb --info "dist/conductor_${{ needs.version.outputs.deb_version }}_${{ matrix.deb_arch }}.deb"
