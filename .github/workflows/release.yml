@@ -170,8 +170,10 @@ jobs:
           "${CONTAINER_RUNTIME}" create --name "${container_name}" "${image_ref}" >/dev/null
           mkdir -p dist
           "${CONTAINER_RUNTIME}" cp "${container_name}:/out/conductor_${{ needs.version.outputs.deb_version }}_${{ matrix.deb_arch }}.deb" dist/
-          "${CONTAINER_RUNTIME}" rm "${container_name}" >/dev/null
-          "${CONTAINER_RUNTIME}" rmi "${image_ref}" >/dev/null
+          # A self-hosted runner may retain an external build container that
+          # references this image. Cleanup must not turn a valid artifact into
+          # a failed job in that case.
+          "${CONTAINER_RUNTIME}" rm -f "${container_name}" >/dev/null 2>&1 || true
 
       - name: Inspect Debian package
         run: dpkg-deb --info "dist/conductor_${{ needs.version.outputs.deb_version }}_${{ matrix.deb_arch }}.deb"
