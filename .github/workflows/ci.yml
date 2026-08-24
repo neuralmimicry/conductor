@@ -27,9 +27,6 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
-
       - name: Check formatting
         run: cargo fmt --check
 
