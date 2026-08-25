@@ -154,6 +154,15 @@ jobs:
             echo "No usable Podman or Docker runtime is available" >&2
             exit 1
           fi
+          # Rootless self-hosted runners may not have a user systemd session.
+          # Explicitly use cgroupfs so crun does not attempt an interactive
+          # sd-bus authentication call while creating the build container.
+          container_runtime_args=()
+          if [[ "${CONTAINER_RUNTIME}" == "podman" ]]; then
+            container_runtime_args+=(--cgroup-manager=cgroupfs)
+          fi
+          printf 'CONTAINER_RUNTIME_ARGS=%q ' "${container_runtime_args[@]}" >>"${GITHUB_ENV}"
+          printf '\n' >>"${GITHUB_ENV}"
 
       - name: Build Debian package in bookworm toolchain container
         shell: bash
@@ -161,19 +170,23 @@ jobs:
           set -euo pipefail
           image_ref="localhost/conductor-release-build-${{ matrix.deb_arch }}:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           container_name="conductor-release-build-${{ matrix.deb_arch }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          "${CONTAINER_RUNTIME}" build \
+          # shellcheck disable=SC2086
+          "${CONTAINER_RUNTIME}" ${CONTAINER_RUNTIME_ARGS:-} build \
             --target source-deb \
             --build-arg "CONDUCTOR_VERSION=${{ needs.version.outputs.app_version }}" \
             -f Containerfile \
             -t "${image_ref}" \
             .
-          "${CONTAINER_RUNTIME}" create --name "${container_name}" "${image_ref}" >/dev/null
+          # shellcheck disable=SC2086
+          "${CONTAINER_RUNTIME}" ${CONTAINER_RUNTIME_ARGS:-} create --name "${container_name}" "${image_ref}" >/dev/null
           mkdir -p dist
-          "${CONTAINER_RUNTIME}" cp "${container_name}:/out/conductor_${{ needs.version.outputs.deb_version }}_${{ matrix.deb_arch }}.deb" dist/
+          # shellcheck disable=SC2086
+          "${CONTAINER_RUNTIME}" ${CONTAINER_RUNTIME_ARGS:-} cp "${container_name}:/out/conductor_${{ needs.version.outputs.deb_version }}_${{ matrix.deb_arch }}.deb" dist/
           # A self-hosted runner may retain an external build container that
           # references this image. Cleanup must not turn a valid artifact into
           # a failed job in that case.
-          "${CONTAINER_RUNTIME}" rm -f "${container_name}" >/dev/null 2>&1 || true
+          # shellcheck disable=SC2086
+          "${CONTAINER_RUNTIME}" ${CONTAINER_RUNTIME_ARGS:-} rm -f "${container_name}" >/dev/null 2>&1 || true
 
       - name: Inspect Debian package
         run: dpkg-deb --info "dist/conductor_${{ needs.version.outputs.deb_version }}_${{ matrix.deb_arch }}.deb"
