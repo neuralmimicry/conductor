@@ -230,3 +230,118 @@ jobs:
           files: |
             release-assets/*.deb
             release-assets/SHA256SUMS
+
+  build-container-arch:
+    name: Build container (${{ matrix.arch }})
+    needs:
+      - version
+      - github-release
+    runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner_arch: X64
+            target_page_size: 4k
+          - arch: arm64
+            runner_arch: ARM64
+            target_page_size: 4k
+    env:
+      IMAGE_REPO: ghcr.io/${{ github.repository }}
+      IMAGE_VERSION: ${{ needs.version.outputs.app_version }}
+      IMAGE_TAG: ${{ needs.version.outputs.tag_name }}
+      GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare rootless Podman
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v podman >/dev/null 2>&1 || {
+            echo "Podman is required on the self-hosted runner" >&2
+            exit 1
+          }
+          podman_runtime_dir="${RUNNER_TEMP}/podman-runtime"
+          mkdir -p "${podman_runtime_dir}"
+          chmod 700 "${podman_runtime_dir}"
+          echo "XDG_RUNTIME_DIR=${podman_runtime_dir}" >>"${GITHUB_ENV}"
+
+      - name: Log in to GHCR
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GHCR_USERNAME}" || { echo "No GHCR username available" >&2; exit 1; }
+          test -n "${GHCR_TOKEN}" || { echo "No GHCR token available" >&2; exit 1; }
+          printf '%s' "${GHCR_TOKEN}" | podman --cgroup-manager=cgroupfs login ghcr.io \
+            --username "${GHCR_USERNAME}" --password-stdin
+
+      - name: Build and push architecture image
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          PAGE_SIZE: ${{ matrix.target_page_size }}
+        run: |
+          set -euo pipefail
+          image_ref="${IMAGE_REPO}:${IMAGE_VERSION}-${ARCH}"
+          iid_file="$(mktemp)"
+          trap 'rm -f "${iid_file}"' EXIT
+          podman --cgroup-manager=cgroupfs build \
+            --pull \
+            --build-arg "CONDUCTOR_VERSION=source" \
+            --build-arg "TARGET_PAGE_SIZE=${PAGE_SIZE}" \
+            --iidfile "${iid_file}" \
+            -f Containerfile \
+            -t "${image_ref}" \
+            .
+          image_id="$(tr -d '\n' <"${iid_file}")"
+          test -n "${image_id}" || { echo "Podman did not emit an image ID" >&2; exit 1; }
+          podman --cgroup-manager=cgroupfs push "${image_id}" "docker://${image_ref}"
+
+  publish-container:
+    name: Publish multi-arch container
+    needs:
+      - version
+      - build-container-arch
+    runs-on: [self-hosted, Linux, X64]
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_REPO: ghcr.io/${{ github.repository }}
+      IMAGE_VERSION: ${{ needs.version.outputs.app_version }}
+      IMAGE_TAG: ${{ needs.version.outputs.tag_name }}
+      COMMIT_SHORT: ${{ github.sha }}
+      GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
+    steps:
+      - name: Log in to GHCR
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GHCR_USERNAME}" || { echo "No GHCR username available" >&2; exit 1; }
+          test -n "${GHCR_TOKEN}" || { echo "No GHCR token available" >&2; exit 1; }
+          printf '%s' "${GHCR_TOKEN}" | podman --cgroup-manager=cgroupfs login ghcr.io \
+            --username "${GHCR_USERNAME}" --password-stdin
+
+      - name: Create and push multi-arch tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="conductor-manifest-${IMAGE_VERSION}"
+          podman --cgroup-manager=cgroupfs manifest rm "${manifest}" >/dev/null 2>&1 || true
+          podman --cgroup-manager=cgroupfs manifest create "${manifest}"
+          podman --cgroup-manager=cgroupfs manifest add "${manifest}" \
+            "docker://${IMAGE_REPO}:${IMAGE_VERSION}-amd64"
+          podman --cgroup-manager=cgroupfs manifest add "${manifest}" \
+            "docker://${IMAGE_REPO}:${IMAGE_VERSION}-arm64"
+          for tag in latest "${IMAGE_VERSION}" "${IMAGE_TAG}" "${COMMIT_SHORT}"; do
+            podman --cgroup-manager=cgroupfs manifest push --all "${manifest}" \
+              "docker://${IMAGE_REPO}:${tag}"
+          done
