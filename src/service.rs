@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -26,7 +26,11 @@ use crate::{
         atlassian::AtlassianClients, continuum::ContinuumClient, refiner::RefinerClient,
         tracey::TraceyClient,
     },
-    metrics::{record_event_persistence, record_execution_cycle},
+    metrics::{
+        record_approval_cycle, record_claimed_work_items, record_discovery_cycle,
+        record_event_persistence, record_execution_cycle, record_execution_duration,
+        record_planning_cycle, set_work_queue_depth,
+    },
     models::{
         ConductorEvent, ConfluencePageLinkRequest, DashboardSummary, DeliveryStage, DiscoveryRun,
         DoraMetricsSummary, ExternalLinkOperationResult, FindingEvidence, FindingProvenance,
@@ -132,41 +136,55 @@ impl ConductorService {
     }
 
     pub async fn run_discovery_cycle(&self) -> Result<DiscoveryRun> {
-        let discovery = discover_and_probe(&self.config, &self.http).await?;
-        let metric_samples = collect_metric_samples(discovery.run.id, &discovery.services);
-        self.repository
-            .replace_service_snapshots(&discovery.services)
-            .await?;
-        self.repository
-            .replace_repository_snapshots(&discovery.repositories)
-            .await?;
-        self.repository.insert_discovery_run(&discovery.run).await?;
-        if !metric_samples.is_empty() {
+        let started = Instant::now();
+        let result = async {
+            let discovery = discover_and_probe(&self.config, &self.http).await?;
+            let metric_samples = collect_metric_samples(discovery.run.id, &discovery.services);
             self.repository
-                .insert_service_metric_samples(&metric_samples)
+                .replace_service_snapshots(&discovery.services)
                 .await?;
+            self.repository
+                .replace_repository_snapshots(&discovery.repositories)
+                .await?;
+            self.repository.insert_discovery_run(&discovery.run).await?;
+            if !metric_samples.is_empty() {
+                self.repository
+                    .insert_service_metric_samples(&metric_samples)
+                    .await?;
+            }
+            let mut event = ConductorEvent::new(
+                "discovery.completed",
+                format!(
+                    "discovery cycle completed with {} services and {} repositories",
+                    discovery.services.len(),
+                    discovery.repositories.len()
+                ),
+                json!({
+                    "discovery_run_id": discovery.run.id.to_string(),
+                    "services_count": discovery.services.len(),
+                    "repositories_count": discovery.repositories.len(),
+                    "status": discovery.run.status.as_str(),
+                }),
+            );
+            event.status = Some(discovery.run.status.as_str().to_string());
+            self.publish_event(event);
+            Ok(discovery.run)
         }
-        let mut event = ConductorEvent::new(
-            "discovery.completed",
-            format!(
-                "discovery cycle completed with {} services and {} repositories",
-                discovery.services.len(),
-                discovery.repositories.len()
-            ),
-            json!({
-                "discovery_run_id": discovery.run.id.to_string(),
-                "services_count": discovery.services.len(),
-                "repositories_count": discovery.repositories.len(),
-                "status": discovery.run.status.as_str(),
-            }),
-        );
-        event.status = Some(discovery.run.status.as_str().to_string());
-        self.publish_event(event);
-        Ok(discovery.run)
+        .await;
+        record_discovery_cycle(result.is_ok(), started.elapsed().as_millis() as u64);
+        result
     }
 
     pub async fn run_planning_cycle(&self) -> Result<ImprovementCycle> {
-        let cycle = run_planning_cycle(self.repository.as_ref(), &self.http, &self.config).await?;
+        let started = Instant::now();
+        let cycle =
+            match run_planning_cycle(self.repository.as_ref(), &self.http, &self.config).await {
+                Ok(cycle) => cycle,
+                Err(error) => {
+                    record_planning_cycle(false, started.elapsed().as_millis() as u64);
+                    return Err(error);
+                }
+            };
         let mut event = ConductorEvent::new(
             "planning.completed",
             cycle.summary.clone(),
@@ -178,10 +196,17 @@ impl ConductorService {
         );
         event.status = Some(cycle.status.as_str().to_string());
         self.publish_event(event);
+        record_planning_cycle(true, started.elapsed().as_millis() as u64);
         Ok(cycle)
     }
 
     pub async fn run_ai_approval_cycle(&self) -> Result<usize> {
+        let result = self.run_ai_approval_cycle_inner().await;
+        record_approval_cycle(result.is_ok());
+        result
+    }
+
+    async fn run_ai_approval_cycle_inner(&self) -> Result<usize> {
         if !self.config.policy.ai_approvals_enabled || !self.config.policy.require_admin_approval {
             return Ok(0);
         }
@@ -1687,6 +1712,7 @@ impl ConductorService {
     }
 
     pub async fn run_execution_cycle(&self) -> Result<Vec<WorkExecution>> {
+        let started = Instant::now();
         self.publish_event(ConductorEvent::new(
             "execution.cycle.started",
             "execution cycle started",
@@ -1698,6 +1724,7 @@ impl ConductorService {
         match &result {
             Ok(executions) => {
                 record_execution_cycle(true);
+                record_claimed_work_items(executions.len());
                 let mut event = ConductorEvent::new(
                     "execution.cycle.completed",
                     format!(
@@ -1721,6 +1748,15 @@ impl ConductorService {
                 event.status = Some("failure".to_string());
                 self.publish_event(event);
             }
+        }
+        record_execution_duration(started.elapsed().as_millis() as u64);
+        if let Ok(items) = self.repository.list_work_items().await {
+            set_work_queue_depth(
+                items
+                    .iter()
+                    .filter(|item| !item.status.is_terminal())
+                    .count(),
+            );
         }
         result
     }
@@ -2787,81 +2823,59 @@ pub fn spawn_background_loops(service: ConductorService) {
             .max(60),
     );
 
-    let discovery_service = service.clone();
+    // One scheduler owns discovery, planning, approval, and execution. The
+    // operations remain asynchronous and the external sync loops below remain
+    // concurrent, but the control-plane stages cannot race with one another or
+    // plan against a discovery snapshot that is still being replaced.
+    let control_service = service.clone();
     tokio::spawn(async move {
-        if let Err(error) = discovery_service.run_discovery_cycle().await {
-            tracing::warn!(error = %error, "initial discovery cycle failed");
-            let mut event = ConductorEvent::new(
-                "discovery.failed",
-                format!("initial discovery cycle failed: {}", error),
-                json!({"error": error.to_string()}),
-            );
-            event.status = Some("failure".to_string());
-            discovery_service.publish_event(event);
-        }
-        let mut ticker = tokio::time::interval(discovery_interval);
+        let mut next_discovery = Instant::now();
+        let mut next_planning = Instant::now();
+        let mut next_approval = Instant::now();
+        let mut next_execution = Instant::now();
+        let mut discovery_available = false;
         loop {
-            ticker.tick().await;
-            if let Err(error) = discovery_service.run_discovery_cycle().await {
-                tracing::warn!(error = %error, "discovery cycle failed");
-                let mut event = ConductorEvent::new(
-                    "discovery.failed",
-                    format!("discovery cycle failed: {}", error),
-                    json!({"error": error.to_string()}),
-                );
-                event.status = Some("failure".to_string());
-                discovery_service.publish_event(event);
+            let now = Instant::now();
+            if now >= next_discovery {
+                discovery_available = match control_service.run_discovery_cycle().await {
+                    Ok(_) => true,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "discovery cycle failed");
+                        let mut event = ConductorEvent::new(
+                            "discovery.failed",
+                            format!("discovery cycle failed: {}", error),
+                            json!({"error": error.to_string()}),
+                        );
+                        event.status = Some("failure".to_string());
+                        control_service.publish_event(event);
+                        false
+                    }
+                };
+                next_discovery = now + discovery_interval;
+                // A successful discovery should be planned immediately instead
+                // of waiting for a second independent timer tick.
+                if discovery_available {
+                    next_planning = now;
+                }
             }
-        }
-    });
-
-    let planning_service = service.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        if let Err(error) = planning_service.run_planning_cycle().await {
-            tracing::warn!(error = %error, "initial planning cycle failed");
-            let mut event = ConductorEvent::new(
-                "planning.failed",
-                format!("initial planning cycle failed: {}", error),
-                json!({"error": error.to_string()}),
-            );
-            event.status = Some("failure".to_string());
-            planning_service.publish_event(event);
-        }
-        let mut ticker = tokio::time::interval(planning_interval);
-        loop {
-            ticker.tick().await;
-            if let Err(error) = planning_service.run_planning_cycle().await {
-                tracing::warn!(error = %error, "planning cycle failed");
-                let mut event = ConductorEvent::new(
-                    "planning.failed",
-                    format!("planning cycle failed: {}", error),
-                    json!({"error": error.to_string()}),
-                );
-                event.status = Some("failure".to_string());
-                planning_service.publish_event(event);
+            if discovery_available && Instant::now() >= next_planning {
+                if let Err(error) = control_service.run_planning_cycle().await {
+                    tracing::warn!(error = %error, "planning cycle failed");
+                    let mut event = ConductorEvent::new(
+                        "planning.failed",
+                        format!("planning cycle failed: {}", error),
+                        json!({"error": error.to_string()}),
+                    );
+                    event.status = Some("failure".to_string());
+                    control_service.publish_event(event);
+                }
+                next_planning = Instant::now() + planning_interval;
             }
-        }
-    });
-
-    if service.config.policy.ai_approvals_enabled && service.config.policy.require_admin_approval {
-        let approval_service = service.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(8)).await;
-            if let Err(error) = approval_service.run_ai_approval_cycle().await {
-                tracing::warn!(error = %error, "initial approval cycle failed");
-                let mut event = ConductorEvent::new(
-                    "approval.cycle.failed",
-                    format!("initial approval cycle failed: {}", error),
-                    json!({"error": error.to_string()}),
-                );
-                event.status = Some("failure".to_string());
-                approval_service.publish_event(event);
-            }
-            let mut ticker = tokio::time::interval(approval_interval);
-            loop {
-                ticker.tick().await;
-                if let Err(error) = approval_service.run_ai_approval_cycle().await {
+            if control_service.config.policy.ai_approvals_enabled
+                && control_service.config.policy.require_admin_approval
+                && Instant::now() >= next_approval
+            {
+                if let Err(error) = control_service.run_ai_approval_cycle().await {
                     tracing::warn!(error = %error, "approval cycle failed");
                     let mut event = ConductorEvent::new(
                         "approval.cycle.failed",
@@ -2869,38 +2883,34 @@ pub fn spawn_background_loops(service: ConductorService) {
                         json!({"error": error.to_string()}),
                     );
                     event.status = Some("failure".to_string());
-                    approval_service.publish_event(event);
+                    control_service.publish_event(event);
                 }
+                next_approval = Instant::now() + approval_interval;
+                // The approval method triggers execution when it schedules
+                // ready work. Avoid immediately launching a redundant second
+                // execution scan in the same control-plane turn.
+                next_execution = Instant::now() + execution_interval;
             }
-        });
-    }
+            if Instant::now() >= next_execution {
+                if let Err(error) = control_service.run_execution_cycle().await {
+                    tracing::warn!(error = %error, "execution cycle failed");
+                    let mut event = ConductorEvent::new(
+                        "execution.cycle.failed",
+                        format!("execution cycle failed: {}", error),
+                        json!({"error": error.to_string()}),
+                    );
+                    event.status = Some("failure".to_string());
+                    control_service.publish_event(event);
+                }
+                next_execution = Instant::now() + execution_interval;
+            }
 
-    let execution_service = service.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        if let Err(error) = execution_service.run_execution_cycle().await {
-            tracing::warn!(error = %error, "initial execution cycle failed");
-            let mut event = ConductorEvent::new(
-                "execution.cycle.failed",
-                format!("initial execution cycle failed: {}", error),
-                json!({"error": error.to_string()}),
-            );
-            event.status = Some("failure".to_string());
-            execution_service.publish_event(event);
-        }
-        let mut ticker = tokio::time::interval(execution_interval);
-        loop {
-            ticker.tick().await;
-            if let Err(error) = execution_service.run_execution_cycle().await {
-                tracing::warn!(error = %error, "execution cycle failed");
-                let mut event = ConductorEvent::new(
-                    "execution.cycle.failed",
-                    format!("execution cycle failed: {}", error),
-                    json!({"error": error.to_string()}),
-                );
-                event.status = Some("failure".to_string());
-                execution_service.publish_event(event);
-            }
+            let next = [next_discovery, next_planning, next_approval, next_execution]
+                .into_iter()
+                .min()
+                .unwrap_or_else(Instant::now);
+            let wait = next.saturating_duration_since(Instant::now());
+            tokio::time::sleep(wait.min(Duration::from_secs(5))).await;
         }
     });
 

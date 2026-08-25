@@ -52,6 +52,24 @@ Important execution controls in `config/conductor.yaml`:
 - `execution.claim_ttl_seconds`: expiry for short-lived dispatch claims used to avoid duplicate multi-instance execution starts.
 - `execution.instance_id`: stable identifier written into dispatch claims and events.
 
+The background control loop is intentionally single-owner for its internal
+stages: a successful discovery snapshot enables planning, then approval and
+execution are considered in order. This prevents planning against a snapshot
+that is still being replaced and avoids two scheduler ticks submitting the
+same ready work. Refiner, Tracey, Atlassian, and other external synchronizers
+remain independent asynchronous loops.
+
+Conductor exposes process-local control-loop telemetry at `GET /metrics`:
+
+- discovery, planning, approval, and execution outcomes
+- total and maximum cycle duration
+- non-terminal work queue depth
+- claimed work and claim-conflict counters
+
+Prometheus should scrape this endpoint so the telemetry survives Conductor
+restarts in the time-series store; the counters themselves are deliberately
+not persisted in the application database.
+
 Important delivery controls in `config/conductor.yaml`:
 
 - `delivery.auto_advance`: automatically promotes a successfully verified work item to the next stage.
