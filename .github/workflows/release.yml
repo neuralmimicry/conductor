@@ -147,9 +147,11 @@ jobs:
             chmod 700 "${podman_runtime_dir}"
             echo "XDG_RUNTIME_DIR=${podman_runtime_dir}" >>"${GITHUB_ENV}"
             echo "CONTAINER_RUNTIME=podman" >>"${GITHUB_ENV}"
+            container_runtime="podman"
           elif command -v docker >/dev/null 2>&1 && env -u DOCKER_HOST docker info >/dev/null 2>&1; then
             echo "CONTAINER_RUNTIME=docker" >>"${GITHUB_ENV}"
             echo "DOCKER_HOST=" >>"${GITHUB_ENV}"
+            container_runtime="docker"
           else
             echo "No usable Podman or Docker runtime is available" >&2
             exit 1
@@ -157,12 +159,11 @@ jobs:
           # Rootless self-hosted runners may not have a user systemd session.
           # Explicitly use cgroupfs so crun does not attempt an interactive
           # sd-bus authentication call while creating the build container.
-          container_runtime_args=()
-          if [[ "${CONTAINER_RUNTIME}" == "podman" ]]; then
-            container_runtime_args+=(--cgroup-manager=cgroupfs)
+          if [[ "${container_runtime}" == "podman" ]]; then
+            echo "CONTAINER_RUNTIME_ARGS=--cgroup-manager=cgroupfs" >>"${GITHUB_ENV}"
+          else
+            echo "CONTAINER_RUNTIME_ARGS=" >>"${GITHUB_ENV}"
           fi
-          printf 'CONTAINER_RUNTIME_ARGS=%q ' "${container_runtime_args[@]}" >>"${GITHUB_ENV}"
-          printf '\n' >>"${GITHUB_ENV}"
 
       - name: Build Debian package in bookworm toolchain container
         shell: bash
