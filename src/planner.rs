@@ -5,6 +5,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     findings::{DetectedFinding, detect_findings},
+    improvement_catalog::{ImprovementGap, KNOWN_GAPS},
     integrations::gail_plan_summary,
     models::{
         DeliveryStage, ImprovementCycle, NewWorkItem, RolloutStrategy, RunStatus, WorkItem,
@@ -69,6 +70,11 @@ pub async fn run_planning_cycle(
     let recommendations =
         derive_recommendations(&detected_findings, config.planning.minimum_priority);
 
+    // Formal gaps are the durable programme backlog and must remain visible
+    // even when operators temporarily disable dynamic finding auto-queueing.
+    for gap in KNOWN_GAPS {
+        upsert_catalogue_gap(repository, gap).await?;
+    }
     if config.planning.auto_queue {
         for recommendation in &recommendations {
             upsert_recommendation(repository, recommendation).await?;
@@ -110,6 +116,7 @@ pub async fn run_planning_cycle(
         })).collect::<Vec<_>>(),
         "finding_count": findings.len(),
         "recommendation_count": recommendations.len(),
+        "catalogue_gap_count": KNOWN_GAPS.len(),
     });
 
     let gail_base_url = services
@@ -127,7 +134,8 @@ pub async fn run_planning_cycle(
         status: RunStatus::Success,
         summary: if recommendations.is_empty() {
             format!(
-                "No new improvement items were queued; {} evidence-backed findings remain visible for review.",
+                "Reconciled {} known platform gaps; {} evidence-backed findings remain visible for review.",
+                KNOWN_GAPS.len(),
                 findings.len()
             )
         } else if !config.planning.auto_queue {
@@ -139,7 +147,8 @@ pub async fn run_planning_cycle(
             )
         } else {
             format!(
-                "Queued {} improvement items from {} findings across {} services.",
+                "Reconciled {} known platform gaps and queued {} finding-driven improvement items from {} findings across {} services.",
+                KNOWN_GAPS.len(),
                 recommendations.len(),
                 findings.len(),
                 unique_service_targets(&recommendations).len()
@@ -278,6 +287,90 @@ fn derive_recommendations(
             .then_with(|| left.dedupe_key.cmp(&right.dedupe_key))
     });
     recommendations
+}
+
+fn catalogue_gap_plan(gap: &ImprovementGap) -> Value {
+    json!({
+        "kind": "formal_gap",
+        "gap_id": gap.id,
+        "repositories": gap.repositories,
+        "outcomes": gap.outcomes,
+        "validation": gap.validation,
+    })
+}
+
+async fn upsert_catalogue_gap(
+    repository: &dyn ConductorRepository,
+    gap: &ImprovementGap,
+) -> Result<()> {
+    let dedupe_key = format!("formal-gap:{}", gap.id);
+    let tags = gap
+        .tags
+        .iter()
+        .map(|tag| (*tag).to_string())
+        .collect::<Vec<_>>();
+    let dependencies = gap
+        .depends_on
+        .iter()
+        .map(|key| format!("formal-gap:{key}"))
+        .collect::<Vec<_>>();
+    let plan = catalogue_gap_plan(gap);
+
+    if let Some(existing) = repository.find_work_item_by_dedupe_key(&dedupe_key).await? {
+        if existing.admin_override {
+            return Ok(());
+        }
+        let changed = existing.title != gap.title
+            || existing.summary != gap.summary
+            || existing.target_service.as_deref() != Some(gap.target_service)
+            || existing.priority != gap.priority
+            || existing.tags != tags
+            || existing.plan != plan
+            || existing.depends_on != dependencies;
+        if !changed {
+            return Ok(());
+        }
+        let mut updated = existing;
+        updated.title = gap.title.to_string();
+        updated.summary = gap.summary.to_string();
+        updated.target_service = Some(gap.target_service.to_string());
+        updated.priority = gap.priority;
+        updated.tags = tags;
+        updated.plan = plan;
+        updated.depends_on = dependencies;
+        updated.updated_at = now_utc();
+        updated.notes.push(format!(
+            "{} reconciled formal gap catalogue entry {}",
+            now_utc().to_rfc3339(),
+            gap.id
+        ));
+        repository.upsert_work_item(&updated).await?;
+        return Ok(());
+    }
+
+    let item = WorkItem::from_new(NewWorkItem {
+        dedupe_key: Some(dedupe_key),
+        title: gap.title.to_string(),
+        summary: gap.summary.to_string(),
+        target_service: Some(gap.target_service.to_string()),
+        delivery_stage: Some(DeliveryStage::Development),
+        validated_stages: Vec::new(),
+        rollout_strategy: Some(RolloutStrategy::default_for_stage(
+            DeliveryStage::Development,
+        )),
+        status: Some(WorkStatus::Planned),
+        priority: Some(gap.priority),
+        progress_pct: Some(0),
+        admin_override: false,
+        execution_approved: false,
+        verification_required: Some(true),
+        tags,
+        plan,
+        depends_on: dependencies,
+        source: Some("formal_gap_catalogue".to_string()),
+        scheduled_for: None,
+    });
+    repository.upsert_work_item(&item).await
 }
 
 async fn upsert_recommendation(
@@ -478,6 +571,33 @@ mod tests {
             repo_visibility.depends_on,
             vec!["stabilize:gail".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn formal_gap_catalogue_is_persisted_once_and_reconciled() {
+        let repository = crate::storage::memory::MemoryRepository::new();
+        for gap in KNOWN_GAPS {
+            upsert_catalogue_gap(&repository, gap)
+                .await
+                .expect("initial gap upsert");
+        }
+        for gap in KNOWN_GAPS {
+            upsert_catalogue_gap(&repository, gap)
+                .await
+                .expect("repeat gap reconciliation");
+        }
+        let items = repository.list_work_items().await.expect("work items");
+        assert_eq!(items.len(), KNOWN_GAPS.len());
+        assert!(
+            items
+                .iter()
+                .all(|item| item.source == "formal_gap_catalogue")
+        );
+        assert!(items.iter().all(|item| {
+            item.dedupe_key
+                .as_deref()
+                .is_some_and(|key| key.starts_with("formal-gap:"))
+        }));
     }
 
     #[test]

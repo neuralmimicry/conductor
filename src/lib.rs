@@ -6,6 +6,7 @@ pub mod discovery;
 pub mod error;
 pub mod executor;
 pub mod findings;
+pub mod improvement_catalog;
 pub mod integrations;
 pub mod metrics;
 pub mod models;
