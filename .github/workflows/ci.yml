@@ -13,11 +13,15 @@ env:
 jobs:
   rust:
     name: Rust (${{ matrix.runner_arch }})
-    runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
       fail-fast: false
       matrix:
-        runner_arch: [X64, ARM64]
+        include:
+          - runner_arch: X64
+            runs_on: '["self-hosted", "Linux", "X64"]'
+          - runner_arch: ARM64
+            runs_on: '["ubuntu-24.04-arm"]'
     steps:
       - name: Checkout
         uses: actions/checkout@v4

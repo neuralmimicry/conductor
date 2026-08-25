@@ -117,15 +117,17 @@ jobs:
   build-deb:
     name: Build ${{ matrix.runner_arch }} Debian package
     needs: version
-    runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner_arch: X64
             deb_arch: amd64
+            runs_on: '["self-hosted", "Linux", "X64"]'
           - runner_arch: ARM64
             deb_arch: arm64
+            runs_on: '["ubuntu-24.04-arm"]'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -236,7 +238,7 @@ jobs:
     needs:
       - version
       - github-release
-    runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
     permissions:
       contents: read
       packages: write
@@ -247,9 +249,11 @@ jobs:
           - arch: amd64
             runner_arch: X64
             target_page_size: 4k
+            runs_on: '["self-hosted", "Linux", "X64"]'
           - arch: arm64
             runner_arch: ARM64
             target_page_size: 4k
+            runs_on: '["ubuntu-24.04-arm"]'
     env:
       IMAGE_REPO: ghcr.io/${{ github.repository }}
       IMAGE_VERSION: ${{ needs.version.outputs.app_version }}
@@ -264,10 +268,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          command -v podman >/dev/null 2>&1 || {
-            echo "Podman is required on the self-hosted runner" >&2
-            exit 1
-          }
+          if ! command -v podman >/dev/null 2>&1; then
+            if command -v sudo >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends podman
+            else
+              echo "Podman is required on the image-build runner" >&2
+              exit 1
+            fi
+          fi
+          podman --version
           podman_runtime_dir="${RUNNER_TEMP}/podman-runtime"
           mkdir -p "${podman_runtime_dir}"
           chmod 700 "${podman_runtime_dir}"
@@ -292,7 +302,11 @@ jobs:
           image_ref="${IMAGE_REPO}:${IMAGE_VERSION}-${ARCH}"
           iid_file="$(mktemp)"
           trap 'rm -f "${iid_file}"' EXIT
-          podman --cgroup-manager=cgroupfs build \
+          podman_build_runtime_args=(--cgroup-manager=cgroupfs)
+          if [[ "${ARCH}" == "arm64" ]] && command -v runc >/dev/null 2>&1; then
+            podman_build_runtime_args+=(--runtime "$(command -v runc)")
+          fi
+          podman "${podman_build_runtime_args[@]}" build \
             --pull \
             --build-arg "CONDUCTOR_VERSION=source" \
             --build-arg "TARGET_PAGE_SIZE=${PAGE_SIZE}" \
