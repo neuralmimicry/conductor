@@ -335,6 +335,25 @@ jobs:
       GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
       GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
     steps:
+      - name: Prepare rootless Podman
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v podman >/dev/null 2>&1; then
+            echo "Podman is required on the manifest runner" >&2
+            exit 1
+          fi
+          podman --version
+          # Keep the manifest job's rootless Podman state isolated from a
+          # runner-wide user session.  Reusing /run/user/<uid> after the
+          # architecture builds can leave Podman trying to re-enter a stale
+          # user namespace (exit 125: cannot re-exec process to join the
+          # existing user namespace).
+          podman_runtime_dir="${RUNNER_TEMP}/podman-runtime"
+          mkdir -p "${podman_runtime_dir}"
+          chmod 700 "${podman_runtime_dir}"
+          echo "XDG_RUNTIME_DIR=${podman_runtime_dir}" >>"${GITHUB_ENV}"
+
       - name: Log in to GHCR
         shell: bash
         run: |
