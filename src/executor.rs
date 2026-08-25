@@ -461,6 +461,16 @@ async fn dispatch_claimed_work_item_inner(
             .await;
         }
     };
+    if let Err(error) = validate_refiner_plan_response(&plan_response) {
+        return finalize_execution_failure(
+            repository,
+            item,
+            &mut execution,
+            event_callback,
+            format!("Refiner returned a low-quality execution plan: {error}"),
+        )
+        .await;
+    }
     emit_execution_event(
         event_callback,
         "execution.planning_submitted",
@@ -1052,7 +1062,7 @@ fn build_refiner_prompt(
             .join(", ")
     };
     format!(
-        "Work item: {title}\nTarget: {target}\nDelivery stage: {delivery_stage}\nValidated stages: {validated_stages}\nRollout strategy: {rollout_strategy}\nSummary: {summary}\nPlan JSON: {plan}\nRepository context: {repo}{rollout_context}\nConstraints: keep changes scoped, resilient, and secure; avoid destructive commands; leave unrelated files untouched; do not bypass staged delivery gates.\nRequired verification: {verification}\nProduce a project-solver plan and job payload that implements the change with explicit verification and stage-aware rollout notes.",
+        "Work item: {title}\nTarget: {target}\nDelivery stage: {delivery_stage}\nValidated stages: {validated_stages}\nRollout strategy: {rollout_strategy}\nSummary: {summary}\nPlan JSON: {plan}\nRepository context: {repo}{rollout_context}\n\nExecution method: inspect the current repository/runtime/job state first; state observed evidence and uncertainty; then choose the smallest safe operation. The operation may be a code change, an Ansible/job update, a progress-monitoring action, or a deliberate no-change decision when evidence is insufficient. Do not infer success from a healthy process alone.\n\nRequired plan sections: evidence and hypothesis, affected files/services/jobs, ordered implementation or operational steps, tests and live checks, rollback/recovery, and the acceptance signal that proves the gap is closed. Keep changes scoped, resilient, and secure; avoid destructive commands; leave unrelated files untouched; do not bypass staged delivery gates.\nRequired verification: {verification}\nReturn a structured project-solver plan. Include non-empty `summary` and `steps` (or a non-empty `requirements_text`), and a `job_payload` object only when it is valid. Never return prose-only, empty, or schema-echo output.",
         title = work_item.title,
         target = service_name,
         delivery_stage = work_item.delivery_stage.as_str(),
@@ -1064,6 +1074,48 @@ fn build_refiner_prompt(
         rollout_context = rollout_context,
         verification = verification,
     )
+}
+
+fn validate_refiner_plan_response(response: &Value) -> Result<()> {
+    let object = response
+        .as_object()
+        .ok_or_else(|| anyhow!("response must be a JSON object"))?;
+    if let Some(job_payload) = object.get("job_payload")
+        && !job_payload.is_object()
+    {
+        return Err(anyhow!("job_payload must be a JSON object"));
+    }
+
+    let has_summary = object
+        .get("summary")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_steps = object
+        .get("steps")
+        .and_then(Value::as_array)
+        .is_some_and(|steps| {
+            !steps.is_empty()
+                && steps.iter().all(|step| match step {
+                    Value::String(value) => !value.trim().is_empty(),
+                    Value::Object(value) => ["title", "action", "description"].iter().any(|key| {
+                        value
+                            .get(*key)
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.trim().is_empty())
+                    }),
+                    _ => false,
+                })
+        });
+    let has_requirements = object
+        .get("requirements_text")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    if !(has_requirements || (has_summary && has_steps)) {
+        return Err(anyhow!(
+            "response needs non-empty requirements_text or summary plus ordered steps"
+        ));
+    }
+    Ok(())
 }
 
 fn build_job_payload(
@@ -1194,7 +1246,7 @@ fn requirements_text(
         String::new()
     };
     format!(
-        "Overview: Improve {target} through the Conductor execution loop.\n\nDelivery Context:\n- Current stage: {delivery_stage}\n- Validated stages: {validated_stages}\n- Rollout strategy: {rollout_strategy}\n\nRequirements Register:\n- REQ-001: Implement the scoped change described in the work item.\n- REQ-002: Preserve secure, resilient behaviour and avoid destructive commands.\n- REQ-003: Update or add tests covering the changed path.\n- REQ-004: Run verification commands and report the outcome.\n- REQ-005: Leave unrelated files untouched.\n- REQ-006: Preserve staged progression and rollout governance metadata.{rollout_requirement}\n\nWork Item Summary:\n{summary}\n\nPlan JSON:\n{plan}",
+        "Overview: Improve {target} through the Conductor execution loop.\n\nDelivery Context:\n- Current stage: {delivery_stage}\n- Validated stages: {validated_stages}\n- Rollout strategy: {rollout_strategy}\n\nRequirements Register:\n- REQ-001: Inspect and record current repository, runtime, or job evidence before selecting an operation.\n- REQ-002: Implement only the scoped change, job update, or progress-monitoring action supported by that evidence.\n- REQ-003: Preserve secure, resilient behaviour and avoid destructive commands.\n- REQ-004: Update or add tests covering the changed path, or provide the relevant live operational check.\n- REQ-005: Run verification commands and report the outcome.\n- REQ-006: Leave unrelated files untouched.\n- REQ-007: Record rollback/recovery steps and the acceptance signal proving the gap is closed.\n- REQ-008: Preserve staged progression and rollout governance metadata.{rollout_requirement}\n\nWork Item Summary:\n{summary}\n\nPlan JSON:\n{plan}",
         target = target,
         delivery_stage = work_item.delivery_stage.as_str(),
         validated_stages = if work_item.validated_stages.is_empty() {
@@ -1874,6 +1926,34 @@ mod tests {
                 .get("solver_command_policy_mode")
                 .and_then(Value::as_str),
             Some("strict")
+        );
+    }
+
+    #[test]
+    fn refiner_plan_quality_gate_accepts_structured_plan() {
+        validate_refiner_plan_response(&json!({
+            "summary": "Inspect and repair the readiness gate",
+            "steps": ["Inspect the current probe", "Add a focused test"],
+            "job_payload": {"project_iterations": 2}
+        }))
+        .expect("structured plan");
+        validate_refiner_plan_response(&json!({
+            "summary": "Inspect and repair the readiness gate",
+            "steps": [{"action": "Inspect the current probe"}],
+        }))
+        .expect("object-step plan");
+    }
+
+    #[test]
+    fn refiner_plan_quality_gate_rejects_empty_or_malformed_plan() {
+        assert!(validate_refiner_plan_response(&json!({})).is_err());
+        assert!(
+            validate_refiner_plan_response(&json!({
+                "summary": "plan",
+                "steps": ["inspect"],
+                "job_payload": []
+            }))
+            .is_err()
         );
     }
 
