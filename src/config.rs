@@ -198,6 +198,15 @@ pub struct PlanningConfig {
     pub auto_queue: bool,
     pub gail_workflow: String,
     pub minimum_priority: i32,
+    /// Maximum serialized estate context sent to Gail's planning model.
+    /// Keeping this below the provider context window leaves room for the
+    /// planner instructions and structured response.
+    pub max_prompt_chars: usize,
+    /// Maximum number of repository, finding, and trend records included in
+    /// the advisory context. The planner still persists the complete estate.
+    pub max_repositories: usize,
+    pub max_findings: usize,
+    pub max_trends: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -445,6 +454,10 @@ impl Default for PlanningConfig {
             auto_queue: true,
             gail_workflow: "conductor_improvement_planner".to_string(),
             minimum_priority: 40,
+            max_prompt_chars: 12_000,
+            max_repositories: 24,
+            max_findings: 24,
+            max_trends: 24,
         }
     }
 }
@@ -637,6 +650,10 @@ impl ConductorConfig {
         if self.planning.gail_workflow.trim().is_empty() {
             self.planning.gail_workflow = "conductor_improvement_planner".to_string();
         }
+        self.planning.max_prompt_chars = self.planning.max_prompt_chars.clamp(4_096, 65_536);
+        self.planning.max_repositories = self.planning.max_repositories.clamp(4, 100);
+        self.planning.max_findings = self.planning.max_findings.clamp(4, 100);
+        self.planning.max_trends = self.planning.max_trends.clamp(4, 100);
         if self.execution.refiner_workflow.trim().is_empty() {
             self.execution.refiner_workflow = "project_solver".to_string();
         }

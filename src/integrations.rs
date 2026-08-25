@@ -1376,7 +1376,8 @@ pub async fn gail_plan_summary(
         return Ok(None);
     };
     let prompt = format!(
-        "Return only valid JSON with this shape: {{\"actions\":[{{\"title\":\"...\",\"reason\":\"...\"}}]}}. Include the three highest-leverage reliability, performance, and self-improvement actions for this topology. Keep each title and reason concise. Topology summary: {}",
+        "Return only valid JSON with this shape: {{\"actions\":[{{\"title\":\"...\",\"reason\":\"...\"}}]}}. Include at most three highest-leverage actions. Use only the supplied typed findings, recommendation summaries, and runtime evidence; do not invent incidents, files, or metrics. Prefer one concrete next action per finding, mention uncertainty when evidence is incomplete, and return an empty actions array when no evidence supports an action. Keep each title and reason concise. Bounded topology context ({} characters): {}",
+        topology_summary.to_string().len(),
         topology_summary
     );
     let completion_prompt = prompt.clone();
@@ -1398,8 +1399,9 @@ pub async fn gail_plan_summary(
                     "include_configured": true,
                     "selection_mode": "best",
                     "max_candidates": 3,
-                    "max_tokens": 512,
+                    "max_tokens": 384,
                     "temperature": 0.0,
+                    "reasoning_effort": "medium",
                     "timeout_seconds": config.integrations.gail.timeout_seconds.max(30),
                     "request_category": "planner_json"
                 }),

@@ -8,8 +8,9 @@ use crate::{
     improvement_catalog::{ImprovementGap, KNOWN_GAPS},
     integrations::gail_plan_summary,
     models::{
-        DeliveryStage, ImprovementCycle, NewWorkItem, RolloutStrategy, RunStatus, WorkItem,
-        WorkStatus, now_utc,
+        DeliveryStage, FindingSeverity, ImprovementCycle, NewWorkItem, RepositorySnapshot,
+        RolloutStrategy, RunStatus, ServiceSnapshot, ServiceTrendSummary, WorkItem, WorkStatus,
+        now_utc,
     },
     repository::ConductorRepository,
     trends::summarize_trends,
@@ -81,43 +82,14 @@ pub async fn run_planning_cycle(
         }
     }
 
-    let topology_summary = json!({
-        "services": services.iter().map(|service| json!({
-            "service_key": service.service_key,
-            "health": service.health.as_str(),
-            "dependencies": service.dependencies,
-            "capabilities": service.capabilities,
-            // Service probes can contain full Prometheus payloads, logs, or
-            // large API responses. They are useful for discovery persistence,
-            // but must not be copied verbatim into the planner prompt.
-            "probe": compact_prompt_value(&service.probe, 0),
-        })).collect::<Vec<_>>(),
-        "repositories": repositories.iter().map(|repository| json!({
-            "repo_key": repository.repo_key,
-            "linked_services": repository.linked_services,
-            "criticality": repository.criticality,
-            "capabilities": repository.capabilities,
-            "archived": repository.archived,
-        })).collect::<Vec<_>>(),
-        "findings": findings.iter().map(|finding| json!({
-            "finding_key": finding.finding_key,
-            "category": finding.category,
-            "severity": finding.severity.as_str(),
-            "target_service": finding.target_service,
-            "target_repository": finding.target_repository,
-            "confidence_score": finding.confidence_score,
-        })).collect::<Vec<_>>(),
-        "trends": trends.iter().map(|trend| json!({
-            "service_key": trend.service_key,
-            "direction": trend.direction,
-            "sample_count": trend.sample_count,
-            "headline": trend.headline,
-            "metrics": trend.metrics,
-        })).collect::<Vec<_>>(),
-        "finding_count": findings.len(),
-        "recommendation_count": recommendations.len(),
-        "catalogue_gap_count": KNOWN_GAPS.len(),
-    });
+    let topology_summary = build_planner_context(
+        &services,
+        &repositories,
+        &detected_findings,
+        recommendations.len(),
+        &trends,
+        config,
+    );
 
     let gail_base_url = services
         .iter()
@@ -166,6 +138,200 @@ pub async fn run_planning_cycle(
 
     repository.insert_improvement_cycle(&cycle).await?;
     Ok(cycle)
+}
+
+/// Build a bounded, evidence-first view for Gail. The complete snapshots stay
+/// in Postgres for the dashboard and audit trail; a small local model receives
+/// only the records it can usefully reason over. Findings retain their
+/// recommendation and evidence summaries so Gail does not have to infer the
+/// actual action from opaque IDs alone.
+fn build_planner_context(
+    services: &[ServiceSnapshot],
+    repositories: &[RepositorySnapshot],
+    detected_findings: &[DetectedFinding],
+    recommendation_count: usize,
+    trends: &[ServiceTrendSummary],
+    config: &crate::config::ConductorConfig,
+) -> Value {
+    let mut relevant_repositories = repositories
+        .iter()
+        .filter(|repository| {
+            !repository.linked_services.is_empty()
+                || matches!(repository.criticality.as_str(), "critical" | "high")
+                || matches!(
+                    repository.repo_key.as_str(),
+                    "conductor" | "swarmhpc" | "gail"
+                )
+        })
+        .collect::<Vec<_>>();
+    relevant_repositories.sort_by(|left, right| {
+        repository_rank(right)
+            .cmp(&repository_rank(left))
+            .then_with(|| left.repo_key.cmp(&right.repo_key))
+    });
+
+    let mut ordered_findings = detected_findings.iter().collect::<Vec<_>>();
+    ordered_findings.sort_by(|left, right| {
+        severity_rank(right.finding.severity)
+            .cmp(&severity_rank(left.finding.severity))
+            .then_with(|| {
+                right
+                    .finding
+                    .confidence_score
+                    .partial_cmp(&left.finding.confidence_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.finding.finding_key.cmp(&right.finding.finding_key))
+    });
+
+    let context = json!({
+        "services": services.iter().map(|service| json!({
+            "service_key": service.service_key,
+            "health": service.health.as_str(),
+            "dependencies": service.dependencies,
+            "capabilities": service.capabilities,
+            // Probes can contain Prometheus payloads or logs. Preserve a
+            // shape/sample only; the typed finding evidence is authoritative.
+            "probe": compact_prompt_value(&service.probe, 0),
+        })).collect::<Vec<_>>(),
+        "repositories": relevant_repositories
+            .into_iter()
+            .take(config.planning.max_repositories)
+            .map(|repository| json!({
+                "repo_key": repository.repo_key,
+                "linked_services": repository.linked_services,
+                "criticality": repository.criticality,
+                "capabilities": repository.capabilities,
+                "archived": repository.archived,
+            }))
+            .collect::<Vec<_>>(),
+        "findings": ordered_findings
+            .into_iter()
+            .take(config.planning.max_findings)
+            .map(|item| json!({
+                "finding_key": item.finding.finding_key,
+                "title": planner_text(&item.finding.title),
+                "summary": planner_text(&item.finding.summary),
+                "category": item.finding.category,
+                "severity": item.finding.severity.as_str(),
+                "target_service": item.finding.target_service,
+                "target_repository": item.finding.target_repository,
+                "confidence_score": item.finding.confidence_score,
+                "recommendation": {
+                    "title": planner_text(&item.recommendation.title),
+                    "summary": planner_text(&item.recommendation.summary),
+                    "priority": item.recommendation.priority,
+                    "depends_on": item.recommendation.depends_on,
+                },
+                "evidence": item.evidence.iter().take(3).map(|evidence| json!({
+                    "type": evidence.evidence_type,
+                    "source": evidence.source_ref,
+                    "summary": planner_text(&evidence.summary),
+                })).collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
+        "trends": trends.iter().take(config.planning.max_trends).map(|trend| json!({
+            "service_key": trend.service_key,
+            "direction": trend.direction,
+            "sample_count": trend.sample_count,
+            "headline": planner_text(&trend.headline),
+            "metrics": trend
+                .metrics
+                .iter()
+                .take(8)
+                .map(|metric| json!({
+                    "name": metric.metric_name,
+                    "latest": metric.latest,
+                    "average": metric.average,
+                    "slope": metric.slope,
+                    "direction": metric.direction,
+                }))
+                .collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "finding_count": detected_findings.len(),
+        "recommendation_count": recommendation_count,
+        "catalogue_gap_count": KNOWN_GAPS.len(),
+    });
+
+    fit_planner_context(context, config.planning.max_prompt_chars)
+}
+
+fn planner_text(text: &str) -> String {
+    const MAX_CHARS: usize = 320;
+    let truncated = text.chars().take(MAX_CHARS).collect::<String>();
+    if text.chars().count() > MAX_CHARS {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+fn repository_rank(repository: &RepositorySnapshot) -> u8 {
+    if repository.criticality == "critical" {
+        3
+    } else if repository.criticality == "high" {
+        2
+    } else if !repository.linked_services.is_empty() {
+        1
+    } else {
+        0
+    }
+}
+
+fn severity_rank(severity: FindingSeverity) -> u8 {
+    match severity {
+        FindingSeverity::Critical => 5,
+        FindingSeverity::High => 4,
+        FindingSeverity::Medium => 3,
+        FindingSeverity::Low => 2,
+        FindingSeverity::Info => 1,
+    }
+}
+
+/// Reduce optional breadth until the serialized JSON fits the configured
+/// budget. This is deliberately deterministic: the most important findings
+/// survive, while low-value repository/trend breadth is removed first.
+fn fit_planner_context(mut context: Value, max_chars: usize) -> Value {
+    let serialized_len = |value: &Value| {
+        serde_json::to_string(value)
+            .map(|text| text.len())
+            .unwrap_or(usize::MAX)
+    };
+    if serialized_len(&context) <= max_chars {
+        return context;
+    }
+
+    if let Some(services) = context.get_mut("services").and_then(Value::as_array_mut) {
+        for service in services {
+            if let Some(object) = service.as_object_mut() {
+                object.remove("probe");
+            }
+        }
+    }
+
+    for key in ["repositories", "trends", "services", "findings"] {
+        loop {
+            if serialized_len(&context) <= max_chars {
+                return context;
+            }
+            let removed = context
+                .get_mut(key)
+                .and_then(Value::as_array_mut)
+                .and_then(|items| if items.len() > 1 { items.pop() } else { None });
+            if removed.is_none() {
+                break;
+            }
+        }
+    }
+
+    // A very small configured budget should still produce valid, explainable
+    // JSON rather than slicing a JSON string in the middle of a token.
+    json!({
+        "services": context.get("services").cloned().unwrap_or_else(|| json!([])),
+        "findings": context.get("findings").cloned().unwrap_or_else(|| json!([])),
+        "finding_count": context.get("finding_count").cloned().unwrap_or_else(|| json!(0)),
+        "catalogue_gap_count": context.get("catalogue_gap_count").cloned().unwrap_or_else(|| json!(0)),
+    })
 }
 
 /// Keep planner context bounded even when a service probe contains an
@@ -645,6 +811,40 @@ mod tests {
                 .iter()
                 .any(|item| item.dedupe_key == "tracey:worsening_trend")
         );
+    }
+
+    #[test]
+    fn planner_context_budget_is_valid_json_and_preserves_findings() {
+        let context = json!({
+            "services": (0..20)
+                .map(|index| json!({
+                    "service_key": format!("service-{index}"),
+                    "health": "healthy",
+                    "probe": {"logs": "x".repeat(1000)},
+                }))
+                .collect::<Vec<_>>(),
+            "repositories": (0..20)
+                .map(|index| json!({
+                    "repo_key": format!("repo-{index}"),
+                    "criticality": "medium",
+                }))
+                .collect::<Vec<_>>(),
+            "findings": [{
+                "finding_key": "service_health:gail",
+                "severity": "critical",
+                "summary": "Gail is unavailable",
+            }],
+            "trends": (0..20)
+                .map(|index| json!({"service_key": format!("service-{index}"), "headline": "trend"}))
+                .collect::<Vec<_>>(),
+            "finding_count": 1,
+            "catalogue_gap_count": 10,
+        });
+
+        let bounded = fit_planner_context(context, 4_096);
+        let serialized = serde_json::to_string(&bounded).expect("valid planner JSON");
+        assert!(serialized.len() <= 4_096);
+        assert_eq!(bounded["findings"][0]["finding_key"], "service_health:gail");
     }
 
     #[tokio::test]

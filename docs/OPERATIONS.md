@@ -45,6 +45,13 @@ Important discovery controls in `config/conductor.yaml`:
 - `discovery.github.owner`: GitHub organisation or user to inventory.
 - `discovery.github.token`: optional PAT used for authenticated inventory and higher rate limits.
 
+Important planning controls:
+
+- `planning.max_prompt_chars`: upper bound for the serialized advisory context sent to Gail (default `12000`).
+- `planning.max_repositories`, `planning.max_findings`, and `planning.max_trends`: breadth limits for the advisory view. Conductor still persists complete discovery and finding data.
+
+Planner context is evidence-first: critical/high or service-linked repositories are preferred, findings include their recommendation and evidence summaries, and oversized context is reduced deterministically without slicing invalid JSON. Gail remains an advisory source; Conductor's typed findings, policy gates, validation, and execution records remain authoritative.
+
 Important execution controls in `config/conductor.yaml`:
 
 - `execution.dry_run`: prevents automatic Refiner submission and allows manual preview payload generation.

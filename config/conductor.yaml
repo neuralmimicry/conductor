@@ -125,6 +125,10 @@ planning:
   auto_queue: true
   gail_workflow: "conductor_improvement_planner"
   minimum_priority: 40
+  max_prompt_chars: 12000
+  max_repositories: 24
+  max_findings: 24
+  max_trends: 24
 
 execution:
   enabled: true
