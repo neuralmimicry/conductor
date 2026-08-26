@@ -824,6 +824,11 @@ pub struct PolicyEvaluation {
     pub required_previous_stage: Option<DeliveryStage>,
     pub rollout_strategy: RolloutStrategy,
     pub protected_targets: Vec<String>,
+    /// Targets that require the non-bypassable safety transaction.  This is
+    /// broader than the configured protected-service list: an existing repo
+    /// owned by the configured GitHub organisation is sensitive even when its
+    /// service snapshot was discovered under a different name.
+    pub sensitive_targets: Vec<String>,
     pub external_repos: Vec<String>,
     pub required_verifications: Vec<String>,
     pub reasons: Vec<String>,
@@ -1178,6 +1183,9 @@ pub struct PolicySummary {
     pub allow_external_repo_execution: bool,
     pub require_successful_github_actions_for_production: bool,
     pub github_actions_workflow_file: String,
+    pub safety_enabled: bool,
+    pub safety_health_check_window_seconds: u64,
+    pub safety_max_rollback_attempts: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

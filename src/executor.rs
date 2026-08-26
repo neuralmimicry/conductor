@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::Duration as ChronoDuration;
@@ -11,13 +14,14 @@ use crate::{
     config::ConductorConfig,
     integrations::{
         GitHubActionsEvidence, build_http_client, fetch_latest_github_actions_evidence,
-        github_repository_coordinate,
+        github_repository_coordinate, probe_service,
     },
     models::{
         ConductorEvent, DeliveryStage, ExecutionStatus, PolicyVerdict, RepositorySnapshot,
-        RolloutStrategy, ServiceSnapshot, WorkExecution, WorkItem, WorkItemPatch, WorkStatus,
+        RolloutStrategy, ServiceHealth, ServiceSnapshot, WorkExecution, WorkItem, WorkItemPatch,
+        WorkStatus,
     },
-    policy::{evaluate_work_item, policy_evaluation_to_value},
+    policy::{apply_repository_safety_policy, evaluate_work_item, policy_evaluation_to_value},
     repository::ConductorRepository,
     validation::{failure_reasons, preview_independent_validation, run_independent_validation},
 };
@@ -321,6 +325,14 @@ async fn dispatch_claimed_work_item_inner(
     // push the requested change to its owning repository.
     let repositories = repository.list_repository_snapshots().await?;
     let mut policy = evaluate_work_item(config, item, target_service);
+    apply_repository_safety_policy(config, item, target_service, &repositories, &mut policy);
+    let safety_contract = safety_contract(config, &policy, item);
+    let safety_baseline = if policy.sensitive_targets.is_empty() {
+        json!({"required": false})
+    } else {
+        capture_safety_probe(config, target_service).await
+    };
+    apply_safety_baseline_gate(&mut policy, &safety_baseline);
     let github_actions =
         production_github_actions_evidence(config, item, target_service, &repositories).await;
     apply_github_actions_gate(&mut policy, github_actions.as_ref());
@@ -332,6 +344,12 @@ async fn dispatch_claimed_work_item_inner(
         item.rollout_strategy,
     );
     execution.policy = policy_value_with_github_actions(&policy, github_actions.as_ref());
+    execution.latest_payload = json!({
+        "safety": {
+            "contract": safety_contract.clone(),
+            "baseline": safety_baseline.clone(),
+        }
+    });
     item.touch_execution(execution.id, execution.policy.clone());
 
     if !matches!(policy.verdict, PolicyVerdict::Allowed) {
@@ -476,7 +494,7 @@ async fn dispatch_claimed_work_item_inner(
         )
         .await;
     }
-    let job_payload =
+    let mut job_payload =
         match build_job_payload(config, item, target_service, &repositories, &plan_response) {
             Ok(payload) => payload,
             Err(error) => {
@@ -490,6 +508,21 @@ async fn dispatch_claimed_work_item_inner(
                 .await;
             }
         };
+    if let Some(object) = job_payload.as_object_mut() {
+        object.insert("protected_rollout".to_string(), safety_contract.clone());
+        if !policy.sensitive_targets.is_empty() {
+            let requirements = object
+                .get("requirements_text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            object.insert(
+                "requirements_text".to_string(),
+                json!(format!(
+                    "{requirements}\n\nProtected rollout contract (mandatory): capture a fresh readiness baseline before any change; use the selected canary or red_green strategy; verify health throughout the post-rollout window; if health or verification degrades, automatically revert the exact produced commit without rewriting history, rerun tests and GitHub Actions, and verify recovery."
+                )),
+            );
+        }
+    }
     execution.request_payload = job_payload.clone();
     execution.latest_payload = json!({"plan_response": plan_response});
     repository.upsert_work_execution(&execution).await?;
@@ -681,10 +714,133 @@ async fn dispatch_claimed_work_item_inner(
         serde_json::to_value(&independent_validation).unwrap_or_else(|_| json!({})),
     );
 
-    let verification_passed = verification
+    let mut safety_post_rollout = json!({"required": false});
+    let mut rollback = json!({"attempted": false});
+    let refiner_completed = terminal
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status.eq_ignore_ascii_case("completed"));
+    if !policy.sensitive_targets.is_empty() && refiner_completed {
+        safety_post_rollout = run_safety_health_window(config, target_service).await;
+        if let Some(object) = verification.as_object_mut() {
+            object.insert(
+                "post_rollout_health".to_string(),
+                safety_post_rollout.clone(),
+            );
+        }
+    }
+    if !policy.sensitive_targets.is_empty() {
+        let rollout_evidence =
+            protected_rollout_evidence(item, &execution.request_payload, &terminal);
+        if let Some(object) = verification.as_object_mut() {
+            object.insert("rollout_evidence".to_string(), rollout_evidence.clone());
+        }
+        if rollout_evidence.get("passed").and_then(Value::as_bool) == Some(false) {
+            if let Some(object) = verification.as_object_mut() {
+                object.insert("passed".to_string(), json!(false));
+                object
+                    .entry("reasons".to_string())
+                    .or_insert_with(|| json!([]));
+                if let Some(reasons) = object.get_mut("reasons").and_then(Value::as_array_mut) {
+                    reasons.push(json!(
+                        "protected-target deployment lacks successful staged rollout evidence"
+                    ));
+                }
+            }
+        }
+    }
+    let mut verification_passed = verification
         .get("passed")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    if policy.sensitive_targets.len() > 0
+        && safety_post_rollout.get("passed").and_then(Value::as_bool) == Some(false)
+    {
+        verification_passed = false;
+        if let Some(object) = verification.as_object_mut() {
+            object.insert("passed".to_string(), json!(false));
+            object
+                .entry("reasons".to_string())
+                .or_insert_with(|| json!([]));
+            if let Some(reasons) = object.get_mut("reasons").and_then(Value::as_array_mut) {
+                reasons.push(json!("protected-target post-rollout health degraded"));
+            }
+        }
+    }
+    if !verification_passed && !policy.sensitive_targets.is_empty() {
+        if let Some(commit_sha) = extract_commit_sha(&terminal) {
+            rollback = automatic_rollback(
+                &client,
+                config,
+                &refiner_base_url,
+                item,
+                &execution,
+                target_service,
+                &terminal,
+                &commit_sha,
+                &safety_post_rollout,
+            )
+            .await;
+            if rollback.get("succeeded").and_then(Value::as_bool) != Some(true) {
+                verification_passed = false;
+            }
+        } else if let Some(object) = verification.as_object_mut() {
+            object
+                .entry("reasons".to_string())
+                .or_insert_with(|| json!([]));
+            if let Some(reasons) = object.get_mut("reasons").and_then(Value::as_array_mut) {
+                reasons.push(json!(
+                    "protected target failed without a rollback commit identity"
+                ));
+            }
+        }
+    }
+    if let Some(object) = verification.as_object_mut() {
+        object.insert("rollback".to_string(), rollback.clone());
+    }
+    execution.latest_payload = json!({
+        "terminal": terminal,
+        "independent_validation": serde_json::to_value(&independent_validation)
+            .unwrap_or_else(|_| json!({})),
+        "safety": {
+            "contract": safety_contract,
+            "baseline": safety_baseline,
+            "post_rollout": safety_post_rollout,
+            "rollback": rollback,
+        }
+    });
+    execution.verification = verification.clone();
+    repository.upsert_work_execution(&execution).await?;
+    repository.upsert_work_item(item).await?;
+    if rollback.get("attempted").and_then(Value::as_bool) == Some(true) {
+        item.notes.push(format!(
+            "{} automatic protected-target rollback {}",
+            crate::models::now_utc().to_rfc3339(),
+            if rollback.get("succeeded").and_then(Value::as_bool) == Some(true) {
+                "succeeded"
+            } else {
+                "failed"
+            }
+        ));
+        emit_execution_event(
+            event_callback,
+            "execution.rollback",
+            format!(
+                "automatic rollback evaluated for Refiner job {}",
+                refiner_job_id
+            ),
+            Some(item),
+            Some(&execution),
+            Some(
+                if rollback.get("succeeded").and_then(Value::as_bool) == Some(true) {
+                    "success"
+                } else {
+                    "failure"
+                },
+            ),
+            rollback.clone(),
+        );
+    }
     if verification_passed {
         execution.mark_status(ExecutionStatus::Success);
         item.mark_stage_validated(current_stage);
@@ -809,6 +965,410 @@ async fn dispatch_claimed_work_item_inner(
     Ok(execution)
 }
 
+fn safety_contract(
+    config: &ConductorConfig,
+    policy: &crate::models::PolicyEvaluation,
+    item: &WorkItem,
+) -> Value {
+    json!({
+        "required": !policy.sensitive_targets.is_empty(),
+        "targets": policy.sensitive_targets,
+        "delivery_stage": item.delivery_stage.as_str(),
+        "rollout_strategy": item.rollout_strategy.as_str(),
+        "health_check_window_seconds": config.safety.health_check_window_seconds,
+        "health_check_interval_seconds": config.safety.health_check_interval_seconds,
+        "rollback": {
+            "automatic": true,
+            "max_attempts": config.safety.max_rollback_attempts,
+            "trigger_conditions": [
+                "post-rollout readiness degradation",
+                "verification failure after a produced commit",
+                "missing or failed protected-target health window"
+            ],
+            "procedure": "refiner_revert_exact_commit_and_verify"
+        }
+    })
+}
+
+async fn capture_safety_probe(
+    config: &ConductorConfig,
+    service: Option<&ServiceSnapshot>,
+) -> Value {
+    let Some(service) = service else {
+        return json!({
+            "passed": false,
+            "status": "missing",
+            "reason": "service snapshot is unavailable"
+        });
+    };
+    let started = Instant::now();
+    let timeout = config.safety.health_check_timeout_seconds.max(1);
+    let client = match build_http_client(timeout) {
+        Ok(client) => client,
+        Err(error) => {
+            return json!({
+                "passed": false,
+                "status": "client_error",
+                "reason": error.to_string(),
+                "service": service.service_key,
+            });
+        }
+    };
+    match probe_service(&client, config, service).await {
+        Ok(probe) => {
+            let passed =
+                probe.health == ServiceHealth::Healthy && health_payload_is_healthy(&probe.metrics);
+            json!({
+                "passed": passed,
+                "status": if passed { "healthy" } else { "degraded" },
+                "service": service.service_key,
+                "endpoint": probe.endpoint,
+                "summary": probe.summary,
+                "health": probe.health.as_str(),
+                "metrics": probe.metrics,
+                "latency_ms": started.elapsed().as_millis(),
+            })
+        }
+        Err(error) => json!({
+            "passed": false,
+            "status": "unreachable",
+            "service": service.service_key,
+            "reason": error.to_string(),
+            "latency_ms": started.elapsed().as_millis(),
+        }),
+    }
+}
+
+fn health_payload_is_healthy(metrics: &Value) -> bool {
+    let health = metrics.get("health").unwrap_or(metrics);
+    if health.get("ok").and_then(Value::as_bool) == Some(false)
+        || health.get("healthy").and_then(Value::as_bool) == Some(false)
+        || health.get("ready").and_then(Value::as_bool) == Some(false)
+    {
+        return false;
+    }
+    for key in ["status", "state"] {
+        if let Some(value) = health.get(key).and_then(Value::as_str) {
+            let value = value.to_ascii_lowercase();
+            if [
+                "failed",
+                "failure",
+                "error",
+                "unhealthy",
+                "degraded",
+                "unready",
+            ]
+            .iter()
+            .any(|candidate| value.contains(candidate))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn apply_safety_baseline_gate(policy: &mut crate::models::PolicyEvaluation, baseline: &Value) {
+    if policy.sensitive_targets.is_empty()
+        || baseline.get("passed").and_then(Value::as_bool) == Some(true)
+    {
+        return;
+    }
+    let reason = "protected target readiness baseline failed; rollout is blocked".to_string();
+    if !policy.reasons.contains(&reason) {
+        policy.reasons.push(reason);
+    }
+    policy.verdict = PolicyVerdict::Blocked;
+    policy.risk_level = "critical".to_string();
+}
+
+async fn run_safety_health_window(
+    config: &ConductorConfig,
+    service: Option<&ServiceSnapshot>,
+) -> Value {
+    let Some(service) = service else {
+        return json!({
+            "required": true,
+            "passed": false,
+            "status": "missing",
+            "reason": "service snapshot is unavailable"
+        });
+    };
+    let started = Instant::now();
+    let window = Duration::from_secs(config.safety.health_check_window_seconds.max(1));
+    let interval = Duration::from_secs(config.safety.health_check_interval_seconds.max(1));
+    let mut samples = Vec::new();
+    loop {
+        let sample = capture_safety_probe(config, Some(service)).await;
+        let passed = sample.get("passed").and_then(Value::as_bool) == Some(true);
+        samples.push(sample);
+        if !passed || started.elapsed() >= window {
+            break;
+        }
+        let remaining = window.saturating_sub(started.elapsed());
+        tokio::time::sleep(interval.min(remaining)).await;
+    }
+    let passed = samples
+        .iter()
+        .all(|sample| sample.get("passed").and_then(Value::as_bool) == Some(true));
+    json!({
+        "required": true,
+        "passed": passed,
+        "status": if passed { "healthy" } else { "degraded" },
+        "window_seconds": started.elapsed().as_secs(),
+        "sample_count": samples.len(),
+        "samples": samples,
+    })
+}
+
+fn extract_commit_sha(detail: &Value) -> Option<String> {
+    for candidate in [
+        detail.pointer("/repo_info/commit_sha"),
+        detail.pointer("/repo_info/github_actions/expected_sha"),
+        detail.pointer("/repo_info/github_actions/head_sha"),
+        detail.pointer("/vcs/commit_sha"),
+    ] {
+        let Some(value) = candidate.and_then(Value::as_str) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.len() >= 7
+            && value.len() <= 64
+            && value.chars().all(|character| character.is_ascii_hexdigit())
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn protected_rollout_evidence(item: &WorkItem, request_payload: &Value, terminal: &Value) -> Value {
+    let action_text = format!("{} {} {}", item.title, item.summary, item.plan).to_ascii_lowercase();
+    let deployment_requested = request_payload
+        .get("delivery_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || ["deploy", "rollout", "release", "restart", "upgrade"]
+            .iter()
+            .any(|keyword| action_text.contains(keyword));
+    if !deployment_requested {
+        return json!({
+            "required": false,
+            "passed": true,
+            "reason": "no deployment operation was requested"
+        });
+    }
+    let staged = terminal
+        .get("stages")
+        .and_then(Value::as_array)
+        .map(|stages| {
+            stages.iter().any(|stage| {
+                let name = stage
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                let kind = stage
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                let status = stage
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                (name.contains("deploy")
+                    || name.contains("rollout")
+                    || kind.contains("deploy")
+                    || kind.contains("rollout"))
+                    && matches!(status.as_str(), "completed" | "ok" | "success")
+            })
+        })
+        .unwrap_or(false);
+    json!({
+        "required": true,
+        "passed": staged,
+        "reason": if staged { "successful staged rollout evidence recorded" } else { "no successful staged rollout stage recorded" }
+    })
+}
+
+async fn automatic_rollback(
+    client: &Client,
+    config: &ConductorConfig,
+    base_url: &str,
+    item: &WorkItem,
+    execution: &WorkExecution,
+    service: Option<&ServiceSnapshot>,
+    terminal: &Value,
+    commit_sha: &str,
+    degraded_health: &Value,
+) -> Value {
+    let repo_url = execution
+        .request_payload
+        .get("repo_url")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let branch = execution
+        .request_payload
+        .get("work_branch")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            execution
+                .request_payload
+                .get("repo_branch")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("main");
+    if repo_url.trim().is_empty() {
+        return json!({
+            "attempted": false,
+            "succeeded": false,
+            "reason": "rollback requires repository context"
+        });
+    }
+    let owner = github_repository_coordinate(repo_url)
+        .map(|(owner, _)| owner)
+        .unwrap_or_default();
+    let requirements_text = format!(
+        "AUTOMATIC ROLLBACK for Conductor execution {}. Restore the last known-good state by reverting the exact commit {} on branch {} using the rollback_commit control. Do not rewrite history. Run the repository-native tests and required checks, push the revert commit to the same branch, and verify the configured GitHub Actions workflow for the resulting commit. Treat any failed check as a rollback failure. This rollback was triggered because the protected-target post-rollout health evidence was: {}.",
+        execution.id, commit_sha, branch, degraded_health
+    );
+    let mut payload = json!({
+        "workflow": config.execution.refiner_workflow,
+        "project_name": format!("{} automatic rollback", item.title),
+        "repo_url": repo_url,
+        // Clone the delivered branch itself so the exact commit is present in
+        // the shallow workspace used by Refiner's deterministic revert.
+        "repo_branch": branch,
+        "work_branch": branch,
+        "fork_org": owner,
+        "skip_fork": true,
+        "rollback_commit": commit_sha,
+        "rollback_of_execution_id": execution.id,
+        "rollback_reason": "protected-target degradation or verification failure",
+        "requirements_text": requirements_text,
+        "project_run": true,
+        "github_actions_required": true,
+        "github_actions_timeout_sec": config.execution.job_timeout_seconds,
+        "token_scope": config.execution.token_scope,
+        "llm_provider": config.execution.llm_provider,
+        "llm_model": config.execution.llm_model,
+        "codingagent": config.execution.coding_agent,
+        "commit_message": format!("Rollback protected execution {}", execution.id),
+    });
+    if let Some(project_root) = execution.request_payload.get("project_root") {
+        payload["project_root"] = project_root.clone();
+    }
+
+    let submit = match post_refiner_json(client, config, base_url, "/api/jobs", &payload).await {
+        Ok(value) => value,
+        Err(error) => {
+            return json!({
+                "attempted": true,
+                "succeeded": false,
+                "reason": format!("rollback submission failed: {}", error),
+                "commit_sha": commit_sha,
+            });
+        }
+    };
+    let Some(job_id) = submit
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| submit.get("job_id").and_then(Value::as_str))
+    else {
+        return json!({
+            "attempted": true,
+            "succeeded": false,
+            "reason": "rollback submission did not return a job id",
+            "commit_sha": commit_sha,
+        });
+    };
+    let detail = match poll_rollback_job(client, config, base_url, job_id).await {
+        Ok(value) => value,
+        Err(error) => {
+            return json!({
+                "attempted": true,
+                "succeeded": false,
+                "job_id": job_id,
+                "reason": error.to_string(),
+                "commit_sha": commit_sha,
+            });
+        }
+    };
+    let completed = detail
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status.eq_ignore_ascii_case("completed"));
+    let actions_passed = detail
+        .pointer("/repo_info/github_actions/succeeded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let verification = verify_refiner_result(&detail);
+    let verification_passed = verification.get("passed").and_then(Value::as_bool) == Some(true);
+    // A successful revert commit and CI run are not sufficient proof that the
+    // running service recovered. Probe the same discovered endpoint after the
+    // rollback job so a stale process/container cannot be reported as safely
+    // restored.
+    let recovery_health = if completed && actions_passed && verification_passed {
+        run_safety_health_window(config, service).await
+    } else {
+        json!({
+            "required": true,
+            "passed": false,
+            "status": "not_checked",
+            "reason": "rollback code or verification gates did not pass"
+        })
+    };
+    let recovery_health_passed =
+        recovery_health.get("passed").and_then(Value::as_bool) == Some(true);
+    let succeeded = completed && actions_passed && verification_passed && recovery_health_passed;
+    json!({
+        "attempted": true,
+        "succeeded": succeeded,
+        "job_id": job_id,
+        "commit_sha": commit_sha,
+        "job_status": detail.get("status"),
+        "github_actions_passed": actions_passed,
+        "verification": verification,
+        "recovery_health": recovery_health,
+        "reason": if succeeded { "rollback completed and was verified" } else { "rollback job did not pass all recovery gates, including recovery readiness" },
+        "terminal": terminal.get("status"),
+    })
+}
+
+async fn poll_rollback_job(
+    client: &Client,
+    config: &ConductorConfig,
+    base_url: &str,
+    job_id: &str,
+) -> Result<Value> {
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_secs(config.execution.job_timeout_seconds.max(30));
+    let poll_interval = Duration::from_secs(config.execution.poll_interval_seconds.max(1));
+    loop {
+        let detail = get_refiner_json(
+            client,
+            config,
+            base_url,
+            format!("/api/jobs/{}", job_id).as_str(),
+        )
+        .await
+        .with_context(|| format!("failed to poll rollback Refiner job {}", job_id))?;
+        let status = detail
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if matches!(status, "completed" | "failed" | "cancelled" | "stopped") {
+            return Ok(detail);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!("rollback Refiner job {} timed out", job_id));
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
 async fn preview_work_item_execution(
     repository: &dyn ConductorRepository,
     config: &ConductorConfig,
@@ -856,7 +1416,16 @@ async fn preview_work_item_execution(
             .iter()
             .find(|service| service.service_key == target)
     });
-    let policy = evaluate_work_item(config, &item, target_service);
+    let mut policy = evaluate_work_item(config, &item, target_service);
+    // A dry run never reaches Refiner or a deployment target.  Preserve the
+    // safety findings in the preview, but allow the preview itself to be
+    // generated so operators can see exactly which gates would be required.
+    if !policy.sensitive_targets.is_empty() && matches!(policy.verdict, PolicyVerdict::Blocked) {
+        policy.verdict = PolicyVerdict::Allowed;
+        policy.reasons.push(
+            "dry-run only: protected-target rollout gates are previewed, not executed".to_string(),
+        );
+    }
     let mut execution = WorkExecution::new(
         item.id,
         item.target_service.clone(),
@@ -1958,6 +2527,50 @@ mod tests {
         (format!("http://{}", addr), handle)
     }
 
+    async fn spawn_mock_rollback_surface(
+        successful: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        async fn submit_job() -> Json<Value> {
+            Json(json!({"job_id": "rollback-job"}))
+        }
+        let status = if successful { "completed" } else { "failed" };
+        let actions_succeeded = successful;
+        let app = Router::new()
+            .route("/api/jobs", post(submit_job))
+            .route(
+                "/api/jobs/{job_id}",
+                get(move |_: axum::extract::Path<String>| async move {
+                    Json(json!({
+                        "status": status,
+                        "stages": [],
+                        "repo_info": {
+                            "github_actions": {"succeeded": actions_succeeded}
+                        }
+                    }))
+                }),
+            )
+            .route("/healthz", get(|| async { Json(json!({"status": "ok"})) }));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rollback surface");
+        let addr = listener.local_addr().expect("rollback addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve rollback surface");
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    fn rollback_service(base_url: &str) -> ServiceSnapshot {
+        let mut service = sample_service();
+        service.service_key = "rollback-test".to_string();
+        service.display_name = "Rollback test".to_string();
+        service.internal_url = Some(base_url.to_string());
+        service.repo_url = None;
+        service
+    }
+
     #[test]
     fn job_payload_inherits_repo_context_and_strict_policy() {
         let config = ConductorConfig::default();
@@ -2107,6 +2720,143 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn safety_health_payload_rejects_explicit_degradation() {
+        assert!(health_payload_is_healthy(
+            &json!({"health": {"status": "ok"}})
+        ));
+        assert!(!health_payload_is_healthy(
+            &json!({"health": {"status": "degraded"}})
+        ));
+        assert!(!health_payload_is_healthy(
+            &json!({"health": {"ok": false}})
+        ));
+    }
+
+    #[test]
+    fn commit_extraction_accepts_only_safe_hexadecimal_ids() {
+        assert_eq!(
+            extract_commit_sha(&json!({"repo_info": {"commit_sha": "abcdef1234567"}})),
+            Some("abcdef1234567".to_string())
+        );
+        assert_eq!(
+            extract_commit_sha(&json!({"repo_info": {"commit_sha": "--danger"}})),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_rollback_reports_successful_recovery() {
+        let (base_url, handle) = spawn_mock_rollback_surface(true).await;
+        let mut config = ConductorConfig::default();
+        config.safety.health_check_window_seconds = 1;
+        config.safety.health_check_interval_seconds = 1;
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("rollback:success".to_string()),
+            title: "Protected change".to_string(),
+            summary: "Rollback test".to_string(),
+            target_service: Some("conductor".to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: vec![],
+            rollout_strategy: Some(RolloutStrategy::Canary),
+            status: Some(WorkStatus::InOperation),
+            priority: Some(90),
+            progress_pct: Some(50),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "change"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        let mut execution = WorkExecution::new(
+            item.id,
+            item.target_service.clone(),
+            item.delivery_stage,
+            item.rollout_strategy,
+        );
+        execution.request_payload = json!({
+            "repo_url": "https://github.com/neuralmimicry/conductor",
+            "repo_branch": "main",
+            "work_branch": "conductor/rollback-success"
+        });
+        let service = rollback_service(&base_url);
+        let result = automatic_rollback(
+            &build_http_client(2).expect("client"),
+            &config,
+            &base_url,
+            &item,
+            &execution,
+            Some(&service),
+            &json!({"status": "completed"}),
+            "abcdef1234567",
+            &json!({"passed": false}),
+        )
+        .await;
+        assert_eq!(result["attempted"], json!(true));
+        assert_eq!(result["succeeded"], json!(true));
+        assert_eq!(result["job_id"], json!("rollback-job"));
+        assert_eq!(result["recovery_health"]["passed"], json!(true));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn automatic_rollback_reports_failed_recovery_without_claiming_success() {
+        let (base_url, handle) = spawn_mock_rollback_surface(false).await;
+        let mut config = ConductorConfig::default();
+        config.safety.health_check_window_seconds = 1;
+        config.safety.health_check_interval_seconds = 1;
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("rollback:failure".to_string()),
+            title: "Protected change".to_string(),
+            summary: "Rollback failure test".to_string(),
+            target_service: Some("conductor".to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: vec![],
+            rollout_strategy: Some(RolloutStrategy::Canary),
+            status: Some(WorkStatus::InOperation),
+            priority: Some(90),
+            progress_pct: Some(50),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "change"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        let mut execution = WorkExecution::new(
+            item.id,
+            item.target_service.clone(),
+            item.delivery_stage,
+            item.rollout_strategy,
+        );
+        execution.request_payload = json!({
+            "repo_url": "https://github.com/neuralmimicry/conductor",
+            "repo_branch": "main",
+            "work_branch": "conductor/rollback-failure"
+        });
+        let service = rollback_service(&base_url);
+        let result = automatic_rollback(
+            &build_http_client(2).expect("client"),
+            &config,
+            &base_url,
+            &item,
+            &execution,
+            Some(&service),
+            &json!({"status": "completed"}),
+            "abcdef1234567",
+            &json!({"passed": false}),
+        )
+        .await;
+        assert_eq!(result["attempted"], json!(true));
+        assert_eq!(result["succeeded"], json!(false));
+        handle.abort();
     }
 
     #[test]

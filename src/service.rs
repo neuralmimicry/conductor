@@ -277,6 +277,24 @@ impl ConductorService {
                     }
 
                     let mut item = original.clone();
+                    if effective_approval
+                        && !policy.sensitive_targets.is_empty()
+                        && matches!(
+                            item.rollout_strategy,
+                            crate::models::RolloutStrategy::Direct
+                        )
+                    {
+                        // Approval must never turn an unsafe direct request
+                        // into an executable direct rollout.  Upgrade the
+                        // queued work to the smallest staged strategy; the
+                        // execution gate still requires a live readiness
+                        // endpoint before Refiner is called.
+                        item.rollout_strategy = crate::models::RolloutStrategy::Canary;
+                        item.notes.push(
+                            "AI approval upgraded protected-target rollout from direct to canary"
+                                .to_string(),
+                        );
+                    }
                     item.execution_approved = effective_approval;
                     item.approval_metadata =
                         build_approval_metadata(&item, &policy, &decision, effective_approval);
@@ -1804,7 +1822,9 @@ impl ConductorService {
                     .find(|service| service.service_key == target)
             });
             let policy = evaluate_work_item(&self.config, original, target_service);
-            if !matches!(policy.verdict, crate::models::PolicyVerdict::Allowed) {
+            if matches!(policy.verdict, crate::models::PolicyVerdict::Blocked)
+                && policy.sensitive_targets.is_empty()
+            {
                 continue;
             }
             let dependency_blockers = approval_dependency_blockers(original, &work_items);

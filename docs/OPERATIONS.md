@@ -59,6 +59,38 @@ Important execution controls in `config/conductor.yaml`:
 - `execution.claim_ttl_seconds`: expiry for short-lived dispatch claims used to avoid duplicate multi-instance execution starts.
 - `execution.instance_id`: stable identifier written into dispatch claims and events.
 
+Sensitive rollout safety is mandatory for protected platform services,
+repositories under the configured GitHub organisation, and configured
+protected repository roots.  The policy summary exposes these settings so an
+operator can confirm the active contract:
+
+- `safety.enabled`: retained as an explicit configuration signal; protected
+  targets cannot bypass the safety transaction by disabling ordinary policy.
+- `safety.health_check_timeout_seconds`: timeout for each readiness probe.
+- `safety.health_check_window_seconds` and
+  `safety.health_check_interval_seconds`: bounded post-rollout health window.
+- `safety.max_rollback_attempts`: upper bound advertised to the rollback
+  procedure; the default is one deterministic revert attempt per failed
+  execution.
+
+For a sensitive execution, Conductor records a fresh baseline before Refiner
+is called, requires `canary` or `red_green`, and injects the protected rollout
+contract into the Refiner job.  A completed Refiner job is not accepted until
+independent validation, the staged rollout evidence, and the post-rollout
+health window pass.  If a produced commit is identified and any gate fails,
+Conductor submits a rollback job using Refiner's hexadecimal commit-id-only
+revert primitive.  The rollback must complete, pass repository verification
+and GitHub Actions, and pass a new readiness health window before it is marked
+recovered; the original execution remains failed so the unsafe change is not
+reported as successful.
+
+Rollback evidence is persisted under the execution's `verification.rollback`
+and `latest_payload.safety.rollback` fields and emitted as an
+`execution.rollback` event.  A missing baseline, missing service endpoint,
+missing commit identity, failed rollback, or failed recovery probe is a hard
+failure requiring operator attention.  Use `execution.dry_run` to inspect the
+contract without contacting Refiner or changing a repository.
+
 The background control loop is intentionally single-owner for its internal
 stages: a successful discovery snapshot enables planning, then approval and
 execution are considered in order. This prevents planning against a snapshot

@@ -4,9 +4,10 @@ use serde_json::Value;
 
 use crate::{
     config::ConductorConfig,
+    integrations::github_repository_coordinate,
     models::{
-        DeliveryStage, PolicyEvaluation, PolicySummary, PolicyVerdict, RolloutStrategy,
-        ServiceSnapshot, WorkItem, now_utc,
+        DeliveryStage, PolicyEvaluation, PolicySummary, PolicyVerdict, RepositorySnapshot,
+        RolloutStrategy, ServiceSnapshot, WorkItem, now_utc,
     },
 };
 
@@ -19,8 +20,12 @@ pub fn evaluate_work_item(
         work_item.delivery_stage,
         config.delivery.require_uat_before_production,
     );
+    let sensitive_targets = sensitive_target_names(config, work_item, service);
 
-    if !config.policy.enabled {
+    // Ordinary policy can be disabled for local diagnostics, but the safety
+    // transaction is deliberately not bypassable for protected platform
+    // services or existing repositories in our own GitHub organisation.
+    if !config.policy.enabled && sensitive_targets.is_empty() {
         return PolicyEvaluation {
             verdict: PolicyVerdict::Allowed,
             risk_level: "low".to_string(),
@@ -29,6 +34,7 @@ pub fn evaluate_work_item(
             required_previous_stage,
             rollout_strategy: work_item.rollout_strategy,
             protected_targets: Vec::new(),
+            sensitive_targets,
             external_repos: Vec::new(),
             required_verifications: Vec::new(),
             reasons: vec!["policy engine disabled".to_string()],
@@ -39,6 +45,40 @@ pub fn evaluate_work_item(
     let mut protected_targets = Vec::new();
     let mut external_repos = Vec::new();
     let mut reasons = Vec::new();
+
+    if !sensitive_targets.is_empty() {
+        if !config.safety.enabled {
+            reasons.push(
+                "safety controls cannot be disabled for protected platform targets".to_string(),
+            );
+        }
+        if !matches!(
+            work_item.rollout_strategy,
+            RolloutStrategy::Canary | RolloutStrategy::RedGreen
+        ) {
+            reasons.push(
+                "protected target requires a canary or red_green rollout strategy".to_string(),
+            );
+        }
+        if service.is_none() {
+            reasons.push(
+                "protected target requires a discovered service snapshot before execution"
+                    .to_string(),
+            );
+        } else if service
+            .and_then(|candidate| {
+                candidate
+                    .internal_url
+                    .as_ref()
+                    .or(candidate.public_url.as_ref())
+            })
+            .is_none()
+        {
+            reasons.push(
+                "protected target requires an HTTP readiness endpoint before execution".to_string(),
+            );
+        }
+    }
 
     if let Some(service) = service {
         if config
@@ -126,6 +166,7 @@ pub fn evaluate_work_item(
         service,
         work_item.delivery_stage,
         work_item.rollout_strategy,
+        !sensitive_targets.is_empty(),
     );
     if config.policy.require_verification && !work_item.verification_required {
         reasons.push("verification gate is required for execution".to_string());
@@ -134,11 +175,16 @@ pub fn evaluate_work_item(
         && work_item.delivery_stage.is_release_gate()
         && !work_item.execution_approved;
 
-    let verdict = if reasons.iter().any(|reason| {
+    let has_hard_block = reasons.iter().any(|reason| {
         reason.contains("blocked action keyword")
-            || reason.contains("requires a canary or red_green rollout strategy")
+            || reason.contains("production stage requires a canary or red_green rollout strategy")
             || reason.contains("requires") && reason.contains("to be validated first")
-    }) {
+    });
+    let has_safety_block = reasons.iter().any(|reason| {
+        reason.contains("protected target requires")
+            || reason.contains("safety controls cannot be disabled")
+    });
+    let verdict = if has_hard_block || (has_safety_block && work_item.execution_approved) {
         PolicyVerdict::Blocked
     } else if !config.policy.allow_external_repo_execution && !external_repos.is_empty() {
         reasons.push("external repository execution is disabled by policy".to_string());
@@ -187,6 +233,7 @@ pub fn evaluate_work_item(
         required_previous_stage,
         rollout_strategy: work_item.rollout_strategy,
         protected_targets,
+        sensitive_targets,
         external_repos,
         required_verifications,
         reasons,
@@ -221,6 +268,9 @@ pub fn policy_summary(config: &ConductorConfig) -> PolicySummary {
             .policy
             .require_successful_github_actions_for_production,
         github_actions_workflow_file: config.policy.github_actions_workflow_file.clone(),
+        safety_enabled: config.safety.enabled,
+        safety_health_check_window_seconds: config.safety.health_check_window_seconds,
+        safety_max_rollback_attempts: config.safety.max_rollback_attempts,
     }
 }
 
@@ -237,6 +287,7 @@ fn required_verifications(
     service: Option<&ServiceSnapshot>,
     delivery_stage: DeliveryStage,
     rollout_strategy: RolloutStrategy,
+    sensitive_target: bool,
 ) -> Vec<String> {
     let mut commands = project_native_verification_commands(service);
     if commands.is_empty() {
@@ -267,7 +318,156 @@ fn required_verifications(
             commands.push("production smoke and health verification".to_string());
         }
     }
+    if sensitive_target {
+        commands.extend([
+            "fresh protected-target readiness baseline".to_string(),
+            format!("{} staged rollout", rollout_strategy.as_str()),
+            "post-rollout readiness health window".to_string(),
+            "automatic rollback on degradation".to_string(),
+            "rollback readiness and recovery verification".to_string(),
+        ]);
+    }
     commands
+}
+
+/// Return the targets for which a normal Refiner job is not sufficient.
+///
+/// Service names are intentionally included as a defence in depth because
+/// discovery can temporarily omit a repository URL during a restart.  The
+/// repository-owner check covers newly added services and prevents a caller
+/// from avoiding governance by changing only its service key.
+pub fn sensitive_target_names(
+    config: &ConductorConfig,
+    work_item: &WorkItem,
+    service: Option<&ServiceSnapshot>,
+) -> Vec<String> {
+    let service_key = service
+        .map(|candidate| candidate.service_key.as_str())
+        .or(work_item.target_service.as_deref())
+        .unwrap_or_default();
+    let configured_service = config
+        .policy
+        .protected_services
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(service_key));
+    let own_repository = service
+        .and_then(|candidate| candidate.repo_url.as_deref())
+        .and_then(github_repository_coordinate)
+        .is_some_and(|(owner, _)| {
+            !config.discovery.github.owner.trim().is_empty()
+                && owner.eq_ignore_ascii_case(config.discovery.github.owner.trim())
+        });
+    let protected_path = service
+        .and_then(|candidate| candidate.repo_path.as_deref())
+        .map(PathBuf::from)
+        .is_some_and(|path| {
+            config
+                .policy
+                .protected_repo_roots
+                .iter()
+                .any(|root| path_starts_with(&path, root))
+        });
+
+    if !(configured_service || own_repository || protected_path) {
+        return Vec::new();
+    }
+
+    let mut targets = Vec::new();
+    if !service_key.trim().is_empty() {
+        targets.push(service_key.to_string());
+    }
+    if let Some(repo_url) = service.and_then(|candidate| candidate.repo_url.as_deref()) {
+        if own_repository {
+            targets.push(format!("repository:{}", repo_url));
+        }
+    }
+    targets
+}
+
+/// Enrich sensitivity from the repository inventory when discovery had to
+/// reconstruct a service's remote from Ansible or GitHub metadata.
+pub fn apply_repository_safety_policy(
+    config: &ConductorConfig,
+    work_item: &WorkItem,
+    service: Option<&ServiceSnapshot>,
+    repositories: &[RepositorySnapshot],
+    policy: &mut PolicyEvaluation,
+) {
+    let Some(service) = service else {
+        return;
+    };
+    let matched = service
+        .repo_path
+        .as_deref()
+        .and_then(|path| {
+            repositories
+                .iter()
+                .find(|repository| repository.local_path.as_deref() == Some(path))
+        })
+        .or_else(|| {
+            repositories
+                .iter()
+                .find(|repository| repository.linked_services.contains(&service.service_key))
+        });
+    let Some(repository) = matched else {
+        return;
+    };
+    let Some(repo_url) = repository.repo_url.as_deref() else {
+        return;
+    };
+    let Some((owner, _)) = github_repository_coordinate(repo_url) else {
+        return;
+    };
+    if config.discovery.github.owner.trim().is_empty()
+        || !owner.eq_ignore_ascii_case(config.discovery.github.owner.trim())
+        || policy
+            .sensitive_targets
+            .iter()
+            .any(|target| target == &format!("repository:{repo_url}"))
+    {
+        return;
+    }
+    policy
+        .sensitive_targets
+        .push(format!("repository:{repo_url}"));
+    if !policy
+        .sensitive_targets
+        .iter()
+        .any(|target| target == &service.service_key)
+    {
+        policy.sensitive_targets.push(service.service_key.clone());
+    }
+    if !matches!(
+        work_item.rollout_strategy,
+        RolloutStrategy::Canary | RolloutStrategy::RedGreen
+    ) {
+        policy
+            .reasons
+            .push("protected target requires a canary or red_green rollout strategy".to_string());
+        policy.verdict = PolicyVerdict::Blocked;
+        policy.risk_level = "critical".to_string();
+    }
+    if service.internal_url.is_none() && service.public_url.is_none() {
+        policy.reasons.push(
+            "protected target requires an HTTP readiness endpoint before execution".to_string(),
+        );
+        policy.verdict = PolicyVerdict::Blocked;
+        policy.risk_level = "critical".to_string();
+    }
+    for verification in [
+        "fresh protected-target readiness baseline",
+        "post-rollout readiness health window",
+        "automatic rollback on degradation",
+        "rollback readiness and recovery verification",
+    ] {
+        if !policy
+            .required_verifications
+            .iter()
+            .any(|candidate| candidate == verification)
+        {
+            policy.required_verifications.push(verification.to_string());
+        }
+    }
 }
 
 pub(crate) fn project_native_verification_commands(
@@ -540,6 +740,109 @@ mod tests {
             commands
                 .iter()
                 .any(|command| command.contains("ansible-inventory -i inventory/hosts.ini --list"))
+        );
+    }
+
+    #[test]
+    fn own_organisation_repository_is_sensitive_even_with_an_unprotected_service_name() {
+        let config = ConductorConfig::default();
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("sensitive:custom".to_string()),
+            title: "Update custom platform service".to_string(),
+            summary: "Change an existing service owned by the platform organisation".to_string(),
+            target_service: Some("custom-service".to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: vec![],
+            rollout_strategy: Some(RolloutStrategy::Direct),
+            status: None,
+            priority: None,
+            progress_pct: None,
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "repository_delivery"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        let service = crate::models::ServiceSnapshot {
+            service_key: "custom-service".to_string(),
+            display_name: "Custom Service".to_string(),
+            kind: "service".to_string(),
+            role_name: "custom".to_string(),
+            playbooks: vec![],
+            host_targets: vec![],
+            hosts: vec![],
+            namespace: None,
+            service_name: None,
+            deployment_environment: None,
+            internal_url: Some("http://custom.internal".to_string()),
+            public_url: None,
+            repo_path: Some("/srv/custom-service".to_string()),
+            repo_url: Some("https://github.com/neuralmimicry/custom-service".to_string()),
+            repo_branch: Some("main".to_string()),
+            health: ServiceHealth::Healthy,
+            capabilities: vec![],
+            dependencies: vec![],
+            storage_paths: vec![],
+            raw_defaults: json!({}),
+            probe: json!({}),
+            discovered_at: now_utc(),
+            updated_at: now_utc(),
+        };
+
+        let evaluation = evaluate_work_item(&config, &item, Some(&service));
+        assert!(
+            evaluation.sensitive_targets.iter().any(
+                |target| target == "repository:https://github.com/neuralmimicry/custom-service"
+            )
+        );
+        assert_eq!(evaluation.verdict, PolicyVerdict::Blocked);
+        assert!(
+            evaluation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("requires a canary or red_green"))
+        );
+        assert!(
+            evaluation
+                .required_verifications
+                .iter()
+                .any(|check| check.contains("automatic rollback"))
+        );
+    }
+
+    #[test]
+    fn mandatory_aarnn_rust_target_cannot_execute_without_discovery() {
+        let config = ConductorConfig::default();
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: None,
+            title: "Update aarnn_rust".to_string(),
+            summary: "Change the neural runtime".to_string(),
+            target_service: Some("aarnn_rust".to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: vec![],
+            rollout_strategy: Some(RolloutStrategy::Canary),
+            status: None,
+            priority: None,
+            progress_pct: None,
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "change"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        let evaluation = evaluate_work_item(&config, &item, None);
+        assert_eq!(evaluation.verdict, PolicyVerdict::Blocked);
+        assert!(
+            evaluation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("service snapshot"))
         );
     }
 }

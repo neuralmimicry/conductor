@@ -165,6 +165,7 @@ policy:
     - "gail"
     - "refiner"
     - "aarnn"
+    - "aarnn_rust"
     - "swarmhpc"
   protected_repo_roots: []
   blocked_action_keywords:
@@ -172,3 +173,14 @@ policy:
     - "rm -rf"
     - "wipe"
     - "destroy"
+
+# Non-bypassable rollout protection for Conductor's own organisation-owned
+# platform services and repositories.  A sensitive execution must pass a
+# fresh readiness baseline, a staged rollout, a post-rollout health window,
+# and (when verification or health degrades) an exact-commit Refiner revert.
+safety:
+  enabled: true
+  health_check_timeout_seconds: 10
+  health_check_window_seconds: 30
+  health_check_interval_seconds: 5
+  max_rollback_attempts: 1

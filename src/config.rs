@@ -40,6 +40,10 @@ pub struct ConductorConfig {
     pub planning: PlanningConfig,
     pub execution: ExecutionConfig,
     pub policy: PolicyConfig,
+    /// Controls the non-bypassable safety transaction used for sensitive
+    /// own-organisation repositories.  Keeping this separate from ordinary
+    /// policy makes the rollout controls visible and independently tunable.
+    pub safety: SafetyConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -249,6 +253,18 @@ pub struct PolicyConfig {
     pub blocked_action_keywords: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SafetyConfig {
+    /// Sensitive targets must capture a fresh readiness baseline, use a
+    /// staged rollout, and remain healthy during the post-rollout window.
+    pub enabled: bool,
+    pub health_check_timeout_seconds: u64,
+    pub health_check_window_seconds: u64,
+    pub health_check_interval_seconds: u64,
+    pub max_rollback_attempts: u8,
+}
+
 impl Default for ConductorConfig {
     fn default() -> Self {
         Self {
@@ -264,6 +280,7 @@ impl Default for ConductorConfig {
             planning: PlanningConfig::default(),
             execution: ExecutionConfig::default(),
             policy: PolicyConfig::default(),
+            safety: SafetyConfig::default(),
         }
     }
 }
@@ -504,6 +521,7 @@ impl Default for PolicyConfig {
                 "gail".to_string(),
                 "refiner".to_string(),
                 "aarnn".to_string(),
+                "aarnn_rust".to_string(),
                 "swarmhpc".to_string(),
                 "ollama".to_string(),
             ],
@@ -514,6 +532,18 @@ impl Default for PolicyConfig {
                 "wipe".to_string(),
                 "destroy".to_string(),
             ],
+        }
+    }
+}
+
+impl Default for SafetyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            health_check_timeout_seconds: 10,
+            health_check_window_seconds: 30,
+            health_check_interval_seconds: 5,
+            max_rollback_attempts: 1,
         }
     }
 }
@@ -702,6 +732,26 @@ impl ConductorConfig {
             self.policy.ai_approval_min_confidence.clamp(0.0, 1.0);
         if self.policy.ai_approval_max_items_per_cycle == 0 {
             self.policy.ai_approval_max_items_per_cycle = 20;
+        }
+        self.safety.health_check_timeout_seconds =
+            self.safety.health_check_timeout_seconds.clamp(1, 120);
+        self.safety.health_check_window_seconds =
+            self.safety.health_check_window_seconds.clamp(1, 3_600);
+        self.safety.health_check_interval_seconds = self
+            .safety
+            .health_check_interval_seconds
+            .clamp(1, self.safety.health_check_window_seconds);
+        self.safety.max_rollback_attempts = self.safety.max_rollback_attempts.clamp(1, 3);
+        normalize_unique_strings(&mut self.policy.protected_services);
+        for mandatory in ["conductor", "refiner", "gail", "aarnn", "aarnn_rust"] {
+            if !self
+                .policy
+                .protected_services
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(mandatory))
+            {
+                self.policy.protected_services.push(mandatory.to_string());
+            }
         }
         normalize_unique_strings(&mut self.policy.protected_services);
         normalize_unique_strings(&mut self.policy.blocked_action_keywords);
