@@ -26,7 +26,7 @@ concurrency:
 jobs:
   version:
     name: Resolve release version
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-24.04
     outputs:
       app_version: ${{ steps.version.outputs.app_version }}
       deb_version: ${{ steps.version.outputs.deb_version }}
@@ -124,7 +124,7 @@ jobs:
         include:
           - runner_arch: X64
             deb_arch: amd64
-            runs_on: '["self-hosted", "Linux", "X64"]'
+            runs_on: '["ubuntu-24.04"]'
           - runner_arch: ARM64
             deb_arch: arm64
             runs_on: '["ubuntu-24.04-arm"]'
@@ -206,7 +206,7 @@ jobs:
     needs:
       - version
       - build-deb
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-24.04
     steps:
       - name: Download Debian packages
         uses: actions/download-artifact@v4
@@ -249,7 +249,7 @@ jobs:
           - arch: amd64
             runner_arch: X64
             target_page_size: 4k
-            runs_on: '["self-hosted", "Linux", "X64"]'
+            runs_on: '["ubuntu-24.04"]'
           - arch: arm64
             runner_arch: ARM64
             target_page_size: 4k
@@ -323,7 +323,7 @@ jobs:
     needs:
       - version
       - build-container-arch
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
