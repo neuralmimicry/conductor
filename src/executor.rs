@@ -314,11 +314,12 @@ async fn dispatch_claimed_work_item_inner(
             .iter()
             .find(|service| service.service_key == target)
     });
-    let repositories = if matches!(item.delivery_stage, DeliveryStage::Production) {
-        repository.list_repository_snapshots().await?
-    } else {
-        Vec::new()
-    };
+    // Repository snapshots are required for every delivery stage, not only
+    // production.  Refiner must receive the actual GitHub repository context
+    // before it creates a workspace; otherwise a service discovered from a
+    // local checkout can silently fall back to a starter project and never
+    // push the requested change to its owning repository.
+    let repositories = repository.list_repository_snapshots().await?;
     let mut policy = evaluate_work_item(config, item, target_service);
     let github_actions =
         production_github_actions_evidence(config, item, target_service, &repositories).await;
@@ -485,19 +486,20 @@ async fn dispatch_claimed_work_item_inner(
                 .unwrap_or_default(),
         }),
     );
-    let job_payload = match build_job_payload(config, item, target_service, &plan_response) {
-        Ok(payload) => payload,
-        Err(error) => {
-            return finalize_execution_failure(
-                repository,
-                item,
-                &mut execution,
-                event_callback,
-                error.to_string(),
-            )
-            .await;
-        }
-    };
+    let job_payload =
+        match build_job_payload(config, item, target_service, &repositories, &plan_response) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return finalize_execution_failure(
+                    repository,
+                    item,
+                    &mut execution,
+                    event_callback,
+                    error.to_string(),
+                )
+                .await;
+            }
+        };
     execution.request_payload = job_payload.clone();
     execution.latest_payload = json!({"plan_response": plan_response});
     repository.upsert_work_execution(&execution).await?;
@@ -836,6 +838,7 @@ async fn preview_work_item_execution(
     }
 
     let services = repository.list_service_snapshots().await?;
+    let repositories = repository.list_repository_snapshots().await?;
     let target_service = item.target_service.as_deref().and_then(|target| {
         services
             .iter()
@@ -866,7 +869,8 @@ async fn preview_work_item_execution(
     }
 
     let prompt = build_refiner_prompt(config, &item, target_service, &policy);
-    let preview_payload = build_job_payload(config, &item, target_service, &json!({}))?;
+    let preview_payload =
+        build_job_payload(config, &item, target_service, &repositories, &json!({}))?;
     let independent_validation = preview_independent_validation(
         &config.validation,
         target_service,
@@ -1122,6 +1126,7 @@ fn build_job_payload(
     config: &ConductorConfig,
     work_item: &WorkItem,
     service: Option<&ServiceSnapshot>,
+    repositories: &[RepositorySnapshot],
     plan_response: &Value,
 ) -> Result<Value> {
     let mut payload = plan_response
@@ -1203,11 +1208,25 @@ fn build_job_payload(
                 payload.insert("project_root".to_string(), json!(project_root));
             }
         }
-        if let Some(repo_url) = service.repo_url.as_deref() {
-            payload.insert("repo_url".to_string(), json!(repo_url));
+        // Prefer an explicit planner value, then enrich the service snapshot
+        // from the repository inventory.  The latter is essential when the
+        // Ansible checkout is a copied/mounted tree without a Git remote.
+        if !payload.contains_key("repo_url") {
+            if let Some((repo_url, branches)) =
+                rollout_repository_context(Some(service), repositories)
+            {
+                payload.insert("repo_url".to_string(), json!(repo_url));
+                if !payload.contains_key("repo_branch") {
+                    if let Some(repo_branch) = branches.first() {
+                        payload.insert("repo_branch".to_string(), json!(repo_branch));
+                    }
+                }
+            }
         }
-        if let Some(repo_branch) = service.repo_branch.as_deref() {
-            payload.insert("repo_branch".to_string(), json!(repo_branch));
+        if !payload.contains_key("repo_branch") {
+            if let Some(repo_branch) = service.repo_branch.as_deref() {
+                payload.insert("repo_branch".to_string(), json!(repo_branch));
+            }
         }
         payload.insert(
             "work_branch".to_string(),
@@ -1914,6 +1933,7 @@ mod tests {
             &config,
             &item,
             Some(&sample_service()),
+            &[],
             &json!({"job_payload": {"workflow": "project_solver"}}),
         )
         .expect("payload");
@@ -1926,6 +1946,78 @@ mod tests {
                 .get("solver_command_policy_mode")
                 .and_then(Value::as_str),
             Some("strict")
+        );
+    }
+
+    #[test]
+    fn job_payload_recovers_repo_context_from_inventory_when_service_remote_is_missing() {
+        let config = ConductorConfig::default();
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("inventory-context:conductor".to_string()),
+            title: "Validate repository delivery".to_string(),
+            summary: "Ensure the change is pushed to the owning repository".to_string(),
+            target_service: Some("conductor".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
+            status: None,
+            priority: None,
+            progress_pct: None,
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "repository_delivery"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        let mut service = sample_service();
+        service.repo_url = None;
+        service.repo_branch = None;
+        let repository = RepositorySnapshot {
+            repo_key: "neuralmimicry/conductor".to_string(),
+            name: "conductor".to_string(),
+            owner: Some("neuralmimicry".to_string()),
+            repo_url: Some("git@github.com:neuralmimicry/conductor.git".to_string()),
+            local_path: Some("/tmp/conductor".to_string()),
+            default_branch: Some("main".to_string()),
+            current_branch: None,
+            language: Some("Rust".to_string()),
+            frameworks: vec![],
+            build_systems: vec!["cargo".to_string()],
+            package_managers: vec![],
+            runtime_type: Some("service".to_string()),
+            deployment_type: Some("kubernetes".to_string()),
+            purpose: None,
+            criticality: "critical".to_string(),
+            visibility: Some("public".to_string()),
+            archived: false,
+            linked_services: vec!["conductor".to_string()],
+            dependencies: vec![],
+            capabilities: vec![],
+            inventory_sources: vec!["github_api".to_string()],
+            metadata: json!({}),
+            discovered_at: crate::models::now_utc(),
+            updated_at: crate::models::now_utc(),
+        };
+
+        let payload = build_job_payload(
+            &config,
+            &item,
+            Some(&service),
+            &[repository],
+            &json!({"job_payload": {"workflow": "project_solver"}}),
+        )
+        .expect("payload");
+
+        assert_eq!(
+            payload.get("repo_url").and_then(Value::as_str),
+            Some("git@github.com:neuralmimicry/conductor.git")
+        );
+        assert_eq!(
+            payload.get("repo_branch").and_then(Value::as_str),
+            Some("main")
         );
     }
 
@@ -1991,6 +2083,7 @@ mod tests {
             &config,
             &item,
             Some(&sample_service()),
+            &[],
             &json!({"job_payload": {"workflow": "project_solver"}}),
         )
         .expect("payload");
@@ -2046,7 +2139,7 @@ mod tests {
         });
 
         let payload =
-            build_job_payload(&config, &item, Some(&service), &json!({})).expect("payload");
+            build_job_payload(&config, &item, Some(&service), &[], &json!({})).expect("payload");
         let deployment = payload
             .get("deployment_automation")
             .and_then(Value::as_object)
