@@ -1257,12 +1257,11 @@ fn requirements_text(
     work_item: &WorkItem,
     service: Option<&ServiceSnapshot>,
 ) -> String {
-    if let Some(text) = plan_response
+    let planner_guidance = plan_response
         .get("requirements_text")
         .and_then(Value::as_str)
-    {
-        return text.to_string();
-    }
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
 
     let target = service
         .map(|service| service.display_name.as_str())
@@ -1276,7 +1275,7 @@ fn requirements_text(
     } else {
         String::new()
     };
-    format!(
+    let authoritative = format!(
         "Overview: Improve {target} through the Conductor execution loop.\n\nDelivery Context:\n- Current stage: {delivery_stage}\n- Validated stages: {validated_stages}\n- Rollout strategy: {rollout_strategy}\n\nRequirements Register:\n- REQ-001: Inspect and record current repository, runtime, or job evidence before selecting an operation.\n- REQ-002: Implement only the scoped change, job update, or progress-monitoring action supported by that evidence.\n- REQ-003: Preserve secure, resilient behaviour and avoid destructive commands.\n- REQ-004: Update or add tests covering the changed path, or provide the relevant live operational check.\n- REQ-005: Run verification commands and report the outcome.\n- REQ-006: Leave unrelated files untouched.\n- REQ-007: Record rollback/recovery steps and the acceptance signal proving the gap is closed.\n- REQ-008: Preserve staged progression and rollout governance metadata.{rollout_requirement}\n\nWork Item Summary:\n{summary}\n\nPlan JSON:\n{plan}",
         target = target,
         delivery_stage = work_item.delivery_stage.as_str(),
@@ -1294,7 +1293,19 @@ fn requirements_text(
         rollout_requirement = rollout_requirement,
         summary = work_item.summary,
         plan = work_item.plan,
-    )
+    );
+
+    // The execution-plan endpoint is advisory: a model can return a valid
+    // looking but semantically stale or read-only plan for a work item that
+    // explicitly requires a repository change.  Keep the governed work item
+    // as the source of truth and retain planner guidance only as context.
+    planner_guidance
+        .map(|guidance| {
+            format!(
+                "{authoritative}\n\nPlanner guidance (advisory; it must not weaken or contradict the authoritative work-item requirements):\n{guidance}\n"
+            )
+        })
+        .unwrap_or(authoritative)
 }
 
 fn deployment_automation_context(
@@ -2345,7 +2356,7 @@ mod tests {
                 .get("requirements_text")
                 .and_then(Value::as_str),
             Some(
-                "Overview: Stabilise the release gate.\n\nRequirements Register:\n- REQ-001: Fix the failing verification path.\n- REQ-002: Preserve rollout metadata.\n- REQ-003: Add or update targeted tests.\n- REQ-004: Document the execution boundary.\n"
+                "Overview: Improve target service through the Conductor execution loop.\n\nDelivery Context:\n- Current stage: development\n- Validated stages: none\n- Rollout strategy: canary\n\nRequirements Register:\n- REQ-001: Inspect and record current repository, runtime, or job evidence before selecting an operation.\n- REQ-002: Implement only the scoped change, job update, or progress-monitoring action supported by that evidence.\n- REQ-003: Preserve secure, resilient behaviour and avoid destructive commands.\n- REQ-004: Update or add tests covering the changed path, or provide the relevant live operational check.\n- REQ-005: Run verification commands and report the outcome.\n- REQ-006: Leave unrelated files untouched.\n- REQ-007: Record rollback/recovery steps and the acceptance signal proving the gap is closed.\n- REQ-008: Preserve staged progression and rollout governance metadata.\n\nWork Item Summary:\nFix the failing verification seam\n\nPlan JSON:\n{\"action\":\"stabilize_release_gate\"}\n\nPlanner guidance (advisory; it must not weaken or contradict the authoritative work-item requirements):\nOverview: Stabilise the release gate.\n\nRequirements Register:\n- REQ-001: Fix the failing verification path.\n- REQ-002: Preserve rollout metadata.\n- REQ-003: Add or update targeted tests.\n- REQ-004: Document the execution boundary.\n"
             )
         );
         assert_eq!(
