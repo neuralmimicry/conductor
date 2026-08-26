@@ -287,6 +287,8 @@ async fn dispatch_claimed_work_item_inner(
             crate::models::now_utc().to_rfc3339(),
             message
         ));
+        repository.upsert_work_execution(&execution).await?;
+        repository.upsert_work_item(item).await?;
         emit_execution_event(
             event_callback,
             "execution.blocked",
@@ -299,8 +301,6 @@ async fn dispatch_claimed_work_item_inner(
                 "policy": policy,
             }),
         );
-        repository.upsert_work_execution(&execution).await?;
-        repository.upsert_work_item(item).await?;
         let _ = repository
             .release_work_item_claim(item.id, claim_token)
             .await;
@@ -344,6 +344,8 @@ async fn dispatch_claimed_work_item_inner(
             crate::models::now_utc().to_rfc3339(),
             message
         ));
+        repository.upsert_work_execution(&execution).await?;
+        repository.upsert_work_item(item).await?;
         emit_execution_event(
             event_callback,
             "execution.blocked",
@@ -356,8 +358,6 @@ async fn dispatch_claimed_work_item_inner(
                 "reasons": policy.reasons,
             }),
         );
-        repository.upsert_work_execution(&execution).await?;
-        repository.upsert_work_item(item).await?;
         let _ = repository
             .release_work_item_claim(item.id, claim_token)
             .await;
@@ -375,6 +375,13 @@ async fn dispatch_claimed_work_item_inner(
         "{} execution started through Refiner",
         crate::models::now_utc().to_rfc3339()
     ));
+    // Persist the execution before emitting any event that references it.  In
+    // PostgreSQL conductor_events.execution_id has a foreign-key constraint;
+    // publishing first makes the event write race the execution write and can
+    // leave the execution invisible and permanently consume capacity.
+    execution.mark_status(ExecutionStatus::Planning);
+    repository.upsert_work_execution(&execution).await?;
+    repository.upsert_work_item(item).await?;
     emit_execution_event(
         event_callback,
         "execution.started",
@@ -388,8 +395,6 @@ async fn dispatch_claimed_work_item_inner(
             "claimed_by": item.claimed_by.clone(),
         }),
     );
-    repository.upsert_work_item(item).await?;
-    repository.upsert_work_execution(&execution).await?;
 
     let _ = repository
         .release_work_item_claim(item.id, claim_token)
@@ -433,7 +438,6 @@ async fn dispatch_claimed_work_item_inner(
         .await;
     }
 
-    execution.mark_status(ExecutionStatus::Planning);
     let prompt = build_refiner_prompt(config, item, target_service, &policy);
     let plan_response = match post_refiner_json(
         &client,
@@ -472,20 +476,6 @@ async fn dispatch_claimed_work_item_inner(
         )
         .await;
     }
-    emit_execution_event(
-        event_callback,
-        "execution.planning_submitted",
-        format!("planning response received for {}", item.title),
-        Some(item),
-        Some(&execution),
-        Some(execution.status.as_str()),
-        json!({
-            "plan_keys": plan_response
-                .as_object()
-                .map(|entries| entries.keys().cloned().collect::<Vec<_>>())
-                .unwrap_or_default(),
-        }),
-    );
     let job_payload =
         match build_job_payload(config, item, target_service, &repositories, &plan_response) {
             Ok(payload) => payload,
@@ -506,6 +496,20 @@ async fn dispatch_claimed_work_item_inner(
 
     item.progress_pct = 20;
     repository.upsert_work_item(item).await?;
+    emit_execution_event(
+        event_callback,
+        "execution.planning_submitted",
+        format!("planning response received for {}", item.title),
+        Some(item),
+        Some(&execution),
+        Some(execution.status.as_str()),
+        json!({
+            "plan_keys": plan_response
+                .as_object()
+                .map(|entries| entries.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default(),
+        }),
+    );
 
     let estimate_response = match post_refiner_json(
         &client,
@@ -582,6 +586,7 @@ async fn dispatch_claimed_work_item_inner(
         "estimate_response": execution.latest_payload.get("estimate_response").cloned().unwrap_or_else(|| json!({})),
         "submit_response": submit_response,
     });
+    repository.upsert_work_execution(&execution).await?;
     emit_execution_event(
         event_callback,
         "execution.job_submitted",
@@ -594,7 +599,6 @@ async fn dispatch_claimed_work_item_inner(
             "target_service": item.target_service.clone(),
         }),
     );
-    repository.upsert_work_execution(&execution).await?;
 
     item.progress_pct = 35;
     item.notes.push(format!(
@@ -656,6 +660,13 @@ async fn dispatch_claimed_work_item_inner(
         crate::models::now_utc().to_rfc3339(),
         independent_validation.summary
     ));
+    execution.verification = verification.clone();
+    execution.latest_payload = attach_independent_validation_payload(
+        terminal.clone(),
+        serde_json::to_value(&independent_validation).unwrap_or_else(|_| json!({})),
+    );
+    repository.upsert_work_execution(&execution).await?;
+    repository.upsert_work_item(item).await?;
     emit_execution_event(
         event_callback,
         "execution.independent_validation",
@@ -669,11 +680,6 @@ async fn dispatch_claimed_work_item_inner(
         }),
         serde_json::to_value(&independent_validation).unwrap_or_else(|_| json!({})),
     );
-    execution.verification = verification.clone();
-    execution.latest_payload = attach_independent_validation_payload(
-        terminal.clone(),
-        serde_json::to_value(&independent_validation).unwrap_or_else(|_| json!({})),
-    );
 
     let verification_passed = verification
         .get("passed")
@@ -682,6 +688,8 @@ async fn dispatch_claimed_work_item_inner(
     if verification_passed {
         execution.mark_status(ExecutionStatus::Success);
         item.mark_stage_validated(current_stage);
+        repository.upsert_work_execution(&execution).await?;
+        repository.upsert_work_item(item).await?;
         emit_execution_event(
             event_callback,
             "execution.verification",
@@ -705,6 +713,8 @@ async fn dispatch_claimed_work_item_inner(
                     current_stage.as_str(),
                     next_stage.as_str()
                 ));
+                repository.upsert_work_execution(&execution).await?;
+                repository.upsert_work_item(item).await?;
                 emit_execution_event(
                     event_callback,
                     "execution.stage_promoted",
@@ -780,6 +790,8 @@ async fn dispatch_claimed_work_item_inner(
             refiner_job_id,
             failure_reason
         ));
+        repository.upsert_work_execution(&execution).await?;
+        repository.upsert_work_item(item).await?;
         emit_execution_event(
             event_callback,
             "execution.verification",
@@ -894,6 +906,8 @@ async fn preview_work_item_execution(
         "{} dry-run preview generated; no external execution was started",
         crate::models::now_utc().to_rfc3339()
     ));
+    repository.upsert_work_execution(&execution).await?;
+    repository.upsert_work_item(&item).await?;
     emit_execution_event(
         event_callback,
         "execution.dry_run",
@@ -903,8 +917,6 @@ async fn preview_work_item_execution(
         Some(execution.status.as_str()),
         execution.latest_payload.clone(),
     );
-    repository.upsert_work_execution(&execution).await?;
-    repository.upsert_work_item(&item).await?;
     Ok(execution)
 }
 
@@ -929,6 +941,8 @@ async fn finalize_execution_failure(
         message
     ));
     item.touch_execution(execution.id, execution.policy.clone());
+    repository.upsert_work_execution(execution).await?;
+    repository.upsert_work_item(item).await?;
     emit_execution_event(
         event_callback,
         "execution.failed",
@@ -941,8 +955,6 @@ async fn finalize_execution_failure(
             "target_service": item.target_service.clone(),
         }),
     );
-    repository.upsert_work_execution(execution).await?;
-    repository.upsert_work_item(item).await?;
     Ok(execution.clone())
 }
 
@@ -1569,6 +1581,11 @@ async fn poll_refiner_job(
         });
         if status != last_status {
             last_status = status.clone();
+            // Keep the durable execution state ahead of its event so event
+            // persistence cannot race the execution foreign-key insert, and
+            // so a restart can resume from the observed Refiner state.
+            repository.upsert_work_execution(execution).await?;
+            repository.upsert_work_item(item).await?;
             emit_execution_event(
                 event_callback,
                 "execution.refiner_status",
@@ -1582,9 +1599,10 @@ async fn poll_refiner_job(
                     "progress_pct": progress,
                 }),
             );
+        } else {
+            repository.upsert_work_execution(execution).await?;
+            repository.upsert_work_item(item).await?;
         }
-        repository.upsert_work_execution(execution).await?;
-        repository.upsert_work_item(item).await?;
 
         if matches!(
             status.as_str(),
