@@ -1244,6 +1244,29 @@ fn build_job_payload(
             "work_branch".to_string(),
             json!(work_branch_name(work_item)),
         );
+
+        // A repository-delivery work item targets the owning repository.  Do
+        // not ask Refiner to fork a repository into the same GitHub
+        // organisation: GitHub rejects that operation (typically as 404),
+        // even when the caller has valid repository permissions.  External
+        // repositories retain Refiner's normal fork behaviour.
+        let is_repository_delivery = work_item
+            .plan
+            .get("action")
+            .and_then(Value::as_str)
+            .is_some_and(|action| action.eq_ignore_ascii_case("repository_delivery"));
+        if is_repository_delivery {
+            if let Some(repo_url) = payload.get("repo_url").and_then(Value::as_str) {
+                if let Some((owner, _repository)) = github_repository_coordinate(repo_url) {
+                    let configured_owner = config.discovery.github.owner.trim();
+                    if !configured_owner.is_empty() && owner.eq_ignore_ascii_case(configured_owner)
+                    {
+                        payload.insert("fork_org".to_string(), json!(owner));
+                        payload.insert("skip_fork".to_string(), json!(true));
+                    }
+                }
+            }
+        }
     }
     if let Some(deployment_automation) = deployment_automation_context(config, service) {
         payload.insert("deployment_automation".to_string(), deployment_automation);
@@ -2047,6 +2070,14 @@ mod tests {
         assert_eq!(
             payload.get("repo_branch").and_then(Value::as_str),
             Some("main")
+        );
+        assert_eq!(
+            payload.get("fork_org").and_then(Value::as_str),
+            Some("neuralmimicry")
+        );
+        assert_eq!(
+            payload.get("skip_fork").and_then(Value::as_bool),
+            Some(true)
         );
     }
 
