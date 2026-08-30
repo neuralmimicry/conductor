@@ -348,8 +348,18 @@ fn grafana_metrics(service: &ServiceSnapshot) -> Map<String, Value> {
         .get("dashboard_count")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let coverage_gap = if datasource_count == 0 || dashboard_count == 0 {
+    let coverage_known = root
+        .get("coverage_known")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let coverage_access_limited = root
+        .get("coverage_access_limited")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let coverage_gap = if coverage_known && (datasource_count == 0 || dashboard_count == 0) {
         1.0
+    } else if !coverage_known || coverage_access_limited {
+        0.5
     } else {
         0.0
     };
@@ -374,6 +384,11 @@ fn grafana_metrics(service: &ServiceSnapshot) -> Map<String, Value> {
     metrics.insert(
         "dashboard_count".to_string(),
         json!(normalize_signal(dashboard_count as f64)),
+    );
+    metrics.insert("coverage_known".to_string(), json!(coverage_known));
+    metrics.insert(
+        "coverage_access_limited".to_string(),
+        json!(coverage_access_limited),
     );
     metrics
 }
@@ -713,5 +728,49 @@ mod tests {
             .unwrap_or(0.0);
 
         assert!(payload >= 0.87);
+    }
+
+    #[test]
+    fn grafana_auth_limited_coverage_is_not_reported_as_zero_inventory() {
+        let service = ServiceSnapshot {
+            service_key: "grafana".to_string(),
+            display_name: "Grafana".to_string(),
+            kind: "observability".to_string(),
+            role_name: "grafana".to_string(),
+            playbooks: vec![],
+            host_targets: vec![],
+            hosts: vec![],
+            namespace: None,
+            service_name: None,
+            deployment_environment: None,
+            internal_url: None,
+            public_url: None,
+            repo_path: None,
+            repo_url: None,
+            repo_branch: None,
+            health: crate::models::ServiceHealth::Degraded,
+            capabilities: vec![],
+            dependencies: vec![],
+            storage_paths: vec![],
+            raw_defaults: json!({}),
+            probe: json!({
+                "metrics": {
+                    "database_status": "ok",
+                    "datasource_count": 0,
+                    "dashboard_count": 0,
+                    "coverage_known": false,
+                    "coverage_access_limited": true
+                }
+            }),
+            discovered_at: now_utc(),
+            updated_at: now_utc(),
+        };
+
+        let samples = collect_metric_samples(Uuid::new_v4(), &[service]);
+        let metrics = &samples[0].metrics;
+
+        assert_eq!(metrics["coverage_known"], Value::Bool(false));
+        assert_eq!(metrics["coverage_access_limited"], Value::Bool(true));
+        assert_eq!(metrics["pressure_score"], json!(0.5));
     }
 }

@@ -784,36 +784,38 @@ async fn probe_grafana(
             }
 
             let (datasources, dashboards) = tokio::join!(
-                async {
-                    get_json_with_auth(client, &base_url, "/api/datasources", external)
-                        .await
-                        .ok()
-                },
-                async {
-                    get_json_with_auth_query(
-                        client,
-                        &base_url,
-                        "/api/search",
-                        &[("type", "dash-db"), ("limit", "1000")],
-                        external,
-                    )
-                    .await
-                    .ok()
-                }
+                get_json_with_auth(client, &base_url, "/api/datasources", external),
+                get_json_with_auth_query(
+                    client,
+                    &base_url,
+                    "/api/search",
+                    &[("type", "dash-db"), ("limit", "1000")],
+                    external,
+                ),
             );
+            let datasource_access = grafana_access_state(&datasources);
+            let dashboard_access = grafana_access_state(&dashboards);
+            let coverage_known =
+                datasource_access == "authorized" && dashboard_access == "authorized";
+            let coverage_access_limited = [datasource_access, dashboard_access]
+                .into_iter()
+                .any(|state| state == "auth_limited");
 
             let datasource_count = datasources
                 .as_ref()
+                .ok()
                 .and_then(Value::as_array)
                 .map(|items| items.len())
                 .unwrap_or(0);
             let dashboard_count = dashboards
                 .as_ref()
+                .ok()
                 .and_then(Value::as_array)
                 .map(|items| items.len())
                 .unwrap_or(0);
             let datasource_sample = datasources
                 .as_ref()
+                .ok()
                 .and_then(Value::as_array)
                 .map(|items| {
                     items
@@ -832,6 +834,7 @@ async fn probe_grafana(
                 .unwrap_or_default();
             let dashboard_sample = dashboards
                 .as_ref()
+                .ok()
                 .and_then(Value::as_array)
                 .map(|items| {
                     items
@@ -853,21 +856,33 @@ async fn probe_grafana(
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
 
+            let coverage_summary = if coverage_access_limited {
+                "coverage inspection requires Grafana authentication"
+            } else if !coverage_known {
+                "coverage inspection was unavailable"
+            } else {
+                "coverage inspected"
+            };
+
             Ok(ProbeResult {
                 endpoint: Some(base_url.clone()),
                 summary: format!(
-                    "Grafana health retrieved with {} datasource(s) and {} dashboard(s)",
-                    datasource_count, dashboard_count
+                    "Grafana health retrieved; {} with {} datasource(s) and {} dashboard(s)",
+                    coverage_summary, datasource_count, dashboard_count
                 ),
                 metrics: json!({
                     "health": health,
                     "database_status": database_status,
                     "datasource_count": datasource_count,
                     "dashboard_count": dashboard_count,
+                    "datasource_access": datasource_access,
+                    "dashboard_access": dashboard_access,
+                    "coverage_known": coverage_known,
+                    "coverage_access_limited": coverage_access_limited,
                     "datasources": datasource_sample,
                     "dashboards": dashboard_sample,
                 }),
-                health: if database_status.eq_ignore_ascii_case("ok") {
+                health: if database_status.eq_ignore_ascii_case("ok") && coverage_known {
                     ServiceHealth::Healthy
                 } else {
                     ServiceHealth::Degraded
@@ -891,6 +906,21 @@ async fn probe_grafana(
         "no Grafana base URL available ({})",
         attempts.join("; ")
     ))
+}
+
+fn grafana_access_state(result: &Result<Value>) -> &'static str {
+    match result {
+        Ok(_) => "authorized",
+        Err(error)
+            if {
+                let message = error.to_string();
+                message.starts_with("unauthorized:") || message.starts_with("forbidden:")
+            } =>
+        {
+            "auth_limited"
+        }
+        Err(_) => "unavailable",
+    }
 }
 
 async fn probe_prometheus(
@@ -1006,6 +1036,10 @@ async fn probe_postgres(
             sqlx::query_scalar("SELECT current_setting('max_connections')::bigint")
                 .fetch_one(&mut connection)
                 .await?;
+        let size_bytes: i64 =
+            sqlx::query_scalar("SELECT pg_database_size(current_database())::bigint")
+                .fetch_one(&mut connection)
+                .await?;
 
         let aggregate_row = sqlx::query(
             r#"
@@ -1021,7 +1055,23 @@ async fn probe_postgres(
             "#,
         )
         .fetch_one(&mut connection)
-        .await?;
+        .await;
+        let aggregate_row = match aggregate_row {
+            Ok(row) => row,
+            Err(error) if postgres_observability_permission_error(&error) => {
+                return Result::<Value>::Ok(json!({
+                    "database": {
+                        "current_database": current_database,
+                        "connection_source": connection_source,
+                        "max_connections": max_connections,
+                        "size_bytes": size_bytes,
+                        "observability_limited": true,
+                        "observability_error": "pg_stat_database_access_denied",
+                    }
+                }));
+            }
+            Err(error) => return Err(error.into()),
+        };
 
         let current_database_row = sqlx::query(
             r#"
@@ -1145,16 +1195,26 @@ async fn probe_postgres(
         .get("idle_in_transaction")
         .and_then(Value::as_i64)
         .unwrap_or(0);
+    let observability_limited = database
+        .get("observability_limited")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     Ok(ProbeResult {
         endpoint: None,
         summary: format!(
-            "Postgres queried with {:.0}% connection utilisation and {} waiting session(s)",
+            "{} with {:.0}% connection utilisation and {} waiting session(s)",
+            if observability_limited {
+                "Postgres is reachable but connection statistics are permission-limited"
+            } else {
+                "Postgres queried"
+            },
             connection_utilization * 100.0,
             waiting_connections
         ),
         metrics,
-        health: if connection_utilization >= 0.9
+        health: if observability_limited
+            || connection_utilization >= 0.9
             || waiting_connections > 0
             || idle_in_transaction >= 4
         {
@@ -1163,6 +1223,13 @@ async fn probe_postgres(
             ServiceHealth::Healthy
         },
     })
+}
+
+fn postgres_observability_permission_error(error: &sqlx::Error) -> bool {
+    error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("permission denied for view pg_stat_database")
 }
 
 async fn probe_shared_storage(
@@ -1316,16 +1383,23 @@ async fn probe_generic(
 
     let checks = future::join_all(candidates.iter().cloned().map(|base_url| async move {
         let result: Result<ProbeResult> = async {
-            let (healthz_result, health_result, tags_result) = tokio::join!(
+            let (healthz_result, health_result, api_health_result, tags_result) = tokio::join!(
                 get_json_with_auth(client, &base_url, "/healthz", external),
                 get_json_with_auth(client, &base_url, "/health", external),
+                get_json_with_auth(client, &base_url, "/api/health", external),
                 get_json_with_auth(client, &base_url, "/api/tags", external),
             );
-            let probe = match (healthz_result, health_result, tags_result) {
-                (Ok(value), _, _) => Ok((value, "/healthz")),
-                (Err(_), Ok(value), _) => Ok((value, "/health")),
-                (Err(_), Err(_), Ok(value)) => Ok((value, "/api/tags")),
-                (Err(error), _, _) => Err(error),
+            let probe = match (
+                healthz_result,
+                health_result,
+                api_health_result,
+                tags_result,
+            ) {
+                (Ok(value), _, _, _) => Ok((value, "/healthz")),
+                (Err(_), Ok(value), _, _) => Ok((value, "/health")),
+                (Err(_), Err(_), Ok(value), _) => Ok((value, "/api/health")),
+                (Err(_), Err(_), Err(_), Ok(value)) => Ok((value, "/api/tags")),
+                (Err(error), _, _, _) => Err(error),
             }?;
 
             Ok(ProbeResult {
@@ -1969,6 +2043,40 @@ mod tests {
         handle.abort();
     }
 
+    #[tokio::test]
+    async fn generic_probe_accepts_api_health_surface() {
+        async fn api_health() -> Json<Value> {
+            Json(json!({"status": "ok", "service": "webots"}))
+        }
+
+        let app = Router::new().route("/api/health", get(api_health));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind generic mock");
+        let addr = listener.local_addr().expect("generic mock addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve generic mock");
+        });
+
+        let base_url = format!("http://{}", addr);
+        let mut service = sample_refiner_service(base_url.clone());
+        service.service_key = "webots".to_string();
+        service.display_name = "Webots".to_string();
+        let client = build_http_client(2).expect("client");
+
+        let probe = probe_service(&client, &ConductorConfig::default(), &service)
+            .await
+            .expect("generic probe");
+
+        assert_eq!(probe.endpoint.as_deref(), Some(base_url.as_str()));
+        assert_eq!(probe.metrics["path_used"].as_str(), Some("/api/health"));
+        assert_eq!(probe.health, ServiceHealth::Healthy);
+
+        handle.abort();
+    }
+
     #[test]
     fn resolve_base_url_prefers_internal_before_public() {
         let service = ServiceSnapshot {
@@ -2040,5 +2148,33 @@ mod tests {
                 "https://prometheus.neuralmimicry.ai".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn grafana_access_state_distinguishes_auth_from_transport_failures() {
+        assert_eq!(
+            grafana_access_state(&Err(anyhow!("unauthorized: login required"))),
+            "auth_limited"
+        );
+        assert_eq!(
+            grafana_access_state(&Err(anyhow!("forbidden: insufficient scope"))),
+            "auth_limited"
+        );
+        assert_eq!(
+            grafana_access_state(&Err(anyhow!("request timed out"))),
+            "unavailable"
+        );
+        assert_eq!(grafana_access_state(&Ok(json!([]))), "authorized");
+    }
+
+    #[test]
+    fn postgres_observability_permission_error_matches_pg_stat_database_denial() {
+        let error =
+            sqlx::Error::Protocol("permission denied for view pg_stat_database".to_string());
+
+        assert!(postgres_observability_permission_error(&error));
+        assert!(!postgres_observability_permission_error(
+            &sqlx::Error::Protocol("connection refused".to_string(),)
+        ));
     }
 }

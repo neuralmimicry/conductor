@@ -677,12 +677,14 @@ async fn dispatch_claimed_work_item_inner(
             json!(current_rollout.as_str()),
         );
     }
-    let independent_validation = run_independent_validation(
+    let independent_validation = run_independent_validation_with_heartbeat(
         &config.validation,
         target_service,
         &policy.required_verifications,
+        &mut execution,
+        repository,
     )
-    .await;
+    .await?;
     merge_independent_validation(
         &mut verification,
         &independent_validation,
@@ -2250,6 +2252,34 @@ fn verify_refiner_result(detail: &Value) -> Value {
         "stage_failures": stage_failures,
         "reasons": findings,
     })
+}
+
+/// Keep the durable execution timestamp fresh while independent checks run.
+/// Validation commands are bounded individually, but a project can have
+/// several checks and the aggregate duration may exceed the stale-execution
+/// threshold.  Without this heartbeat a healthy, long-running verification is
+/// indistinguishable from a crashed Conductor process after a restart.
+async fn run_independent_validation_with_heartbeat(
+    config: &crate::config::ValidationConfig,
+    service: Option<&ServiceSnapshot>,
+    required_checks: &[String],
+    execution: &mut WorkExecution,
+    repository: &dyn ConductorRepository,
+) -> Result<crate::validation::IndependentValidationReport> {
+    let validation = run_independent_validation(config, service, required_checks);
+    tokio::pin!(validation);
+    let heartbeat_seconds = (config.timeout_seconds.max(1).min(60)).min(30).max(5);
+    let heartbeat_interval = Duration::from_secs(heartbeat_seconds);
+
+    loop {
+        tokio::select! {
+            report = &mut validation => return Ok(report),
+            _ = tokio::time::sleep(heartbeat_interval) => {
+                execution.updated_at = crate::models::now_utc();
+                repository.upsert_work_execution(execution).await?;
+            }
+        }
+    }
 }
 
 fn merge_independent_validation(

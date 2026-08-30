@@ -31,6 +31,133 @@ pub struct DetectedFinding {
     pub recommendation: RecommendationSeed,
 }
 
+/// Return a stable repository identity across local inventory and GitHub
+/// discovery. The same repository can otherwise arrive as `owner/name` from
+/// GitHub and `name` from a local checkout, producing duplicate findings and
+/// work items for one codebase.
+fn repository_identity(repository: &RepositorySnapshot) -> String {
+    if let Some(url) = repository.repo_url.as_deref() {
+        let mut value = url.trim().to_ascii_lowercase();
+        if let Some(path) = value.strip_prefix("git@github.com:") {
+            value = path.to_string();
+        } else if let Some((_, path)) = value.split_once("://") {
+            value = path
+                .split_once('/')
+                .map(|(_, path)| path)
+                .unwrap_or(path)
+                .to_string();
+        }
+        return value
+            .trim_matches('/')
+            .strip_suffix(".git")
+            .unwrap_or(value.trim_matches('/'))
+            .to_string();
+    }
+
+    let key = repository.repo_key.trim();
+    if key.contains('/') {
+        key.to_ascii_lowercase()
+    } else if let Some(owner) = repository
+        .owner
+        .as_deref()
+        .filter(|owner| !owner.trim().is_empty())
+    {
+        format!(
+            "{}/{}",
+            owner.trim().to_ascii_lowercase(),
+            key.to_ascii_lowercase()
+        )
+    } else {
+        key.to_ascii_lowercase()
+    }
+}
+
+fn repository_preference_score(repository: &RepositorySnapshot) -> usize {
+    repository.local_path.is_some() as usize * 100
+        + ((!repository.repo_key.contains('/')) as usize) * 10
+        + repository.capabilities.len()
+        + repository.linked_services.len()
+}
+
+/// Collapse duplicate repository records while retaining the useful union of
+/// inventory facts. Local snapshots win scalar identity fields because they
+/// carry the checkout path used by controlled change execution.
+fn deduplicate_repositories(repositories: &[RepositorySnapshot]) -> Vec<RepositorySnapshot> {
+    let mut canonical = BTreeMap::<String, RepositorySnapshot>::new();
+    for repository in repositories {
+        let identity = repository_identity(repository);
+        let Some(existing) = canonical.get_mut(&identity) else {
+            canonical.insert(identity, repository.clone());
+            continue;
+        };
+
+        let existing_score = repository_preference_score(existing);
+        let candidate_score = repository_preference_score(repository);
+        if candidate_score > existing_score {
+            let mut selected = repository.clone();
+            selected.capabilities = unique_strings(
+                [
+                    existing.capabilities.clone(),
+                    repository.capabilities.clone(),
+                ]
+                .concat(),
+            );
+            selected.linked_services = unique_strings(
+                [
+                    existing.linked_services.clone(),
+                    repository.linked_services.clone(),
+                ]
+                .concat(),
+            );
+            selected.dependencies = unique_strings(
+                [
+                    existing.dependencies.clone(),
+                    repository.dependencies.clone(),
+                ]
+                .concat(),
+            );
+            selected.inventory_sources = unique_strings(
+                [
+                    existing.inventory_sources.clone(),
+                    repository.inventory_sources.clone(),
+                ]
+                .concat(),
+            );
+            *existing = selected;
+        } else {
+            existing.capabilities = unique_strings(
+                [
+                    existing.capabilities.clone(),
+                    repository.capabilities.clone(),
+                ]
+                .concat(),
+            );
+            existing.linked_services = unique_strings(
+                [
+                    existing.linked_services.clone(),
+                    repository.linked_services.clone(),
+                ]
+                .concat(),
+            );
+            existing.dependencies = unique_strings(
+                [
+                    existing.dependencies.clone(),
+                    repository.dependencies.clone(),
+                ]
+                .concat(),
+            );
+            existing.inventory_sources = unique_strings(
+                [
+                    existing.inventory_sources.clone(),
+                    repository.inventory_sources.clone(),
+                ]
+                .concat(),
+            );
+        }
+    }
+    canonical.into_values().collect()
+}
+
 #[derive(Clone, Debug)]
 struct EvidenceSeed {
     evidence_type: String,
@@ -661,9 +788,33 @@ pub fn detect_findings(
                 .unwrap_or("unknown");
             let datasource_count = extract_i64(&metrics, "datasource_count").unwrap_or(0);
             let dashboard_count = extract_i64(&metrics, "dashboard_count").unwrap_or(0);
+            let coverage_known = metrics
+                .get("coverage_known")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let coverage_access_limited = metrics
+                .get("coverage_access_limited")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let visibility_summary = if coverage_access_limited {
+                format!(
+                    "Grafana health is reporting database='{}', but Conductor cannot inspect datasource/dashboard coverage because the Grafana API requires authentication. Configure a read-only Grafana credential for Conductor.",
+                    database_status
+                )
+            } else if !coverage_known {
+                format!(
+                    "Grafana health is reporting database='{}', but datasource/dashboard coverage could not be inspected. Restore the Grafana API probe path before relying on dashboard evidence.",
+                    database_status
+                )
+            } else {
+                format!(
+                    "Grafana health is reporting database='{}' with {} datasource(s) and {} dashboard(s). Restore dashboard coverage and backing state so estate operators retain a usable observability cockpit.",
+                    database_status, datasource_count, dashboard_count
+                )
+            };
             if !database_status.eq_ignore_ascii_case("ok")
-                || datasource_count == 0
-                || dashboard_count == 0
+                || coverage_access_limited
+                || (coverage_known && (datasource_count == 0 || dashboard_count == 0))
             {
                 let severity = if !database_status.eq_ignore_ascii_case("ok") {
                     FindingSeverity::High
@@ -680,12 +831,7 @@ pub fn detect_findings(
                     source_run_id,
                     "grafana_visibility_gap",
                     "Grafana visibility surface needs attention",
-                    &format!(
-                        "Grafana health is reporting database='{}' with {} datasource(s) and {} dashboard(s). Restore dashboard coverage and backing state so estate operators retain a usable observability cockpit.",
-                        database_status,
-                        datasource_count,
-                        dashboard_count
-                    ),
+                    &visibility_summary,
                     "observability",
                     severity,
                     Some("grafana".to_string()),
@@ -697,6 +843,8 @@ pub fn detect_findings(
                         "database_status": database_status,
                         "datasource_count": datasource_count,
                         "dashboard_count": dashboard_count,
+                        "coverage_known": coverage_known,
+                        "coverage_access_limited": coverage_access_limited,
                     }),
                     vec![EvidenceSeed {
                         evidence_type: "runtime_probe".to_string(),
@@ -726,12 +874,7 @@ pub fn detect_findings(
                     RecommendationSeed {
                         dedupe_key: "grafana:visibility".to_string(),
                         title: "Restore Grafana visibility coverage".to_string(),
-                        summary: format!(
-                            "Grafana health is reporting database='{}' with {} datasource(s) and {} dashboard(s). Restore dashboard coverage and backing state so estate operators retain a usable observability cockpit.",
-                            database_status,
-                            datasource_count,
-                            dashboard_count
-                        ),
+                        summary: visibility_summary.clone(),
                         target_service: Some("grafana".to_string()),
                         priority,
                         tags: vec!["observability".to_string(), "dashboard".to_string()],
@@ -1002,7 +1145,7 @@ pub fn detect_findings(
         }
     }
 
-    for repository in repositories {
+    for repository in deduplicate_repositories(repositories) {
         if repository.archived && !repository.linked_services.is_empty() {
             findings.push(build_detected_finding(
                 existing_by_key.get(&format!("archived_live_repo:{}", repository.repo_key)),
@@ -1032,7 +1175,7 @@ pub fn detect_findings(
                     source_kind: "inventory".to_string(),
                     source_ref: repository.repo_key.clone(),
                     summary: "Archived repository remains linked to active services".to_string(),
-                    payload: repository_evidence_payload(repository),
+                    payload: repository_evidence_payload(&repository),
                 }],
                 vec![
                     provenance_seed(
@@ -1121,7 +1264,7 @@ pub fn detect_findings(
                     source_kind: "inventory".to_string(),
                     source_ref: repository.repo_key.clone(),
                     summary: "Repository capabilities do not include tests while linked services are present".to_string(),
-                    payload: repository_evidence_payload(repository),
+                    payload: repository_evidence_payload(&repository),
                 }],
                 vec![
                     provenance_seed(
@@ -1929,6 +2072,30 @@ mod tests {
     }
 
     #[test]
+    fn detect_findings_collapses_local_and_github_repository_aliases() {
+        let local = base_repository("gail");
+        let mut github = base_repository("neuralmimicry/gail");
+        github.repo_url = Some("git@github.com:neuralmimicry/gail.git".to_string());
+        github.local_path = None;
+
+        let detected = detect_findings(&[], &[local, github], &[], None, &[]);
+        let baseline = detected
+            .iter()
+            .filter(|item| {
+                item.finding
+                    .finding_key
+                    .starts_with("repository_test_baseline:")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(baseline.len(), 1);
+        assert_eq!(
+            baseline[0].recommendation.dedupe_key,
+            "repo:test_baseline:gail"
+        );
+    }
+
+    #[test]
     fn detect_findings_preserves_existing_first_seen_timestamp() {
         let repository = base_repository("tracey");
         let existing = FindingRecord {
@@ -2010,6 +2177,32 @@ mod tests {
             detected
                 .iter()
                 .any(|item| item.finding.finding_key == "shared_storage_pressure")
+        );
+    }
+
+    #[test]
+    fn detect_findings_reports_grafana_auth_limited_coverage() {
+        let mut grafana = base_service("grafana");
+        grafana.probe = json!({
+            "metrics": {
+                "database_status": "ok",
+                "datasource_count": 0,
+                "dashboard_count": 0,
+                "coverage_known": false,
+                "coverage_access_limited": true
+            }
+        });
+
+        let detected = detect_findings(&[grafana], &[], &[], None, &[]);
+        let finding = detected
+            .iter()
+            .find(|item| item.finding.finding_key == "grafana_visibility_gap")
+            .expect("Grafana visibility finding");
+
+        assert!(finding.finding.summary.contains("requires authentication"));
+        assert_eq!(
+            finding.finding.details["coverage_access_limited"],
+            Value::Bool(true)
         );
     }
 }
