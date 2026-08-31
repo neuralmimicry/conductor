@@ -496,7 +496,10 @@ impl Default for ExecutionConfig {
             token_scope: "personal".to_string(),
             llm_provider: None,
             llm_model: None,
-            coding_agent: Some("project_solver".to_string()),
+            // Refiner's --codingagent flag accepts coding-agent backends
+            // (llm/opencode/codex), not workflow identifiers such as
+            // project_solver. Keep the workflow selection above separate.
+            coding_agent: Some("llm".to_string()),
         }
     }
 }
