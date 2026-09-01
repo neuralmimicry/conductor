@@ -1927,7 +1927,14 @@ fn deployment_automation_context(
     service: Option<&ServiceSnapshot>,
 ) -> Option<Value> {
     let ansible_root = &config.discovery.ansible_root;
-    if ansible_root.as_os_str().is_empty() || !ansible_root.exists() {
+    // A container image creates the configured workspace paths before the
+    // read-only Ansible checkout is mounted.  Treat such an empty placeholder
+    // as unavailable; otherwise execution plans advertise automation context
+    // that cannot actually be used.
+    if ansible_root.as_os_str().is_empty()
+        || !ansible_root.join("ansible.cfg").is_file()
+        || !ansible_root.join("inventory").join("hosts.ini").is_file()
+    {
         return None;
     }
     let repo_root = ansible_root.parent().unwrap_or(ansible_root);
