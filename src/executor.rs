@@ -29,6 +29,11 @@ use crate::{
 pub type ExecutionEventCallback = Arc<dyn Fn(ConductorEvent) + Send + Sync>;
 
 const REFINER_EXECUTION_PLAN_PATH: &str = "/api/execution/plan";
+// Discovery and health integrations use a short timeout, but Refiner job
+// payloads include bounded logs and metrics and can take longer to read while
+// the solver is busy. Keep lifecycle polling from failing on that unrelated
+// short integration timeout.
+const REFINER_OPERATION_REQUEST_TIMEOUT_SECONDS: u64 = 60;
 
 async fn reconcile_stale_executions(
     repository: &dyn ConductorRepository,
@@ -419,7 +424,13 @@ async fn dispatch_claimed_work_item_inner(
         .await;
     item.clear_claim();
 
-    let client = match build_refiner_client(config.integrations.refiner.timeout_seconds.max(1)) {
+    let client = match build_refiner_client(
+        config
+            .integrations
+            .refiner
+            .timeout_seconds
+            .max(REFINER_OPERATION_REQUEST_TIMEOUT_SECONDS),
+    ) {
         Ok(client) => client,
         Err(error) => {
             return finalize_execution_failure(
