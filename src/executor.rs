@@ -1876,14 +1876,20 @@ fn requirements_text(
     let rollout_requirement = if let Some(context) = deployment_automation_context(config, service)
     {
         format!(
-            "\n- REQ-007: When runtime rollout or restart work is needed, use the available Ansible automation context: {}.",
+            "\n- REQ-013: When runtime rollout or restart work is needed, use the available Ansible automation context: {}.",
             context
         )
     } else {
         String::new()
     };
+    let protected_rollout_requirements = if service.is_some() {
+        "\n- REQ-009: Capture a fresh protected-target readiness baseline before any change.\n- REQ-010: Use the selected canary or red-green rollout strategy and verify the post-rollout health window.\n- REQ-011: Automatically revert the exact produced commit without rewriting history if health or verification degrades.\n- REQ-012: Verify rollback readiness and recovery before finalising the delivery."
+            .to_string()
+    } else {
+        String::new()
+    };
     let authoritative = format!(
-        "Overview: Improve {target} through the Conductor execution loop.\n\nDelivery Context:\n- Current stage: {delivery_stage}\n- Validated stages: {validated_stages}\n- Rollout strategy: {rollout_strategy}\n\nRequirements Register:\n- REQ-001: Inspect and record current repository, runtime, or job evidence before selecting an operation.\n- REQ-002: Implement only the scoped change, job update, or progress-monitoring action supported by that evidence.\n- REQ-003: Preserve secure, resilient behaviour and avoid destructive commands.\n- REQ-004: Update or add tests covering the changed path, or provide the relevant live operational check.\n- REQ-005: Run verification commands and report the outcome.\n- REQ-006: Leave unrelated files untouched.\n- REQ-007: Record rollback/recovery steps and the acceptance signal proving the gap is closed.\n- REQ-008: Preserve staged progression and rollout governance metadata.{rollout_requirement}\n\nWork Item Summary:\n{summary}\n\nPlan JSON:\n{plan}",
+        "Overview: Improve {target} through the Conductor execution loop.\n\nDelivery Context:\n- Current stage: {delivery_stage}\n- Validated stages: {validated_stages}\n- Rollout strategy: {rollout_strategy}\n\nRequirements Register:\n- REQ-001: Inspect and record current repository, runtime, or job evidence before selecting an operation.\n- REQ-002: Implement only the scoped change, job update, or progress-monitoring action supported by that evidence.\n- REQ-003: Preserve secure, resilient behaviour and avoid destructive commands.\n- REQ-004: Update or add tests covering the changed path, or provide the relevant live operational check.\n- REQ-005: Run verification commands and report the outcome.\n- REQ-006: Leave unrelated files untouched.\n- REQ-007: Record rollback/recovery steps and the acceptance signal proving the gap is closed.\n- REQ-008: Preserve staged progression and rollout governance metadata.{protected_rollout_requirements}{rollout_requirement}\n\nWork Item Summary:\n{summary}\n\nPlan JSON:\n{plan}",
         target = target,
         delivery_stage = work_item.delivery_stage.as_str(),
         validated_stages = if work_item.validated_stages.is_empty() {
@@ -1897,6 +1903,7 @@ fn requirements_text(
                 .join(", ")
         },
         rollout_strategy = work_item.rollout_strategy.as_str(),
+        protected_rollout_requirements = protected_rollout_requirements,
         rollout_requirement = rollout_requirement,
         summary = work_item.summary,
         plan = work_item.plan,
