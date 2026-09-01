@@ -1757,6 +1757,12 @@ fn build_job_payload(
         json!(requirements_text(config, plan_response, work_item, service)),
     );
     payload.insert("project_run".to_string(), json!(true));
+    // Conductor supplies an authoritative, evidence-backed requirements
+    // document.  Do not let Refiner add unrelated repository-wide sequence
+    // or helper-module findings to this execution; those belong to a
+    // separately planned discovery task and can otherwise exhaust the local
+    // solver context before the requested work starts.
+    payload.insert("requirements_only".to_string(), json!(true));
     payload.insert("dry_run".to_string(), json!(config.execution.dry_run));
     payload.insert(
         "token_scope".to_string(),
@@ -2789,6 +2795,7 @@ mod tests {
                 .and_then(Value::as_str),
             Some("strict")
         );
+        assert_eq!(payload.get("requirements_only"), Some(&json!(true)));
     }
 
     #[test]
