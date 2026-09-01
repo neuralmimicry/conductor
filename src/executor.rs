@@ -731,10 +731,7 @@ async fn dispatch_claimed_work_item_inner(
 
     let mut safety_post_rollout = json!({"required": false});
     let mut rollback = json!({"attempted": false});
-    let refiner_completed = terminal
-        .get("status")
-        .and_then(Value::as_str)
-        .is_some_and(|status| status.eq_ignore_ascii_case("completed"));
+    let refiner_completed = refiner_effective_status(&terminal) == "completed";
     if !policy.sensitive_targets.is_empty() && refiner_completed {
         safety_post_rollout = run_safety_health_window(config, target_service).await;
         if let Some(object) = verification.as_object_mut() {
@@ -2187,11 +2184,7 @@ async fn poll_refiner_job(
         .await
         .with_context(|| format!("failed to poll Refiner job {}", job_id))?;
         execution.latest_payload = detail.clone();
-        let status = detail
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_ascii_lowercase();
+        let status = refiner_effective_status(&detail);
         let progress = detail
             .get("progress")
             .and_then(Value::as_i64)
@@ -2249,12 +2242,58 @@ async fn poll_refiner_job(
     }
 }
 
-fn verify_refiner_result(detail: &Value) -> Value {
+fn refiner_effective_status(detail: &Value) -> String {
     let status = detail
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_ascii_lowercase();
+    if matches!(
+        status.as_str(),
+        "completed" | "failed" | "cancelled" | "stopped"
+    ) {
+        return status;
+    }
+
+    // Refiner can publish terminal metadata before updating its top-level
+    // status. Treat a finished job with a non-zero exit code or failed stage
+    // as failed instead of waiting until the Conductor job timeout.
+    let finished = detail
+        .get("finished_at")
+        .is_some_and(|value| value.as_str().is_some_and(|text| !text.trim().is_empty()));
+    if finished {
+        let exit_failed = detail
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .is_some_and(|code| code != 0);
+        let stage_failed = detail
+            .get("stages")
+            .and_then(Value::as_array)
+            .is_some_and(|stages| {
+                stages.iter().any(|stage| {
+                    stage
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .is_some_and(|stage_status| {
+                            matches!(
+                                stage_status.to_ascii_lowercase().as_str(),
+                                "failed" | "blocked" | "cancelled"
+                            )
+                        })
+                })
+            });
+        return if exit_failed || stage_failed {
+            "failed".to_string()
+        } else {
+            "completed".to_string()
+        };
+    }
+
+    status
+}
+
+fn verify_refiner_result(detail: &Value) -> Value {
+    let status = refiner_effective_status(detail);
     let mut stage_failures = Vec::new();
     if let Some(stages) = detail.get("stages").and_then(Value::as_array) {
         for stage in stages {
@@ -3035,6 +3074,41 @@ mod tests {
             ]
         }));
         assert_eq!(report.get("passed").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn terminal_refiner_metadata_overrides_stale_running_status() {
+        let detail = json!({
+            "status": "running",
+            "progress": 100,
+            "finished_at": "01/09/2026 13:26:24",
+            "exit_code": 2,
+            "stages": [
+                {"name": "execute", "status": "failed"},
+                {"name": "finalize", "status": "failed"}
+            ]
+        });
+
+        assert_eq!(refiner_effective_status(&detail), "failed");
+        let report = verify_refiner_result(&detail);
+        assert_eq!(
+            report.get("job_status").and_then(Value::as_str),
+            Some("failed")
+        );
+        assert_eq!(report.get("passed").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn finished_refiner_metadata_without_failures_is_completed() {
+        let detail = json!({
+            "status": "running",
+            "progress": 100,
+            "finished_at": "01/09/2026 13:26:24",
+            "exit_code": 0,
+            "stages": [{"name": "execute", "status": "completed"}]
+        });
+
+        assert_eq!(refiner_effective_status(&detail), "completed");
     }
 
     #[test]
