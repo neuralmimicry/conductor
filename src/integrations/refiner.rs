@@ -2,11 +2,13 @@ use anyhow::{Result, anyhow};
 use futures::future;
 use reqwest::Client;
 use serde_json::{Value, json};
+use std::time::Duration;
 
 use crate::{config::ExternalServiceConfig, models::ServiceSnapshot};
 
 const REFINER_PUBLIC_ALIAS_URL: &str = "https://refiner.neuralmimicry.ai";
 const REFINER_PUBLIC_EDGE_URL: &str = "https://api.neuralmimicry.ai";
+const REFINER_HEALTH_PROBE_TIMEOUT_SECONDS: u64 = 5;
 
 #[derive(Clone)]
 pub struct RefinerClient {
@@ -197,13 +199,23 @@ pub async fn select_live_base_url(
     }
 
     let checks = future::join_all(candidates.iter().cloned().map(|candidate| async move {
-        let result = super::get_json(
-            client,
-            &candidate,
-            "/api/health",
-            config.bearer_token.as_deref(),
+        let result = tokio::time::timeout(
+            Duration::from_secs(REFINER_HEALTH_PROBE_TIMEOUT_SECONDS),
+            super::get_json(
+                client,
+                &candidate,
+                "/api/health",
+                config.bearer_token.as_deref(),
+            ),
         )
-        .await;
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "health probe timed out after {} seconds",
+                REFINER_HEALTH_PROBE_TIMEOUT_SECONDS
+            )
+        })
+        .and_then(|result| result);
         (candidate, result)
     }))
     .await;
