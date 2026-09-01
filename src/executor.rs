@@ -1263,6 +1263,10 @@ async fn automatic_rollback(
         "fork_org": owner,
         "skip_fork": true,
         "rollback_commit": commit_sha,
+        // Refiner must start from the exact delivered tip.  A concurrent
+        // rollback or branch writer must be rejected instead of reverting a
+        // different tree and later being reported as a valid recovery.
+        "rollback_expected_head": commit_sha,
         "rollback_of_execution_id": execution.id,
         "rollback_reason": "protected-target degradation or verification failure",
         "requirements_text": requirements_text,
@@ -1891,8 +1895,10 @@ fn requirements_text(
     } else {
         String::new()
     };
+    let authoritative_delivery_constraints =
+        format_authoritative_delivery_constraints(&work_item.plan);
     let authoritative = format!(
-        "Overview: Improve {target} through the Conductor execution loop.\n\nDelivery Context:\n- Current stage: {delivery_stage}\n- Validated stages: {validated_stages}\n- Rollout strategy: {rollout_strategy}\n\nRequirements Register:\n- REQ-001: Inspect and record current repository, runtime, or job evidence before selecting an operation.\n- REQ-002: Implement only the scoped change, job update, or progress-monitoring action supported by that evidence.\n- REQ-003: Preserve secure, resilient behaviour and avoid destructive commands.\n- REQ-004: Update or add tests covering the changed path, or provide the relevant live operational check.\n- REQ-005: Run verification commands and report the outcome.\n- REQ-006: Leave unrelated files untouched.\n- REQ-007: Record rollback/recovery steps and the acceptance signal proving the gap is closed.\n- REQ-008: Preserve staged progression and rollout governance metadata.{protected_rollout_requirements}{rollout_requirement}\n\nWork Item Summary:\n{summary}\n\nPlan JSON:\n{plan}",
+        "Overview: Improve {target} through the Conductor execution loop.\n\nDelivery Context:\n- Current stage: {delivery_stage}\n- Validated stages: {validated_stages}\n- Rollout strategy: {rollout_strategy}\n\nRequirements Register:\n- REQ-001: Inspect and record current repository, runtime, or job evidence before selecting an operation.\n- REQ-002: Implement only the scoped change, job update, or progress-monitoring action supported by that evidence.\n- REQ-003: Preserve secure, resilient behaviour and avoid destructive commands.\n- REQ-004: Update or add tests covering the changed path, or provide the relevant live operational check.\n- REQ-005: Run verification commands and report the outcome.\n- REQ-006: Leave unrelated files untouched.\n- REQ-007: Record rollback/recovery steps and the acceptance signal proving the gap is closed.\n- REQ-008: Preserve staged progression and rollout governance metadata.{protected_rollout_requirements}{rollout_requirement}\n\nWork Item Summary:\n{summary}\n\nAuthoritative delivery constraints (mandatory; implement and verify these, do not merely describe them):\n{authoritative_delivery_constraints}\n\nPlan JSON:\n{plan}",
         target = target,
         delivery_stage = work_item.delivery_stage.as_str(),
         validated_stages = if work_item.validated_stages.is_empty() {
@@ -1908,6 +1914,7 @@ fn requirements_text(
         rollout_strategy = work_item.rollout_strategy.as_str(),
         protected_rollout_requirements = protected_rollout_requirements,
         rollout_requirement = rollout_requirement,
+        authoritative_delivery_constraints = authoritative_delivery_constraints,
         summary = work_item.summary,
         plan = work_item.plan,
     );
@@ -1923,6 +1930,44 @@ fn requirements_text(
             )
         })
         .unwrap_or(authoritative)
+}
+
+fn format_authoritative_delivery_constraints(plan: &Value) -> String {
+    let Some(plan) = plan.as_object() else {
+        return "- No structured delivery constraints were supplied; follow the work-item summary exactly.".to_string();
+    };
+
+    let mut lines = Vec::new();
+    if let Some(files) = plan.get("required_files").and_then(Value::as_array) {
+        for path in files
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            lines.push(format!(
+                "- Required file: {} (must exist in the delivered repository).",
+                path
+            ));
+        }
+    }
+    if let Some(commands) = plan.get("required_verifications").and_then(Value::as_array) {
+        for command in commands
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+        {
+            lines.push(format!(
+                "- Required verification command: {} (must be run and pass).",
+                command
+            ));
+        }
+    }
+    if lines.is_empty() {
+        lines.push("- No structured delivery constraints were supplied; follow the work-item summary exactly.".to_string());
+    }
+    lines.join("\n")
 }
 
 fn deployment_automation_context(
@@ -2855,6 +2900,21 @@ mod tests {
     }
 
     #[test]
+    fn requirements_text_makes_structured_delivery_constraints_authoritative() {
+        let constraints = format_authoritative_delivery_constraints(&json!({
+            "required_files": ["docs/refiner-supported-languages.md"],
+            "required_verifications": ["cargo fmt --check", "cargo test"],
+        }));
+        assert!(constraints.contains(
+            "Required file: docs/refiner-supported-languages.md (must exist in the delivered repository)."
+        ));
+        assert!(
+            constraints
+                .contains("Required verification command: cargo test (must be run and pass).")
+        );
+    }
+
+    #[test]
     fn safety_health_payload_rejects_explicit_degradation() {
         assert!(health_payload_is_healthy(
             &json!({"health": {"status": "ok"}})
@@ -3322,7 +3382,7 @@ mod tests {
                 .get("requirements_text")
                 .and_then(Value::as_str),
             Some(
-                "Overview: Improve target service through the Conductor execution loop.\n\nDelivery Context:\n- Current stage: development\n- Validated stages: none\n- Rollout strategy: canary\n\nRequirements Register:\n- REQ-001: Inspect and record current repository, runtime, or job evidence before selecting an operation.\n- REQ-002: Implement only the scoped change, job update, or progress-monitoring action supported by that evidence.\n- REQ-003: Preserve secure, resilient behaviour and avoid destructive commands.\n- REQ-004: Update or add tests covering the changed path, or provide the relevant live operational check.\n- REQ-005: Run verification commands and report the outcome.\n- REQ-006: Leave unrelated files untouched.\n- REQ-007: Record rollback/recovery steps and the acceptance signal proving the gap is closed.\n- REQ-008: Preserve staged progression and rollout governance metadata.\n\nWork Item Summary:\nFix the failing verification seam\n\nPlan JSON:\n{\"action\":\"stabilize_release_gate\"}\n\nPlanner guidance (advisory; it must not weaken or contradict the authoritative work-item requirements):\nOverview: Stabilise the release gate.\n\nRequirements Register:\n- REQ-001: Fix the failing verification path.\n- REQ-002: Preserve rollout metadata.\n- REQ-003: Add or update targeted tests.\n- REQ-004: Document the execution boundary.\n"
+                "Overview: Improve target service through the Conductor execution loop.\n\nDelivery Context:\n- Current stage: development\n- Validated stages: none\n- Rollout strategy: canary\n\nRequirements Register:\n- REQ-001: Inspect and record current repository, runtime, or job evidence before selecting an operation.\n- REQ-002: Implement only the scoped change, job update, or progress-monitoring action supported by that evidence.\n- REQ-003: Preserve secure, resilient behaviour and avoid destructive commands.\n- REQ-004: Update or add tests covering the changed path, or provide the relevant live operational check.\n- REQ-005: Run verification commands and report the outcome.\n- REQ-006: Leave unrelated files untouched.\n- REQ-007: Record rollback/recovery steps and the acceptance signal proving the gap is closed.\n- REQ-008: Preserve staged progression and rollout governance metadata.\n\nWork Item Summary:\nFix the failing verification seam\n\nAuthoritative delivery constraints (mandatory; implement and verify these, do not merely describe them):\n- No structured delivery constraints were supplied; follow the work-item summary exactly.\n\nPlan JSON:\n{\"action\":\"stabilize_release_gate\"}\n\nPlanner guidance (advisory; it must not weaken or contradict the authoritative work-item requirements):\nOverview: Stabilise the release gate.\n\nRequirements Register:\n- REQ-001: Fix the failing verification path.\n- REQ-002: Preserve rollout metadata.\n- REQ-003: Add or update targeted tests.\n- REQ-004: Document the execution boundary.\n"
             )
         );
         assert_eq!(
