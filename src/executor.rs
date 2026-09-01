@@ -32,8 +32,10 @@ const REFINER_EXECUTION_PLAN_PATH: &str = "/api/execution/plan";
 // Discovery and health integrations use a short timeout, but Refiner job
 // payloads include bounded logs and metrics and can take longer to read while
 // the solver is busy. Keep lifecycle polling from failing on that unrelated
-// short integration timeout.
-const REFINER_OPERATION_REQUEST_TIMEOUT_SECONDS: u64 = 60;
+// short integration timeout. Five minutes remains bounded while allowing a
+// busy ARM64 Refiner to serialize a job detail response without losing the
+// otherwise healthy execution.
+const REFINER_OPERATION_REQUEST_TIMEOUT_SECONDS: u64 = 300;
 
 async fn reconcile_stale_executions(
     repository: &dyn ConductorRepository,
