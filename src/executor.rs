@@ -36,6 +36,12 @@ const REFINER_EXECUTION_PLAN_PATH: &str = "/api/execution/plan";
 // busy ARM64 Refiner to serialize a job detail response without losing the
 // otherwise healthy execution.
 const REFINER_OPERATION_REQUEST_TIMEOUT_SECONDS: u64 = 300;
+// Refiner persists terminal job metadata in more than one update.  A failed
+// project run can therefore expose finished_at/exit_code before the produced
+// commit is copied into repo_info.  Keep the terminal response open briefly
+// so protected-target rollback has the exact commit identity it requires.
+const REFINER_TERMINAL_COMMIT_REFRESH_ATTEMPTS: usize = 10;
+const REFINER_TERMINAL_COMMIT_REFRESH_INTERVAL_SECONDS: u64 = 1;
 
 async fn reconcile_stale_executions(
     repository: &dyn ConductorRepository,
@@ -2233,6 +2239,30 @@ async fn poll_refiner_job(
             status.as_str(),
             "completed" | "failed" | "cancelled" | "stopped"
         ) {
+            if needs_terminal_commit_refresh(&detail) {
+                let mut refreshed = detail;
+                for _ in 0..REFINER_TERMINAL_COMMIT_REFRESH_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_secs(
+                        REFINER_TERMINAL_COMMIT_REFRESH_INTERVAL_SECONDS,
+                    ))
+                    .await;
+                    let Ok(candidate) = get_refiner_json(
+                        client,
+                        config,
+                        base_url,
+                        format!("/api/jobs/{}", job_id).as_str(),
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    refreshed = candidate;
+                    if extract_commit_sha(&refreshed).is_some() {
+                        break;
+                    }
+                }
+                return Ok(refreshed);
+            }
             return Ok(detail);
         }
         if tokio::time::Instant::now() >= deadline {
@@ -2290,6 +2320,12 @@ fn refiner_effective_status(detail: &Value) -> String {
     }
 
     status
+}
+
+fn needs_terminal_commit_refresh(detail: &Value) -> bool {
+    refiner_effective_status(detail) == "failed"
+        && detail.get("repo_info").is_some()
+        && extract_commit_sha(detail).is_none()
 }
 
 fn verify_refiner_result(detail: &Value) -> Value {
@@ -3096,6 +3132,24 @@ mod tests {
             Some("failed")
         );
         assert_eq!(report.get("passed").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn failed_terminal_job_refreshes_when_commit_metadata_is_late() {
+        let detail = json!({
+            "status": "running",
+            "finished_at": "01/09/2026 13:26:24",
+            "exit_code": 2,
+            "repo_info": {"branch": "conductor/change"},
+        });
+
+        assert!(needs_terminal_commit_refresh(&detail));
+        assert!(!needs_terminal_commit_refresh(&json!({
+            "status": "running",
+            "finished_at": "01/09/2026 13:26:24",
+            "exit_code": 2,
+            "repo_info": {"commit_sha": "abcdef1234567"},
+        })));
     }
 
     #[test]
