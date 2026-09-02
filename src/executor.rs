@@ -242,11 +242,128 @@ pub async fn execute_specific_work_item(
     dispatch_claimed_work_item(repository, config, claimed, event_callback).await
 }
 
+/// Claim an execution and persist its identity before starting the potentially
+/// long Refiner/Gail workflow.  The caller can return this durable record to
+/// an HTTP client and continue the claimed work in a detached task.
+pub async fn prepare_specific_work_item(
+    repository: &dyn ConductorRepository,
+    config: &ConductorConfig,
+    work_item_id: Uuid,
+    force_schedule: bool,
+    event_callback: Option<&ExecutionEventCallback>,
+) -> Result<(WorkItem, WorkExecution)> {
+    if config.execution.emergency_stop {
+        return Err(anyhow!(
+            "execution is halted because execution.emergency_stop is enabled"
+        ));
+    }
+
+    let item = repository
+        .get_work_item(work_item_id)
+        .await?
+        .ok_or_else(|| anyhow!("work item {} not found", work_item_id))?;
+    if !item.execution_approved {
+        return Err(anyhow!(
+            "work item {} is not approved for execution",
+            work_item_id
+        ));
+    }
+    if !force_schedule
+        && item
+            .scheduled_for
+            .is_some_and(|scheduled_for| scheduled_for > crate::models::now_utc())
+    {
+        return Err(anyhow!(
+            "work item {} is scheduled for the future and is not yet due",
+            work_item_id
+        ));
+    }
+    if config.execution.dry_run {
+        return Err(anyhow!(
+            "detached execution is unavailable while execution.dry_run is enabled"
+        ));
+    }
+
+    reconcile_stale_executions(repository, config, event_callback).await?;
+    let claimed = repository
+        .claim_work_item_for_execution(
+            work_item_id,
+            crate::models::now_utc(),
+            execution_instance_id(config),
+            config.execution.claim_ttl_seconds,
+            force_schedule,
+            config.execution.max_concurrent_executions,
+        )
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "work item {} is already claimed or no execution capacity is available",
+                work_item_id
+            )
+        })?;
+
+    let execution = WorkExecution::new(
+        claimed.id,
+        claimed.target_service.clone(),
+        claimed.delivery_stage,
+        claimed.rollout_strategy,
+    );
+    repository.upsert_work_execution(&execution).await?;
+    Ok((claimed, execution))
+}
+
+/// Finish a previously prepared execution in a detached task.  Any error
+/// before the normal dispatcher can finalize the record is made terminal so a
+/// client never has to infer failure from an expired claim alone.
+pub async fn execute_prepared_work_item(
+    repository: &dyn ConductorRepository,
+    config: &ConductorConfig,
+    mut item: WorkItem,
+    execution: WorkExecution,
+    event_callback: Option<&ExecutionEventCallback>,
+) -> Result<WorkExecution> {
+    let result = dispatch_claimed_work_item_with_execution(
+        repository,
+        config,
+        item.clone(),
+        event_callback,
+        Some(execution.clone()),
+    )
+    .await;
+    match result {
+        Ok(execution) => Ok(execution),
+        Err(error) => {
+            // The dispatcher wrapper has released the claim before returning.
+            // Finalize the exact pre-created execution and item identity.
+            item.clear_claim();
+            let mut execution = execution;
+            finalize_execution_failure(
+                repository,
+                &mut item,
+                &mut execution,
+                event_callback,
+                error.to_string(),
+            )
+            .await
+        }
+    }
+}
+
 async fn dispatch_claimed_work_item(
+    repository: &dyn ConductorRepository,
+    config: &ConductorConfig,
+    item: WorkItem,
+    event_callback: Option<&ExecutionEventCallback>,
+) -> Result<WorkExecution> {
+    dispatch_claimed_work_item_with_execution(repository, config, item, event_callback, None).await
+}
+
+async fn dispatch_claimed_work_item_with_execution(
     repository: &dyn ConductorRepository,
     config: &ConductorConfig,
     mut item: WorkItem,
     event_callback: Option<&ExecutionEventCallback>,
+    initial_execution: Option<WorkExecution>,
 ) -> Result<WorkExecution> {
     let claim_token = item
         .claim_token
@@ -258,6 +375,7 @@ async fn dispatch_claimed_work_item(
         &mut item,
         claim_token,
         event_callback,
+        initial_execution,
     )
     .await;
     if item.claim_token.is_some() {
@@ -275,6 +393,7 @@ async fn dispatch_claimed_work_item_inner(
     item: &mut WorkItem,
     claim_token: Uuid,
     event_callback: Option<&ExecutionEventCallback>,
+    initial_execution: Option<WorkExecution>,
 ) -> Result<WorkExecution> {
     let work_items = repository.list_work_items().await?;
     let dependency_blockers = dependency_blockers(item, &work_items);
@@ -350,12 +469,14 @@ async fn dispatch_claimed_work_item_inner(
         production_github_actions_evidence(config, item, target_service, &repositories).await;
     apply_github_actions_gate(&mut policy, github_actions.as_ref());
 
-    let mut execution = WorkExecution::new(
-        item.id,
-        item.target_service.clone(),
-        item.delivery_stage,
-        item.rollout_strategy,
-    );
+    let mut execution = initial_execution.unwrap_or_else(|| {
+        WorkExecution::new(
+            item.id,
+            item.target_service.clone(),
+            item.delivery_stage,
+            item.rollout_strategy,
+        )
+    });
     execution.policy = policy_value_with_github_actions(&policy, github_actions.as_ref());
     execution.latest_payload = json!({
         "safety": {

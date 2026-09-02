@@ -490,19 +490,10 @@ async fn execute_work_item(
     Json(request): Json<ExecuteWorkItemRequest>,
 ) -> ApiResult<Json<WorkExecution>> {
     service.authorize_admin(&headers)?;
-    // Keep the long-running workflow alive when a client, proxy, or browser
-    // times out while waiting for Refiner/Gail. Awaiting the future directly
-    // ties execution lifetime to the HTTP request; a disconnect can then
-    // leave the durable execution stuck in `planning` with no worker left to
-    // advance it. The spawned task preserves the existing response contract
-    // for connected clients while allowing disconnected callers to poll the
-    // durable work-item/execution endpoints instead.
     let force_schedule = request.force_schedule.unwrap_or(false);
-    let execution_task =
-        tokio::spawn(async move { service.execute_work_item(id, force_schedule).await });
-    let execution = execution_task
+    let execution = service
+        .start_work_item_execution(id, force_schedule)
         .await
-        .map_err(|error| ApiError::internal(format!("execution task failed: {error}")))?
         .map_err(|error| {
             let message = error.to_string();
             if message.contains("not found") {

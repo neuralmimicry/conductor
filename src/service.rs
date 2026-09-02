@@ -21,7 +21,10 @@ use crate::{
     config::ConductorConfig,
     discovery::discover_and_probe,
     error::ApiError,
-    executor::{ExecutionEventCallback, execute_specific_work_item, run_execution_cycle},
+    executor::{
+        ExecutionEventCallback, execute_prepared_work_item, execute_specific_work_item,
+        prepare_specific_work_item, run_execution_cycle,
+    },
     integrations::{
         atlassian::AtlassianClients, continuum::ContinuumClient, refiner::RefinerClient,
         tracey::TraceyClient,
@@ -1801,6 +1804,43 @@ impl ConductorService {
             Some(&callback),
         )
         .await
+    }
+
+    pub async fn start_work_item_execution(
+        &self,
+        work_item_id: Uuid,
+        force_schedule: bool,
+    ) -> Result<WorkExecution> {
+        if self.config.execution.dry_run {
+            return self.execute_work_item(work_item_id, force_schedule).await;
+        }
+
+        let callback = self.event_callback();
+        let (item, execution) = prepare_specific_work_item(
+            self.repository.as_ref(),
+            &self.config,
+            work_item_id,
+            force_schedule,
+            Some(&callback),
+        )
+        .await?;
+        let response_execution = execution.clone();
+        let repository = self.repository.clone();
+        let config = self.config.clone();
+        tokio::spawn(async move {
+            if let Err(error) = execute_prepared_work_item(
+                repository.as_ref(),
+                &config,
+                item,
+                execution,
+                Some(&callback),
+            )
+            .await
+            {
+                tracing::error!(%error, work_item_id = %work_item_id, "detached work-item execution failed");
+            }
+        });
+        Ok(response_execution)
     }
 
     async fn schedule_ready_approved_work_items(&self) -> Result<usize> {
