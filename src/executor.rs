@@ -450,6 +450,55 @@ async fn dispatch_claimed_work_item_inner(
             .iter()
             .find(|service| service.service_key == target)
     });
+    if let Some(evidence) = healthy_service_revalidation(&item, target_service) {
+        let mut execution = initial_execution.unwrap_or_else(|| {
+            WorkExecution::new(
+                item.id,
+                item.target_service.clone(),
+                item.delivery_stage,
+                item.rollout_strategy,
+            )
+        });
+        execution.policy = json!({
+            "verdict": "allowed",
+            "risk_level": "low",
+            "reasons": ["healthy service revalidated; no code or rollout change required"],
+            "no_change": true,
+        });
+        execution.latest_payload = json!({"operational_revalidation": evidence.clone()});
+        execution.verification = json!({
+            "passed": true,
+            "mode": "operational_revalidation",
+            "job_status": "not_required",
+            "reasons": [],
+            "operational_revalidation": evidence,
+        });
+        execution.mark_status(ExecutionStatus::Success);
+        item.status = WorkStatus::Success;
+        item.progress_pct = 100;
+        item.finished_at = Some(crate::models::now_utc());
+        item.notes.push(format!(
+            "{} service health revalidated as healthy; no Refiner change was required",
+            crate::models::now_utc().to_rfc3339()
+        ));
+        item.touch_execution(execution.id, execution.policy.clone());
+        repository.upsert_work_execution(&execution).await?;
+        repository.upsert_work_item(item).await?;
+        emit_execution_event(
+            event_callback,
+            "execution.verification",
+            format!("{} health revalidated without a change", item.title),
+            Some(item),
+            Some(&execution),
+            Some("success"),
+            execution.verification.clone(),
+        );
+        let _ = repository
+            .release_work_item_claim(item.id, claim_token)
+            .await;
+        item.clear_claim();
+        return Ok(execution);
+    }
     // Repository snapshots are required for every delivery stage, not only
     // production.  Refiner must receive the actual GitHub repository context
     // before it creates a workspace; otherwise a service discovered from a
@@ -2126,6 +2175,38 @@ fn deployment_automation_context(
     }))
 }
 
+fn healthy_service_revalidation(
+    item: &WorkItem,
+    service: Option<&ServiceSnapshot>,
+) -> Option<Value> {
+    let service = service?;
+    let action = item.plan.get("action").and_then(Value::as_str)?;
+    let finding_key = item.plan.get("finding_key").and_then(Value::as_str)?;
+    let has_explicit_delivery_scope =
+        ["required_files", "required_verifications"]
+            .iter()
+            .any(|key| {
+                item.plan
+                    .get(*key)
+                    .and_then(Value::as_array)
+                    .is_some_and(|values| !values.is_empty())
+            });
+    if !action.eq_ignore_ascii_case("stabilize_service")
+        || !finding_key.starts_with("service_health:")
+        || service.health != ServiceHealth::Healthy
+        || has_explicit_delivery_scope
+    {
+        return None;
+    }
+
+    Some(json!({
+        "service_key": service.service_key,
+        "health": service.health.as_str(),
+        "finding_key": finding_key,
+        "reason": "the previously reported service-health finding is no longer present",
+    }))
+}
+
 fn work_branch_name(work_item: &WorkItem) -> String {
     let raw = work_item
         .dedupe_key
@@ -2737,6 +2818,71 @@ mod tests {
             discovered_at: crate::models::now_utc(),
             updated_at: crate::models::now_utc(),
         }
+    }
+
+    #[test]
+    fn healthy_service_health_finding_is_revalidated_without_delivery_scope() {
+        let mut item = WorkItem::from_new(NewWorkItem {
+            title: "Stabilize Refiner".to_string(),
+            summary: "Restore Refiner health".to_string(),
+            target_service: Some("conductor".to_string()),
+            dedupe_key: None,
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
+            status: None,
+            priority: None,
+            progress_pct: None,
+            admin_override: false,
+            execution_approved: false,
+            verification_required: None,
+            tags: vec![],
+            plan: json!({
+                "action": "stabilize_service",
+                "finding_key": "service_health:conductor",
+            }),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        assert!(healthy_service_revalidation(&item, Some(&sample_service())).is_some());
+
+        item.plan["required_files"] = json!(["src/main.rs"]);
+        assert!(healthy_service_revalidation(&item, Some(&sample_service())).is_none());
+    }
+
+    #[test]
+    fn unhealthy_or_non_health_items_still_require_refiner_delivery() {
+        let mut service = sample_service();
+        service.health = ServiceHealth::Degraded;
+        let item = WorkItem::from_new(NewWorkItem {
+            title: "Stabilize service".to_string(),
+            summary: "Repair service".to_string(),
+            target_service: Some("conductor".to_string()),
+            dedupe_key: None,
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
+            status: None,
+            priority: None,
+            progress_pct: None,
+            admin_override: false,
+            execution_approved: false,
+            verification_required: None,
+            tags: vec![],
+            plan: json!({
+                "action": "stabilize_service",
+                "finding_key": "service_health:conductor",
+            }),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        assert!(healthy_service_revalidation(&item, Some(&service)).is_none());
+
+        let mut non_health = item;
+        non_health.plan["finding_key"] = json!("repository_test_baseline:conductor");
+        assert!(healthy_service_revalidation(&non_health, Some(&sample_service())).is_none());
     }
 
     async fn spawn_mock_github(conclusion: &'static str) -> (String, tokio::task::JoinHandle<()>) {
