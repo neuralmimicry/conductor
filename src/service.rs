@@ -59,6 +59,10 @@ pub struct ConductorService {
 }
 
 const EXTERNAL_SYNC_CONCURRENCY: usize = 8;
+// Gail approval is an independent, fail-closed control-plane operation. Run
+// a small bounded batch so one slow model endpoint cannot serialize the whole
+// scheduler, while avoiding a burst that would overload the local providers.
+const AI_APPROVAL_CONCURRENCY: usize = 4;
 
 impl ConductorService {
     pub fn new(
@@ -226,42 +230,72 @@ impl ConductorService {
                     .or(service.internal_url.as_deref())
             });
 
+        // Select reviewable work before applying the per-cycle limit.  A
+        // previously denied or policy-blocked item must not consume the only
+        // review slot forever (the old ordering starved every later item when
+        // ai_approval_max_items_per_cycle was one).
+        let review_candidates = work_items
+            .iter()
+            .filter(|item| work_item_requires_ai_review(item))
+            .filter(|item| {
+                !(metadata_verdict(&item.approval_metadata) == Some("denied")
+                    && metadata_matches_item(&item.approval_metadata, item))
+            })
+            .filter(|item| {
+                let target_service = item.target_service.as_deref().and_then(|target| {
+                    services
+                        .iter()
+                        .find(|service| service.service_key == target)
+                });
+                !matches!(
+                    evaluate_work_item(&self.config, item, target_service).verdict,
+                    crate::models::PolicyVerdict::Blocked
+                )
+            })
+            .take(self.config.policy.ai_approval_max_items_per_cycle)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let approval_results = stream::iter(review_candidates.into_iter().map(|original| {
+            let service = self.clone();
+            let services = services.clone();
+            let work_items = work_items.clone();
+            let gail_base_url = gail_base_url.map(ToOwned::to_owned);
+            async move {
+                let target_service = original.target_service.as_deref().and_then(|target| {
+                    services
+                        .iter()
+                        .find(|service| service.service_key == target)
+                });
+                let policy = evaluate_work_item(&service.config, &original, target_service);
+                if matches!(policy.verdict, crate::models::PolicyVerdict::Blocked) {
+                    return None;
+                }
+                let dependency_blockers = approval_dependency_blockers(&original, &work_items);
+                let result = request_ai_approval(
+                    &service.http,
+                    &service.config,
+                    &original,
+                    target_service,
+                    &policy,
+                    &dependency_blockers,
+                    gail_base_url.as_deref(),
+                )
+                .await;
+                Some((original, policy, dependency_blockers, result))
+            }
+        }))
+        .buffer_unordered(AI_APPROVAL_CONCURRENCY)
+        .filter_map(|result| async move { result })
+        .collect::<Vec<_>>()
+        .await;
+
         let mut reviewed = 0usize;
         let mut approved = 0usize;
         let mut denied = 0usize;
         let mut errors = Vec::new();
-        for original in work_items
-            .iter()
-            .filter(|item| work_item_requires_ai_review(item))
-            .take(self.config.policy.ai_approval_max_items_per_cycle)
-        {
-            let target_service = original.target_service.as_deref().and_then(|target| {
-                services
-                    .iter()
-                    .find(|service| service.service_key == target)
-            });
-            let policy = evaluate_work_item(&self.config, original, target_service);
-            if matches!(policy.verdict, crate::models::PolicyVerdict::Blocked) {
-                continue;
-            }
-            if metadata_verdict(&original.approval_metadata) == Some("denied")
-                && metadata_matches_item(&original.approval_metadata, original)
-            {
-                continue;
-            }
-
-            let dependency_blockers = approval_dependency_blockers(original, &work_items);
-            match request_ai_approval(
-                &self.http,
-                &self.config,
-                original,
-                target_service,
-                &policy,
-                &dependency_blockers,
-                gail_base_url,
-            )
-            .await
-            {
+        for (original, policy, dependency_blockers, result) in approval_results {
+            match result {
                 Ok(Some(mut decision)) => {
                     reviewed += 1;
                     let effective_approval = decision.approved
@@ -1862,9 +1896,14 @@ impl ConductorService {
                     .find(|service| service.service_key == target)
             });
             let policy = evaluate_work_item(&self.config, original, target_service);
-            if matches!(policy.verdict, crate::models::PolicyVerdict::Blocked)
-                && policy.sensitive_targets.is_empty()
-            {
+            // A policy-blocked item must never be re-scheduled merely because
+            // it targets a protected service.  The executor is fail-closed,
+            // but scheduling such an item first consumes the execution slot
+            // and then leaves it on hold, causing the approval loop to repeat
+            // the same no-op cycle forever.  Protected items remain visible
+            // for explicit remediation/approval, while runnable items retain
+            // the only path into Refiner.
+            if matches!(policy.verdict, crate::models::PolicyVerdict::Blocked) {
                 continue;
             }
             let dependency_blockers = approval_dependency_blockers(original, &work_items);
@@ -5991,9 +6030,9 @@ mod tests {
         let mut config = ConductorConfig::default();
         config.execution.enabled = false;
         config.integrations.atlassian.enabled = false;
-        config.integrations.gail.base_url = Some(gail_base_url);
+        config.integrations.gail.base_url = Some(gail_base_url.clone());
         config.policy.ai_approvals_enabled = true;
-        config.policy.ai_approval_max_items_per_cycle = 10;
+        config.policy.ai_approval_max_items_per_cycle = 1;
 
         let repository = Arc::new(MemoryRepository::new());
         let service_snapshot = ServiceSnapshot {
@@ -6007,7 +6046,7 @@ mod tests {
             namespace: Some("gail".to_string()),
             service_name: Some("gail".to_string()),
             deployment_environment: Some(DeliveryStage::Development),
-            internal_url: None,
+            internal_url: Some(gail_base_url.clone()),
             public_url: None,
             repo_path: Some("/tmp/gail".to_string()),
             repo_url: None,
@@ -6047,6 +6086,21 @@ mod tests {
             scheduled_for: None,
         });
         repository.upsert_work_item(&item).await.expect("work item");
+
+        // A denied high-priority item must not starve the next review when
+        // the configured batch size is one.
+        let mut denied_item = item.clone();
+        denied_item.id = Uuid::new_v4();
+        denied_item.priority = 100;
+        denied_item.status = WorkStatus::OnHold;
+        denied_item.approval_metadata = json!({
+            "verdict": "denied",
+            "fingerprint": crate::approvals::work_item_approval_fingerprint(&denied_item),
+        });
+        repository
+            .upsert_work_item(&denied_item)
+            .await
+            .expect("denied work item");
 
         let http = build_http_client(2).expect("http client");
         let service = ConductorService::new(config, repository.clone(), http);
@@ -6204,5 +6258,57 @@ mod tests {
         assert_eq!(work_item.target_service.as_deref(), Some("conductor"));
         assert!(!work_item.execution_approved);
         assert_eq!(work_item.status, WorkStatus::Planned);
+    }
+
+    #[tokio::test]
+    async fn approved_policy_blocked_protected_item_is_not_rescheduled() {
+        let repository = Arc::new(MemoryRepository::new());
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("octobot:blocked-baseline".to_string()),
+            title: "Establish a protected target baseline".to_string(),
+            summary: "This item must remain held until the protected-target policy is satisfied."
+                .to_string(),
+            target_service: Some("octobot".to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: vec![],
+            rollout_strategy: Some(RolloutStrategy::Direct),
+            status: Some(WorkStatus::OnHold),
+            priority: Some(100),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec!["protected".to_string()],
+            plan: json!({"action": "baseline"}),
+            depends_on: vec![],
+            source: Some("test".to_string()),
+            scheduled_for: None,
+        });
+        let mut item = item;
+        item.approval_metadata = json!({
+            "verdict": "approved",
+            "schedule_now": true,
+        });
+        repository.upsert_work_item(&item).await.expect("work item");
+
+        let mut config = ConductorConfig::default();
+        config.policy.protected_services.push("octobot".to_string());
+        let service = ConductorService::new(
+            config,
+            repository.clone(),
+            build_http_client(2).expect("http client"),
+        );
+        assert_eq!(
+            service.schedule_ready_approved_work_items().await.unwrap(),
+            0
+        );
+
+        let current = repository
+            .get_work_item(item.id)
+            .await
+            .expect("fetch")
+            .expect("item");
+        assert_eq!(current.status, WorkStatus::OnHold);
+        assert!(current.execution_approved);
     }
 }

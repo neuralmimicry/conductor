@@ -8,7 +8,14 @@ use crate::{config::ExternalServiceConfig, models::ServiceSnapshot};
 
 const REFINER_PUBLIC_ALIAS_URL: &str = "https://refiner.neuralmimicry.ai";
 const REFINER_PUBLIC_EDGE_URL: &str = "https://api.neuralmimicry.ai";
-const REFINER_HEALTH_PROBE_TIMEOUT_SECONDS: u64 = 5;
+// Refiner's operational health response includes orchestration and provider
+// telemetry, so it is materially more expensive than a plain liveness
+// endpoint.  A five-second hard-coded probe deadline caused Conductor to
+// report Refiner as unreachable during normal Gail/provider load, even when
+// the job APIs were healthy.  Keep this bounded, but allow the service's
+// configured HTTP timeout (currently 30 seconds) to absorb that transient
+// work without blocking the scheduler indefinitely.
+const REFINER_HEALTH_PROBE_TIMEOUT_SECONDS: u64 = 20;
 
 #[derive(Clone)]
 pub struct RefinerClient {

@@ -7,10 +7,11 @@ use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::time::{Duration, sleep};
 
 use crate::{
     config::ConductorConfig,
-    integrations::post_json,
+    integrations::post_json_with_timeout,
     models::{PolicyEvaluation, ServiceSnapshot, WorkItem, now_utc, unique_strings},
     policy::policy_evaluation_to_value,
 };
@@ -93,36 +94,69 @@ pub async fn request_ai_approval(
         },
     });
 
-    let completion = post_json(
-        client,
-        &base_url,
-        "/v1/llm/complete",
-        config.integrations.gail.bearer_token.as_deref(),
-        &json!({
-            "workflow": config.policy.ai_approval_workflow,
-            "role": "reviewer",
-            "include_configured": true,
-            "selection_mode": "best",
-            "max_candidates": 5,
-            "timeout_seconds": config.integrations.gail.timeout_seconds.max(45),
-            "reasoning_effort": "high",
-            "request_category": "approval_review",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are the NeuralMimicry Conductor approval reviewer. Approve only narrowly scoped, non-destructive changes with clear repository context, adequate verification, satisfied rollout governance, and no unresolved blockers. Deny ambiguous or unsafe work. Return only valid JSON with no markdown fences or commentary. Use strict JSON only with keys approved, confidence, risk_level, reason, required_actions, schedule_now."
-                },
-                {
-                    "role": "user",
-                    "content": format!(
-                        "Review this work item for safe automated execution approval. Confidence must be between 0.0 and 1.0.\n\nContext JSON:\n{}",
-                        prompt_context
-                    )
+    // Approval is a control-plane gate. Keep it bounded even if a deployed
+    // integration was given an accidentally broad general-purpose timeout;
+    // a stalled reviewer must not prevent subsequent scheduler cycles.
+    let approval_timeout_seconds = config.integrations.gail.timeout_seconds.clamp(45, 120);
+    let request_body = json!({
+        "workflow": config.policy.ai_approval_workflow,
+        "role": "reviewer",
+        "include_configured": true,
+        "selection_mode": "best",
+        // Approval is a single verdict, so racing five expensive local
+        // candidates only increases queue pressure and malformed responses.
+        "max_candidates": 1,
+        "max_tokens": 256,
+        "timeout_seconds": approval_timeout_seconds,
+        "reasoning_effort": "medium",
+        "request_category": "approval_review",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are the NeuralMimicry Conductor approval reviewer. Approve only narrowly scoped, non-destructive changes with clear repository context, adequate verification, satisfied rollout governance, and no unresolved blockers. Deny ambiguous or unsafe work. Return only valid JSON with no markdown fences or commentary. Use strict JSON only with keys approved, confidence, risk_level, reason, required_actions, schedule_now. Keep reason under 160 characters."
+            },
+            {
+                "role": "user",
+                "content": format!(
+                    "Review this work item for safe automated execution approval. Confidence must be between 0.0 and 1.0.\n\nContext JSON:\n{}",
+                    prompt_context
+                )
+            }
+        ]
+    });
+
+    // Retry only transport/upstream failures. A syntactically valid but
+    // ambiguous model response must remain fail-closed and is not converted
+    // into an approval by this retry loop.
+    let mut completion = None;
+    let mut last_error = None;
+    for attempt in 0..3u32 {
+        match post_json_with_timeout(
+            client,
+            &base_url,
+            "/v1/llm/complete",
+            config.integrations.gail.bearer_token.as_deref(),
+            &request_body,
+            approval_timeout_seconds,
+        )
+        .await
+        {
+            Ok(value) => {
+                completion = Some(value);
+                break;
+            }
+            Err(error) => {
+                let retryable = is_retryable_gail_error(&error.to_string());
+                last_error = Some(error);
+                if !retryable || attempt == 2 {
+                    break;
                 }
-            ]
-        }),
-    )
-    .await?;
+                sleep(Duration::from_secs(1u64 << attempt)).await;
+            }
+        }
+    }
+    let completion = completion
+        .ok_or_else(|| last_error.unwrap_or_else(|| anyhow!("Gail approval request failed")))?;
 
     let text = completion
         .get("text")
@@ -149,6 +183,29 @@ pub async fn request_ai_approval(
         .map(ToString::to_string);
 
     Ok(Some(decision))
+}
+
+fn is_retryable_gail_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "timeout",
+        "timed out",
+        "connection",
+        "connect error",
+        "connection reset",
+        "connection refused",
+        "broken pipe",
+        "upstream_error",
+        "service unavailable",
+        "temporarily unavailable",
+        "rate limit",
+        "429",
+        "502",
+        "503",
+        "504",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 pub fn work_item_approval_fingerprint(item: &WorkItem) -> String {

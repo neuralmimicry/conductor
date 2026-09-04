@@ -3,7 +3,7 @@ FROM docker.io/library/rust:1.88-bookworm AS source-deb
 
 ARG CONDUCTOR_VERSION=source
 
-RUN apt-get update \
+RUN apt-get -o Acquire::ForceIPv4=true update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
@@ -54,8 +54,8 @@ COPY --from=source-deb /usr/local/cargo /usr/local/cargo
 COPY --from=source-deb /usr/local/rustup /usr/local/rustup
 
 RUN set -eu; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
+    apt-get -o Acquire::ForceIPv4=true update; \
+    apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends \
         ansible \
         build-essential \
         ca-certificates \
@@ -147,7 +147,7 @@ RUN set -eu; \
             curl -fsSL "${deb_url}" -o /tmp/conductor.deb; \
         fi; \
     fi; \
-    apt-get install -y --no-install-recommends /tmp/conductor.deb; \
+    apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends /tmp/conductor.deb; \
     rm -f /tmp/conductor.deb /tmp/source-conductor.deb; \
     mkdir -p /app/config /app/assets /app/migrations /workspace/neuralmimicry /workspace/swarmhpc/swarmhpc/ansible /run/secrets/ansible; \
     cp /etc/conductor/conductor.yaml /app/config/conductor.yaml; \

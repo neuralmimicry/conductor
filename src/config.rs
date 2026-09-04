@@ -222,6 +222,10 @@ pub struct ExecutionConfig {
     pub refresh_interval_seconds: u64,
     pub poll_interval_seconds: u64,
     pub job_timeout_seconds: u64,
+    /// Maximum duration for one synchronous Refiner planning/estimate/submit
+    /// request. This is separate from short discovery integration timeouts
+    /// because Refiner may wait for Gail fallback waves before responding.
+    pub refiner_operation_timeout_seconds: u64,
     pub claim_ttl_seconds: u64,
     pub max_concurrent_executions: usize,
     pub instance_id: Option<String>,
@@ -488,6 +492,7 @@ impl Default for ExecutionConfig {
             refresh_interval_seconds: 120,
             poll_interval_seconds: 5,
             job_timeout_seconds: 900,
+            refiner_operation_timeout_seconds: 1200,
             claim_ttl_seconds: 1200,
             max_concurrent_executions: 1,
             instance_id: None,
@@ -518,7 +523,7 @@ impl Default for PolicyConfig {
             ai_approval_interval_seconds: 60,
             ai_approval_workflow: "conductor_safe_approval".to_string(),
             ai_approval_min_confidence: 0.7,
-            ai_approval_max_items_per_cycle: 20,
+            ai_approval_max_items_per_cycle: 4,
             protected_services: vec![
                 "conductor".to_string(),
                 "gail".to_string(),
@@ -648,6 +653,13 @@ impl ConductorConfig {
         if self.execution.job_timeout_seconds == 0 {
             self.execution.job_timeout_seconds = 900;
         }
+        if self.execution.refiner_operation_timeout_seconds == 0 {
+            self.execution.refiner_operation_timeout_seconds = 1200;
+        }
+        self.execution.refiner_operation_timeout_seconds = self
+            .execution
+            .refiner_operation_timeout_seconds
+            .clamp(60, 3600);
         if self.execution.claim_ttl_seconds == 0 {
             self.execution.claim_ttl_seconds =
                 self.execution.job_timeout_seconds.saturating_add(300);
@@ -734,7 +746,7 @@ impl ConductorConfig {
         self.policy.ai_approval_min_confidence =
             self.policy.ai_approval_min_confidence.clamp(0.0, 1.0);
         if self.policy.ai_approval_max_items_per_cycle == 0 {
-            self.policy.ai_approval_max_items_per_cycle = 20;
+            self.policy.ai_approval_max_items_per_cycle = 4;
         }
         self.safety.health_check_timeout_seconds =
             self.safety.health_check_timeout_seconds.clamp(1, 120);

@@ -137,6 +137,7 @@ execution:
   refresh_interval_seconds: 120
   poll_interval_seconds: 5
   job_timeout_seconds: 900
+  refiner_operation_timeout_seconds: 1200
   claim_ttl_seconds: 1200
   max_concurrent_executions: 1
   instance_id: "${CONDUCTOR_INSTANCE_ID}"
@@ -159,7 +160,7 @@ policy:
   ai_approval_interval_seconds: 60
   ai_approval_workflow: "conductor_safe_approval"
   ai_approval_min_confidence: 0.7
-  ai_approval_max_items_per_cycle: 20
+  ai_approval_max_items_per_cycle: 4
   protected_services:
     - "conductor"
     - "gail"

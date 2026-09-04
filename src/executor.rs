@@ -32,16 +32,22 @@ const REFINER_EXECUTION_PLAN_PATH: &str = "/api/execution/plan";
 // Discovery and health integrations use a short timeout, but Refiner job
 // payloads include bounded logs and metrics and can take longer to read while
 // the solver is busy. Keep lifecycle polling from failing on that unrelated
-// short integration timeout. Five minutes remains bounded while allowing a
-// busy ARM64 Refiner to serialize a job detail response without losing the
-// otherwise healthy execution.
-const REFINER_OPERATION_REQUEST_TIMEOUT_SECONDS: u64 = 300;
+// short integration timeout. The effective value is configured on the
+// execution section so it can be aligned with Gail's fallback budget and
+// Refiner's own upstream request timeout.
 // Refiner persists terminal job metadata in more than one update.  A failed
 // project run can therefore expose finished_at/exit_code before the produced
 // commit is copied into repo_info.  Keep the terminal response open briefly
 // so protected-target rollback has the exact commit identity it requires.
 const REFINER_TERMINAL_COMMIT_REFRESH_ATTEMPTS: usize = 10;
 const REFINER_TERMINAL_COMMIT_REFRESH_INTERVAL_SECONDS: u64 = 1;
+const REFINER_POLL_TRANSIENT_RETRY_LIMIT: usize = 4;
+const REFINER_POLL_TRANSIENT_RETRY_BASE_SECONDS: u64 = 1;
+// A newly submitted Refiner job can be visible on the POST-serving worker
+// before its first GET is visible through the selected edge or shared job
+// index.  Give that short publication window a bounded retry grace period;
+// missing jobs after the grace period remain failures.
+const REFINER_POLL_NOT_FOUND_GRACE_LIMIT: usize = 4;
 
 async fn reconcile_stale_executions(
     repository: &dyn ConductorRepository,
@@ -607,7 +613,7 @@ async fn dispatch_claimed_work_item_inner(
             .integrations
             .refiner
             .timeout_seconds
-            .max(REFINER_OPERATION_REQUEST_TIMEOUT_SECONDS),
+            .max(config.execution.refiner_operation_timeout_seconds),
     ) {
         Ok(client) => client,
         Err(error) => {
@@ -668,7 +674,7 @@ async fn dispatch_claimed_work_item_inner(
                 item,
                 &mut execution,
                 event_callback,
-                error.to_string(),
+                format!("{error:#}"),
             )
             .await;
         }
@@ -750,7 +756,7 @@ async fn dispatch_claimed_work_item_inner(
                 item,
                 &mut execution,
                 event_callback,
-                error.to_string(),
+                format!("{error:#}"),
             )
             .await;
         }
@@ -778,7 +784,7 @@ async fn dispatch_claimed_work_item_inner(
                 item,
                 &mut execution,
                 event_callback,
-                error.to_string(),
+                format!("{error:#}"),
             )
             .await;
         }
@@ -2432,16 +2438,87 @@ async fn poll_refiner_job(
         + Duration::from_secs(config.execution.job_timeout_seconds.max(30));
     let poll_interval = Duration::from_secs(config.execution.poll_interval_seconds.max(1));
     let mut last_status = String::new();
+    let mut transient_failures = 0usize;
+    let mut not_found_failures = 0usize;
 
     loop {
-        let detail = get_refiner_json(
+        let detail = match get_refiner_json(
             client,
             config,
             base_url,
             format!("/api/jobs/{}", job_id).as_str(),
         )
         .await
-        .with_context(|| format!("failed to poll Refiner job {}", job_id))?;
+        {
+            Ok(detail) => {
+                transient_failures = 0;
+                not_found_failures = 0;
+                detail
+            }
+            Err(error)
+                if is_transient_refiner_poll_error(&error)
+                    && transient_failures < REFINER_POLL_TRANSIENT_RETRY_LIMIT =>
+            {
+                transient_failures += 1;
+                let backoff_seconds = REFINER_POLL_TRANSIENT_RETRY_BASE_SECONDS
+                    .saturating_mul(1u64 << (transient_failures - 1));
+                let backoff = Duration::from_secs(backoff_seconds);
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining <= backoff {
+                    return Err(anyhow!(
+                        "failed to poll Refiner job {} before deadline after {} transient retries: {error:#}",
+                        job_id,
+                        transient_failures,
+                    ));
+                }
+                tracing::warn!(
+                    target: "conductor::refiner",
+                    job_id,
+                    retry = transient_failures,
+                    retry_limit = REFINER_POLL_TRANSIENT_RETRY_LIMIT,
+                    backoff_seconds,
+                    error = ?error,
+                    "Transient Refiner poll failure; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+            Err(error)
+                if is_refiner_job_not_found_error(&error)
+                    && not_found_failures < REFINER_POLL_NOT_FOUND_GRACE_LIMIT =>
+            {
+                not_found_failures += 1;
+                let backoff_seconds = REFINER_POLL_TRANSIENT_RETRY_BASE_SECONDS
+                    .saturating_mul(1u64 << (not_found_failures - 1));
+                let backoff = Duration::from_secs(backoff_seconds);
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining <= backoff {
+                    return Err(anyhow!(
+                        "Refiner job {} remained unavailable after {} publication retries: {error:#}",
+                        job_id,
+                        not_found_failures,
+                    ));
+                }
+                tracing::warn!(
+                    target: "conductor::refiner",
+                    job_id,
+                    retry = not_found_failures,
+                    retry_limit = REFINER_POLL_NOT_FOUND_GRACE_LIMIT,
+                    backoff_seconds,
+                    error = ?error,
+                    "Refiner job not visible yet; retrying publication check"
+                );
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "failed to poll Refiner job {} after {} transient retries: {error:#}",
+                    job_id,
+                    transient_failures,
+                ));
+            }
+        };
         execution.latest_payload = detail.clone();
         let status = refiner_effective_status(&detail);
         let progress = detail
@@ -2729,14 +2806,57 @@ async fn post_refiner_json(
     path: &str,
     body: &Value,
 ) -> Result<Value> {
+    let effective_timeout_seconds = config
+        .integrations
+        .refiner
+        .timeout_seconds
+        .max(config.execution.refiner_operation_timeout_seconds)
+        .max(1);
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let started = Instant::now();
+    tracing::info!(
+        target: "conductor::refiner",
+        path,
+        timeout_seconds = effective_timeout_seconds,
+        "Refiner request started"
+    );
     let mut request = client
-        .post(format!("{}{}", base_url.trim_end_matches('/'), path))
+        .post(&url)
+        // Keep this request-scoped as well as client-scoped.  This makes the
+        // long-running Refiner operation deadline explicit and prevents a
+        // future shared-client change from silently restoring a short
+        // discovery timeout.
+        .timeout(Duration::from_secs(effective_timeout_seconds))
         .json(body);
     if let Some(token) = config.integrations.refiner.bearer_token.as_deref() {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await?;
-    decode_response(response).await
+    let response = request.send().await.map_err(|error| {
+        anyhow!(
+            "Refiner request {path} failed after {} ms: {error}",
+            started.elapsed().as_millis()
+        )
+    })?;
+    let status = response.status();
+    let result = decode_response(response).await;
+    match &result {
+        Ok(_) => tracing::info!(
+            target: "conductor::refiner",
+            path,
+            status = status.as_u16(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Refiner request completed"
+        ),
+        Err(error) => tracing::error!(
+            target: "conductor::refiner",
+            path,
+            status = status.as_u16(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            error = ?error,
+            "Refiner request returned an error"
+        ),
+    }
+    result
 }
 
 async fn get_refiner_json(
@@ -2745,12 +2865,88 @@ async fn get_refiner_json(
     base_url: &str,
     path: &str,
 ) -> Result<Value> {
-    let mut request = client.get(format!("{}{}", base_url.trim_end_matches('/'), path));
+    let effective_timeout_seconds = config.integrations.refiner.timeout_seconds.max(1);
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let started = Instant::now();
+    tracing::debug!(
+        target: "conductor::refiner",
+        path,
+        timeout_seconds = effective_timeout_seconds,
+        "Refiner GET request started"
+    );
+    let mut request = client
+        .get(url)
+        .timeout(Duration::from_secs(effective_timeout_seconds));
     if let Some(token) = config.integrations.refiner.bearer_token.as_deref() {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await?;
-    decode_response(response).await
+    let response = request.send().await.map_err(|error| {
+        anyhow!(
+            "Refiner GET request {path} failed after {} ms: {error}",
+            started.elapsed().as_millis()
+        )
+    })?;
+    let status = response.status();
+    let result = decode_response(response).await;
+    match &result {
+        Ok(_) => tracing::debug!(
+            target: "conductor::refiner",
+            path,
+            status = status.as_u16(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Refiner GET request completed"
+        ),
+        Err(error) => tracing::warn!(
+            target: "conductor::refiner",
+            path,
+            status = status.as_u16(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            error = ?error,
+            "Refiner GET request returned an error"
+        ),
+    }
+    result
+}
+
+fn is_transient_refiner_poll_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+
+    // Authentication and missing-job errors are deterministic. Retrying them
+    // only delays the actionable failure and can never recover the execution.
+    if message.contains("unauthorized")
+        || message.contains("forbidden")
+        || message.contains("not_found")
+    {
+        return false;
+    }
+
+    // decode_response includes the HTTP status so ordinary client errors
+    // (bad request, validation failure, etc.) remain non-retryable while the
+    // standard overload/rate-limit statuses are safely retried.
+    if let Some(status_start) = message.find("status ") {
+        let status = &message[status_start + "status ".len()..];
+        let status_code: String = status.chars().take_while(char::is_ascii_digit).collect();
+        if let Ok(status_code) = status_code.parse::<u16>() {
+            return matches!(status_code, 408 | 425 | 429) || status_code >= 500;
+        }
+    }
+
+    // Transport failures (timeouts, connection resets, and transient DNS or
+    // connect errors) have no HTTP status and are safe to retry for polling.
+    message.contains("timeout")
+        || message.contains("timed out")
+        || message.contains("connection")
+        || message.contains("connect")
+        || message.contains("reset")
+        || message.contains("broken pipe")
+        || message.contains("temporarily")
+}
+
+fn is_refiner_job_not_found_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("not_found")
+        || message.contains("status 404")
+        || message.contains("job not found")
 }
 
 async fn decode_response(response: reqwest::Response) -> Result<Value> {
@@ -2771,7 +2967,12 @@ async fn decode_response(response: reqwest::Response) -> Result<Value> {
         StatusCode::NOT_FOUND => "not_found",
         _ => "upstream_error",
     };
-    Err(anyhow!("{}: {}", prefix, message))
+    Err(anyhow!(
+        "{} (status {}): {}",
+        prefix,
+        status.as_u16(),
+        message
+    ))
 }
 
 #[cfg(test)]
@@ -2789,6 +2990,7 @@ mod tests {
     };
     use chrono::Duration as ChronoDuration;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
     use tokio::net::TcpListener;
 
@@ -2975,6 +3177,41 @@ mod tests {
                 .expect("serve refiner execution surface");
         });
         (format!("http://{}", addr), handle)
+    }
+
+    async fn spawn_flaky_refiner_poll_surface()
+    -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/api/jobs/{job_id}",
+            get(move || {
+                let attempts = Arc::clone(&handler_attempts);
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({"error": "Refiner temporarily overloaded"})),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            Json(json!({"status": "completed", "stages": []})),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind flaky refiner surface");
+        let addr = listener.local_addr().expect("flaky refiner addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve flaky refiner surface");
+        });
+        (format!("http://{}", addr), attempts, handle)
     }
 
     async fn spawn_mock_rollback_surface(
@@ -3466,6 +3703,87 @@ mod tests {
             Some("failed")
         );
         assert_eq!(report.get("passed").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn transient_refiner_poll_errors_are_retryable_but_auth_and_missing_jobs_are_not() {
+        assert!(is_transient_refiner_poll_error(&anyhow!(
+            "upstream_error (status 503): temporarily overloaded"
+        )));
+        assert!(is_transient_refiner_poll_error(&anyhow!(
+            "Refiner GET request failed after 1000 ms: request timed out"
+        )));
+        assert!(!is_transient_refiner_poll_error(&anyhow!(
+            "unauthorized (status 401): invalid token"
+        )));
+        assert!(!is_transient_refiner_poll_error(&anyhow!(
+            "not_found (status 404): job does not exist"
+        )));
+        assert!(!is_transient_refiner_poll_error(&anyhow!(
+            "upstream_error (status 400): invalid job id"
+        )));
+    }
+
+    #[tokio::test]
+    async fn poll_refiner_job_recovers_from_transient_upstream_failure() {
+        let (base_url, attempts, handle) = spawn_flaky_refiner_poll_surface().await;
+        let mut config = ConductorConfig::default();
+        config.integrations.refiner.base_url = Some(base_url.clone());
+        config.integrations.refiner.timeout_seconds = 2;
+        config.execution.poll_interval_seconds = 1;
+        config.execution.job_timeout_seconds = 30;
+
+        let repository = Arc::new(MemoryRepository::new());
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("poll:transient-refiner".to_string()),
+            title: "Poll transient Refiner failure".to_string(),
+            summary: "Retry a temporary Refiner overload".to_string(),
+            target_service: Some("conductor".to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: vec![],
+            rollout_strategy: Some(RolloutStrategy::Canary),
+            status: Some(WorkStatus::Scheduled),
+            priority: Some(80),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "poll"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        repository
+            .upsert_work_item(&item)
+            .await
+            .expect("insert poll work item");
+        let mut execution = WorkExecution::new(
+            item.id,
+            item.target_service.clone(),
+            item.delivery_stage,
+            item.rollout_strategy,
+        );
+
+        let detail = poll_refiner_job(
+            &build_http_client(2).expect("client"),
+            &config,
+            &base_url,
+            "flaky-job",
+            &mut item.clone(),
+            &mut execution,
+            repository.as_ref(),
+            None,
+        )
+        .await
+        .expect("poll should recover");
+
+        assert_eq!(
+            detail.get("status").and_then(Value::as_str),
+            Some("completed")
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        handle.abort();
     }
 
     #[test]
