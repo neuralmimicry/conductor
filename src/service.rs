@@ -60,9 +60,13 @@ pub struct ConductorService {
 
 const EXTERNAL_SYNC_CONCURRENCY: usize = 8;
 // Gail approval is an independent, fail-closed control-plane operation. Run
-// a small bounded batch so one slow model endpoint cannot serialize the whole
-// scheduler, while avoiding a burst that would overload the local providers.
-const AI_APPROVAL_CONCURRENCY: usize = 4;
+// Approval reviews are control-plane traffic and must remain reliable under
+// single-slot native llama.cpp providers.  Running several reviews at once
+// makes the ranker select the same provider for every request, causing queue
+// churn, degraded fallbacks, and a scheduler-wide stall.  One review at a
+// time still clears the four-item cycle quickly while preserving provider
+// capacity for planning and Refiner work.
+const AI_APPROVAL_CONCURRENCY: usize = 1;
 
 impl ConductorService {
     pub fn new(
