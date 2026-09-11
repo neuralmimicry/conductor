@@ -1473,7 +1473,10 @@ pub async fn gail_plan_summary(
                     "include_configured": true,
                     "selection_mode": "best",
                     "max_candidates": 3,
-                    "max_tokens": 384,
+                    // Planning context includes the complete estate summary;
+                    // keep the platform minimum so a concise JSON response
+                    // is not truncated before it can be parsed.
+                    "max_tokens": 16_384,
                     "temperature": 0.0,
                     "reasoning_effort": "medium",
                     "timeout_seconds": config.integrations.gail.timeout_seconds.max(30),
