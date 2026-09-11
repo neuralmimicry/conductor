@@ -16,12 +16,12 @@ use crate::{
     policy::policy_evaluation_to_value,
 };
 
-// The platform default remains 16,384 tokens for general workloads. An
-// approval is a bounded JSON verdict, however, so reserving the full general
-// purpose budget would make this control-plane gate wait behind unnecessarily
-// long local-model generations. Keep this exception explicit and local to the
-// approval workflow.
-const APPROVAL_REVIEW_MAX_OUTPUT_TOKENS: u32 = 512;
+// Keep the platform minimum default for approval requests as well. The
+// response is a small JSON verdict, but the reviewer may spend tokens on
+// reasoning before emitting it; a 256/512-token cap was truncating valid
+// decisions for larger work-item contexts and left the scheduler permanently
+// blocked on approval parsing.
+const APPROVAL_REVIEW_MAX_OUTPUT_TOKENS: u32 = 16_384;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AiApprovalDecision {
