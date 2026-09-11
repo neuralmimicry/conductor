@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 use crate::{
     approvals::{
-        build_approval_metadata, metadata_matches_item, metadata_schedule_now, metadata_verdict,
-        request_ai_approval,
+        approval_failure_metadata, build_approval_metadata, metadata_matches_item,
+        metadata_retry_due, metadata_schedule_now, metadata_verdict, request_ai_approval,
     },
     config::ConductorConfig,
     discovery::discover_and_probe,
@@ -241,6 +241,7 @@ impl ConductorService {
         let review_candidates = work_items
             .iter()
             .filter(|item| work_item_requires_ai_review(item))
+            .filter(|item| metadata_retry_due(&item.approval_metadata))
             .filter(|item| {
                 !(metadata_verdict(&item.approval_metadata) == Some("denied")
                     && metadata_matches_item(&item.approval_metadata, item))
@@ -398,6 +399,19 @@ impl ConductorService {
                 Ok(None) => break,
                 Err(error) => {
                     errors.push(format!("{}: {}", original.id, error));
+                    let mut failed_item = original.clone();
+                    failed_item.approval_metadata =
+                        approval_failure_metadata(&original.approval_metadata, &error.to_string());
+                    failed_item.notes.push(format!(
+                        "{} AI approval provider failure; retry is cooled down until epoch {}",
+                        now_utc().to_rfc3339(),
+                        failed_item
+                            .approval_metadata
+                            .get("retry_not_before_epoch")
+                            .and_then(Value::as_i64)
+                            .unwrap_or_default()
+                    ));
+                    self.repository.upsert_work_item(&failed_item).await?;
                     let mut event = ConductorEvent::new(
                         "approval.failed",
                         format!("AI approval failed for {}: {}", original.title, error),

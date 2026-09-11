@@ -291,6 +291,47 @@ pub fn metadata_matches_item(metadata: &Value, item: &WorkItem) -> bool {
         .is_some_and(|fingerprint| fingerprint == work_item_approval_fingerprint(item))
 }
 
+/// Failed provider calls must not be retried on every scheduler tick.  Keep
+/// the cooldown in the work item so it survives a Conductor restart and does
+/// not consume the only approval slot while Gail is degraded.
+pub fn metadata_retry_due(metadata: &Value) -> bool {
+    let Some(not_before) = metadata
+        .get("retry_not_before_epoch")
+        .and_then(Value::as_i64)
+    else {
+        return true;
+    };
+    now_utc().timestamp() >= not_before
+}
+
+pub fn approval_failure_metadata(previous: &Value, error: &str) -> Value {
+    let failures = previous
+        .get("provider_failure_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(1);
+    let exponent = failures.saturating_sub(1).min(5);
+    let cooldown_seconds = (60_i64 * (1_i64 << exponent)).min(1_800);
+    let retry_not_before_epoch = now_utc().timestamp().saturating_add(cooldown_seconds);
+    let mut metadata = previous.clone();
+    if !metadata.is_object() {
+        metadata = json!({});
+    }
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("provider_failure_count".to_string(), json!(failures));
+        object.insert(
+            "last_provider_failure_at".to_string(),
+            json!(now_utc().to_rfc3339()),
+        );
+        object.insert("last_provider_failure".to_string(), json!(error));
+        object.insert(
+            "retry_not_before_epoch".to_string(),
+            json!(retry_not_before_epoch),
+        );
+    }
+    metadata
+}
+
 fn normalize_reason(approved: bool, reason: String) -> String {
     let trimmed = reason.trim();
     if !trimmed.is_empty() {
