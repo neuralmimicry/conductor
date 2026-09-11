@@ -106,10 +106,11 @@ pub async fn request_ai_approval(
         // Approval is a single verdict, so racing five expensive local
         // candidates only increases queue pressure and malformed responses.
         "max_candidates": 1,
-        // Native Qwen endpoints occasionally spend a short response budget on
-        // reasoning markers before emitting the required decision object.
-        // Leave enough room for the complete strict JSON verdict.
-        "max_tokens": 384,
+        // Keep the requested output budget at the platform minimum. Gail's
+        // prompt-budget layer may reduce this to the provider's context
+        // capacity, but a small caller-side cap must never truncate a modern
+        // reasoning model before it emits the complete verdict.
+        "max_tokens": 16_384,
         // Ask the provider adapter to enforce a JSON object response. The
         // parser remains fail-closed, but this prevents reasoning prose and
         // markdown wrappers from consuming the approval result.
