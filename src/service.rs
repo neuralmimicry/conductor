@@ -1910,6 +1910,30 @@ impl ConductorService {
         let services = self.repository.list_service_snapshots().await?;
         let mut work_items = self.repository.list_work_items().await?;
 
+        // Automatic execution has no separate AI approval pass in deployments
+        // where the administrator gate is disabled.  Apply the same protected
+        // target rollout normalisation here before evaluating policy; otherwise
+        // planner output defaults to direct, is rejected as unsafe, and remains
+        // permanently in planned/on_hold without ever reaching Refiner.
+        let normalise_protected_rollout =
+            |item: &mut WorkItem, target_service: Option<&ServiceSnapshot>| {
+                let policy = evaluate_work_item(&self.config, item, target_service);
+                if !policy.sensitive_targets.is_empty()
+                    && matches!(
+                        item.rollout_strategy,
+                        crate::models::RolloutStrategy::Direct
+                    )
+                {
+                    item.rollout_strategy = crate::models::RolloutStrategy::Canary;
+                    item.notes.push(
+                    "automatic execution upgraded protected-target rollout from direct to canary"
+                        .to_string(),
+                );
+                    return true;
+                }
+                false
+            };
+
         // When the administrator gate is intentionally disabled, planner
         // output must still enter the execution queue. Historically planner
         // items were persisted with execution_approved=false while the
@@ -1926,11 +1950,14 @@ impl ConductorService {
                         .iter()
                         .find(|service| service.service_key == target)
                 });
-                let policy = evaluate_work_item(&self.config, original, target_service);
+                let mut item = original.clone();
+                if normalise_protected_rollout(&mut item, target_service) {
+                    self.repository.upsert_work_item(&item).await?;
+                }
+                let policy = evaluate_work_item(&self.config, &item, target_service);
                 if matches!(policy.verdict, crate::models::PolicyVerdict::Blocked) {
                     continue;
                 }
-                let mut item = original.clone();
                 item.execution_approved = true;
                 item.approval_metadata = json!({
                     "approved": true,
@@ -1961,7 +1988,11 @@ impl ConductorService {
                     .iter()
                     .find(|service| service.service_key == target)
             });
-            let policy = evaluate_work_item(&self.config, original, target_service);
+            let mut item = original.clone();
+            if normalise_protected_rollout(&mut item, target_service) {
+                self.repository.upsert_work_item(&item).await?;
+            }
+            let policy = evaluate_work_item(&self.config, &item, target_service);
             // A policy-blocked item must never be re-scheduled merely because
             // it targets a protected service.  The executor is fail-closed,
             // but scheduling such an item first consumes the execution slot
@@ -1972,12 +2003,11 @@ impl ConductorService {
             if matches!(policy.verdict, crate::models::PolicyVerdict::Blocked) {
                 continue;
             }
-            let dependency_blockers = approval_dependency_blockers(original, &work_items);
+            let dependency_blockers = approval_dependency_blockers(&item, &work_items);
             if !dependency_blockers.is_empty() {
                 continue;
             }
 
-            let mut item = original.clone();
             item.status = WorkStatus::Scheduled;
             item.notes.push(format!(
                 "{} scheduled for execution after approval gates passed",
