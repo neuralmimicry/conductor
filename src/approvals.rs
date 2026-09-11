@@ -21,7 +21,7 @@ use crate::{
 // purpose budget would make this control-plane gate wait behind unnecessarily
 // long local-model generations. Keep this exception explicit and local to the
 // approval workflow.
-const APPROVAL_REVIEW_MAX_OUTPUT_TOKENS: u32 = 2_048;
+const APPROVAL_REVIEW_MAX_OUTPUT_TOKENS: u32 = 512;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AiApprovalDecision {
