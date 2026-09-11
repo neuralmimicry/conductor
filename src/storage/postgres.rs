@@ -974,6 +974,25 @@ impl ConductorRepository for PostgresRepository {
             .await?;
         rows.into_iter().map(map_conductor_event).collect()
     }
+
+    async fn prune_history(&self, before: DateTime<Utc>) -> Result<()> {
+        // Discovery runs own service metric samples through a foreign key with
+        // ON DELETE CASCADE. Delete the parent first so this high-volume
+        // history stays bounded without leaving orphaned samples behind.
+        sqlx::query("DELETE FROM discovery_runs WHERE finished_at < $1")
+            .bind(before)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM conductor_events WHERE created_at < $1")
+            .bind(before)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM improvement_cycles WHERE finished_at < $1")
+            .bind(before)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 fn map_work_item(row: PgRow) -> Result<WorkItem> {

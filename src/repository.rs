@@ -101,4 +101,10 @@ pub trait ConductorRepository: Send + Sync {
     async fn count_improvement_cycles(&self) -> anyhow::Result<usize>;
     async fn insert_conductor_event(&self, event: &ConductorEvent) -> anyhow::Result<()>;
     async fn list_conductor_events(&self, limit: usize) -> anyhow::Result<Vec<ConductorEvent>>;
+
+    /// Remove bounded operational history while retaining recent evidence.
+    /// Non-persistent implementations may use the default no-op.
+    async fn prune_history(&self, _before: DateTime<Utc>) -> anyhow::Result<()> {
+        Ok(())
+    }
 }

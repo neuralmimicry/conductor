@@ -65,6 +65,8 @@ pub struct SecurityConfig {
 #[serde(default)]
 pub struct StorageConfig {
     pub root_dir: PathBuf,
+    pub history_retention_days: u64,
+    pub maintenance_interval_seconds: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -312,6 +314,8 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             root_dir: PathBuf::from("data"),
+            history_retention_days: 14,
+            maintenance_interval_seconds: 3600,
         }
     }
 }

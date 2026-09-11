@@ -9,6 +9,8 @@ security:
 
 storage:
   root_dir: "data"
+  history_retention_days: 14
+  maintenance_interval_seconds: 3600
 
 database:
   url: "${CONDUCTOR_DATABASE_URL}"

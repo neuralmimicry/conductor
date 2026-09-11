@@ -218,7 +218,18 @@ impl ConductorService {
     }
 
     async fn run_ai_approval_cycle_inner(&self) -> Result<usize> {
-        if !self.config.policy.ai_approvals_enabled || !self.config.policy.require_admin_approval {
+        if !self.config.policy.require_admin_approval {
+            let scheduled = self.schedule_ready_approved_work_items().await?;
+            if scheduled > 0
+                && self.config.execution.enabled
+                && !self.config.execution.dry_run
+                && !self.config.execution.emergency_stop
+            {
+                self.run_execution_cycle().await?;
+            }
+            return Ok(scheduled);
+        }
+        if !self.config.policy.ai_approvals_enabled {
             return Ok(0);
         }
 
@@ -1897,7 +1908,44 @@ impl ConductorService {
 
     async fn schedule_ready_approved_work_items(&self) -> Result<usize> {
         let services = self.repository.list_service_snapshots().await?;
-        let work_items = self.repository.list_work_items().await?;
+        let mut work_items = self.repository.list_work_items().await?;
+
+        // When the administrator gate is intentionally disabled, planner
+        // output must still enter the execution queue. Historically planner
+        // items were persisted with execution_approved=false while the
+        // approval loop was disabled by the same flag, so the executor
+        // correctly claimed zero items forever. Preserve policy safety checks,
+        // but provide the missing automatic-execution transition.
+        if !self.config.policy.require_admin_approval {
+            for original in work_items.iter().filter(|item| {
+                !item.execution_approved
+                    && matches!(item.status, WorkStatus::Planned | WorkStatus::OnHold)
+            }) {
+                let target_service = original.target_service.as_deref().and_then(|target| {
+                    services
+                        .iter()
+                        .find(|service| service.service_key == target)
+                });
+                let policy = evaluate_work_item(&self.config, original, target_service);
+                if matches!(policy.verdict, crate::models::PolicyVerdict::Blocked) {
+                    continue;
+                }
+                let mut item = original.clone();
+                item.execution_approved = true;
+                item.approval_metadata = json!({
+                    "approved": true,
+                    "schedule_now": true,
+                    "mode": "automatic_execution",
+                    "reason": "administrator approval gate disabled by deployment policy",
+                });
+                item.notes.push(format!(
+                    "{} automatically approved because the administrator approval gate is disabled",
+                    now_utc().to_rfc3339()
+                ));
+                self.repository.upsert_work_item(&item).await?;
+            }
+            work_items = self.repository.list_work_items().await?;
+        }
         let mut scheduled = 0usize;
 
         for original in work_items
@@ -1952,6 +2000,12 @@ impl ConductorService {
         }
 
         Ok(scheduled)
+    }
+
+    async fn run_history_maintenance(&self) -> Result<()> {
+        let retention_days = self.config.storage.history_retention_days.max(1);
+        let before = now_utc() - ChronoDuration::days(retention_days as i64);
+        self.repository.prune_history(before).await
     }
 
     async fn upsert_self_test_regression_work_item(
@@ -2939,6 +2993,8 @@ pub fn spawn_background_loops(service: ConductorService) {
             .sync_interval_seconds
             .max(60),
     );
+    let maintenance_interval =
+        Duration::from_secs(service.config.storage.maintenance_interval_seconds.max(300));
 
     // One scheduler owns discovery, planning, approval, and execution. The
     // operations remain asynchronous and the external sync loops below remain
@@ -2988,10 +3044,7 @@ pub fn spawn_background_loops(service: ConductorService) {
                 }
                 next_planning = Instant::now() + planning_interval;
             }
-            if control_service.config.policy.ai_approvals_enabled
-                && control_service.config.policy.require_admin_approval
-                && Instant::now() >= next_approval
-            {
+            if Instant::now() >= next_approval {
                 if let Err(error) = control_service.run_ai_approval_cycle().await {
                     tracing::warn!(error = %error, "approval cycle failed");
                     let mut event = ConductorEvent::new(
@@ -3028,6 +3081,19 @@ pub fn spawn_background_loops(service: ConductorService) {
                 .unwrap_or_else(Instant::now);
             let wait = next.saturating_duration_since(Instant::now());
             tokio::time::sleep(wait.min(Duration::from_secs(5))).await;
+        }
+    });
+
+    let maintenance_service = service.clone();
+    tokio::spawn(async move {
+        // Start promptly so an already oversized database begins to converge,
+        // then keep the retention boundary current.
+        let mut interval = tokio::time::interval(maintenance_interval);
+        loop {
+            if let Err(error) = maintenance_service.run_history_maintenance().await {
+                tracing::warn!(error = %error, "history maintenance failed");
+            }
+            interval.tick().await;
         }
     });
 
