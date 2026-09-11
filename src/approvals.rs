@@ -16,6 +16,13 @@ use crate::{
     policy::policy_evaluation_to_value,
 };
 
+// The platform default remains 16,384 tokens for general workloads. An
+// approval is a bounded JSON verdict, however, so reserving the full general
+// purpose budget would make this control-plane gate wait behind unnecessarily
+// long local-model generations. Keep this exception explicit and local to the
+// approval workflow.
+const APPROVAL_REVIEW_MAX_OUTPUT_TOKENS: u32 = 2_048;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AiApprovalDecision {
     pub approved: bool,
@@ -106,11 +113,11 @@ pub async fn request_ai_approval(
         // Approval is a single verdict, so racing five expensive local
         // candidates only increases queue pressure and malformed responses.
         "max_candidates": 1,
-        // Keep the requested output budget at the platform minimum. Gail's
-        // prompt-budget layer may reduce this to the provider's context
-        // capacity, but a small caller-side cap must never truncate a modern
-        // reasoning model before it emits the complete verdict.
-        "max_tokens": 16_384,
+        // This workflow returns one small JSON verdict. Use a bounded
+        // workflow-specific budget so approvals do not wait for a full
+        // general-purpose generation. The platform default remains 16,384
+        // tokens for workloads where the larger context is useful.
+        "max_tokens": APPROVAL_REVIEW_MAX_OUTPUT_TOKENS,
         // Ask the provider adapter to enforce a JSON object response. The
         // parser remains fail-closed, but this prevents reasoning prose and
         // markdown wrappers from consuming the approval result.
