@@ -101,10 +101,12 @@ pub async fn request_ai_approval(
         },
     });
 
-    // Approval is a control-plane gate. Keep it bounded even if a deployed
-    // integration was given an accidentally broad general-purpose timeout;
-    // a stalled reviewer must not prevent subsequent scheduler cycles.
-    let approval_timeout_seconds = config.integrations.gail.timeout_seconds.clamp(45, 120);
+    // Approval is a control-plane gate, but local Gail providers can spend
+    // several minutes working through a full estate context. Keep a finite
+    // upper bound while allowing the configured integration timeout to cover
+    // the real request duration; a short discovery timeout must not starve
+    // the scheduler before execution can reach Refiner.
+    let approval_timeout_seconds = config.integrations.gail.timeout_seconds.clamp(45, 900);
     let request_body = json!({
         "workflow": config.policy.ai_approval_workflow,
         "role": "reviewer",
