@@ -979,18 +979,42 @@ impl ConductorRepository for PostgresRepository {
         // Discovery runs own service metric samples through a foreign key with
         // ON DELETE CASCADE. Delete the parent first so this high-volume
         // history stays bounded without leaving orphaned samples behind.
-        sqlx::query("DELETE FROM discovery_runs WHERE finished_at < $1")
+        // Keep each delete small: this database is shared with Gail and is
+        // backed by NFS, so one multi-million-row transaction would hold WAL
+        // and row locks long enough to stall the control plane.
+        for _ in 0..4 {
+            let result = sqlx::query(
+                "DELETE FROM discovery_runs WHERE id IN (SELECT id FROM discovery_runs WHERE finished_at < $1 ORDER BY finished_at LIMIT 1000)",
+            )
             .bind(before)
             .execute(&self.pool)
             .await?;
-        sqlx::query("DELETE FROM conductor_events WHERE created_at < $1")
+            if result.rows_affected() == 0 {
+                break;
+            }
+        }
+        for _ in 0..4 {
+            let result = sqlx::query(
+                "DELETE FROM conductor_events WHERE id IN (SELECT id FROM conductor_events WHERE created_at < $1 ORDER BY created_at LIMIT 5000)",
+            )
             .bind(before)
             .execute(&self.pool)
             .await?;
-        sqlx::query("DELETE FROM improvement_cycles WHERE finished_at < $1")
+            if result.rows_affected() == 0 {
+                break;
+            }
+        }
+        for _ in 0..4 {
+            let result = sqlx::query(
+                "DELETE FROM improvement_cycles WHERE id IN (SELECT id FROM improvement_cycles WHERE finished_at < $1 ORDER BY finished_at LIMIT 1000)",
+            )
             .bind(before)
             .execute(&self.pool)
             .await?;
+            if result.rows_affected() == 0 {
+                break;
+            }
+        }
         Ok(())
     }
 }
