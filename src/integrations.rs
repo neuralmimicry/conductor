@@ -1076,7 +1076,7 @@ async fn probe_postgres(
         let current_database_row = sqlx::query(
             r#"
             SELECT
-                numbackends,
+                numbackends::bigint AS numbackends,
                 xact_commit,
                 xact_rollback,
                 blks_read,
@@ -1107,7 +1107,7 @@ async fn probe_postgres(
 
         let top_databases = sqlx::query(
             r#"
-            SELECT stats.datname AS database_name, stats.numbackends
+            SELECT stats.datname AS database_name, stats.numbackends::bigint AS numbackends
             FROM pg_stat_database AS stats
             JOIN pg_database AS databases
               ON databases.datname = stats.datname
