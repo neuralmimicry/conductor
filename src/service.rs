@@ -2003,6 +2003,20 @@ impl ConductorService {
             if matches!(policy.verdict, crate::models::PolicyVerdict::Blocked) {
                 continue;
             }
+            // The executor performs a fresh readiness probe before it calls
+            // Refiner.  Avoid claiming the sole execution slot for a
+            // protected target that discovery already knows is degraded: the
+            // executor will fail closed on the same baseline, and the item
+            // would otherwise be re-scheduled on every planning cycle.  The
+            // next discovery refresh makes the item eligible again after the
+            // service recovers.
+            if !policy.sensitive_targets.is_empty()
+                && !target_service.is_some_and(|service| {
+                    matches!(service.health, crate::models::ServiceHealth::Healthy)
+                })
+            {
+                continue;
+            }
             let dependency_blockers = approval_dependency_blockers(&item, &work_items);
             if !dependency_blockers.is_empty() {
                 continue;
