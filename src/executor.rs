@@ -29,6 +29,7 @@ use crate::{
 pub type ExecutionEventCallback = Arc<dyn Fn(ConductorEvent) + Send + Sync>;
 
 const REFINER_EXECUTION_PLAN_PATH: &str = "/api/execution/plan";
+const DEFAULT_REFINER_LLM_MAX_TOKENS: i64 = 16_384;
 // Discovery and health integrations use a short timeout, but Refiner job
 // payloads include bounded logs and metrics and can take longer to read while
 // the solver is busy. Keep lifecycle polling from failing on that unrelated
@@ -1987,6 +1988,18 @@ fn build_job_payload(
     if let Some(model) = &config.execution.llm_model {
         payload.insert("llm_model".to_string(), json!(model));
     }
+    // Project-solver work routinely needs a full implementation and
+    // verification pass.  Preserve an explicitly larger planner value, but
+    // never let a missing or undersized Conductor default recreate the
+    // truncation seen with the historical 256-token setting.
+    let requested_tokens = payload
+        .get("llm_max_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    payload.insert(
+        "llm_max_tokens".to_string(),
+        json!(requested_tokens.max(DEFAULT_REFINER_LLM_MAX_TOKENS)),
+    );
     if let Some(service) = service {
         if config.execution.use_local_project_root {
             if let Some(project_root) = service.repo_path.as_deref() {
@@ -3607,6 +3620,10 @@ mod tests {
                 .and_then(|rollout| rollout.get("canary_percentage"))
                 .and_then(Value::as_u64),
             Some(25)
+        );
+        assert_eq!(
+            payload.get("llm_max_tokens").and_then(Value::as_i64),
+            Some(DEFAULT_REFINER_LLM_MAX_TOKENS)
         );
     }
 
