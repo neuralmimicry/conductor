@@ -1097,7 +1097,9 @@ async fn probe_postgres(
         let activity_row = sqlx::query(
             r#"
             SELECT
-                COUNT(*) FILTER (WHERE wait_event_type IS NOT NULL)::bigint AS waiting_connections,
+                COUNT(*) FILTER (
+                    WHERE state = 'active' AND wait_event_type IS NOT NULL
+                )::bigint AS waiting_connections,
                 COUNT(*) FILTER (WHERE state = 'idle in transaction')::bigint AS idle_in_transaction
             FROM pg_stat_activity
             WHERE datname = current_database()
