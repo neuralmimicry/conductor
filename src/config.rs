@@ -180,6 +180,9 @@ pub struct PostgresIntegrationConfig {
 pub struct SharedStorageIntegrationConfig {
     pub enabled: bool,
     pub mount_path: Option<PathBuf>,
+    /// Conductor may inspect a deliberately read-only diagnostic mount while
+    /// the underlying shared export remains writable to its real clients.
+    pub read_only_expected: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -428,6 +431,7 @@ impl Default for SharedStorageIntegrationConfig {
         Self {
             enabled: true,
             mount_path: None,
+            read_only_expected: false,
         }
     }
 }

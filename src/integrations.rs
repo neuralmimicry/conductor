@@ -276,6 +276,9 @@ pub async fn probe_service(
         "grafana" => probe_grafana(client, config, service).await,
         "prometheus" => probe_prometheus(client, config, service).await,
         "postgres" => probe_postgres(config, service).await,
+        // This role reconciles database accounts and has no HTTP surface of
+        // its own. Its operational dependency is the same PostgreSQL probe.
+        "postgres_accounts" => probe_postgres(config, service).await,
         "shared-storage" => probe_shared_storage(config, service).await,
         _ => {
             probe_generic(
@@ -1322,7 +1325,7 @@ async fn probe_shared_storage(
             "subdirectories": subdirectories,
             "missing_subdirectories": missing_subdirectories,
         }),
-        health: if filesystem.read_only
+        health: if (filesystem.read_only && !config.integrations.shared_storage.read_only_expected)
             || usage_ratio >= 0.95
             || inode_usage_ratio >= 0.95
             || (expected_subdirectories_len > 0

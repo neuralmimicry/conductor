@@ -256,10 +256,16 @@ impl MutableService {
             .as_ref()
             .and_then(|raw| normalize_url(raw, tls_enabled));
 
+        let service_key_alias = self.service_key.replace('-', "_");
         let internal_url = pick_string(
             &self.vars,
             &[
                 &format!("continuum_tenant_{}_internal_url", self.service_key),
+                &format!("continuum_tenant_{}_internal_url", service_key_alias),
+                &format!("continuum_{}_server_url", self.service_key),
+                &format!("continuum_{}_server_url", service_key_alias),
+                &format!("continuum_{}_api_base_url", self.service_key),
+                &format!("continuum_{}_api_base_url", service_key_alias),
                 &format!(
                     "continuum_shared_{}_api_internal_base_url",
                     self.service_key
