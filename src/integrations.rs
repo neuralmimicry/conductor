@@ -280,6 +280,9 @@ pub async fn probe_service(
         // its own. Its operational dependency is the same PostgreSQL probe.
         "postgres_accounts" => probe_postgres(config, service).await,
         "shared-storage" => probe_shared_storage(config, service).await,
+        "k3s-control-plane" | "k3s-worker" | "nemoclaw" | "pxe-control" => {
+            probe_inventory_service(service)
+        }
         _ => {
             probe_generic(
                 client,
@@ -1337,6 +1340,23 @@ async fn probe_shared_storage(
         } else {
             ServiceHealth::Healthy
         },
+    })
+}
+
+fn probe_inventory_service(service: &ServiceSnapshot) -> Result<ProbeResult> {
+    Ok(ProbeResult {
+        endpoint: None,
+        summary: format!(
+            "{} is configured as a host-managed service; no HTTP probe surface is defined",
+            service.display_name
+        ),
+        metrics: json!({
+            "probe": "inventory_only",
+            "probe_skipped": true,
+            "hosts": service.hosts,
+            "reason": "host-managed service has no configured HTTP base URL",
+        }),
+        health: ServiceHealth::Healthy,
     })
 }
 
