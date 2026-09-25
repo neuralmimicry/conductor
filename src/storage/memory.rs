@@ -272,10 +272,9 @@ impl ConductorRepository for MemoryRepository {
         let expires_at = now + ChronoDuration::seconds(claim_ttl_seconds as i64);
         let mut items: Vec<_> = self.work_items.read().await.values().cloned().collect();
         items.sort_by(|left, right| {
-            right
-                .priority
-                .cmp(&left.priority)
-                .then_with(|| right.updated_at.cmp(&left.updated_at))
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| right.priority.cmp(&left.priority))
         });
 
         let mut claimed_ids = Vec::new();

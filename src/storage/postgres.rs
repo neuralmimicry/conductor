@@ -665,7 +665,10 @@ impl ConductorRepository for PostgresRepository {
               AND status = 'scheduled'
               AND (scheduled_for IS NULL OR scheduled_for <= $1)
               AND (claim_expires_at IS NULL OR claim_expires_at <= $1)
-            ORDER BY priority DESC, updated_at DESC
+            -- Preserve queue age across continuous planning cycles. Priority
+            -- breaks ties without allowing newly-created high-priority work to
+            -- keep older approved work waiting forever.
+            ORDER BY updated_at ASC, priority DESC
             FOR UPDATE SKIP LOCKED
             LIMIT $2
             "#,

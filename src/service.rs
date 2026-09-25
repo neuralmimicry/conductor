@@ -220,13 +220,6 @@ impl ConductorService {
     async fn run_ai_approval_cycle_inner(&self) -> Result<usize> {
         if !self.config.policy.require_admin_approval {
             let scheduled = self.schedule_ready_approved_work_items().await?;
-            if scheduled > 0
-                && self.config.execution.enabled
-                && !self.config.execution.dry_run
-                && !self.config.execution.emergency_stop
-            {
-                self.run_execution_cycle().await?;
-            }
             return Ok(scheduled);
         }
         if !self.config.policy.ai_approvals_enabled {
@@ -462,22 +455,6 @@ impl ConductorService {
             "partial_failure".to_string()
         });
         self.publish_event(event);
-
-        if (approved > 0 || scheduled > 0)
-            && self.config.execution.enabled
-            && !self.config.execution.dry_run
-            && !self.config.execution.emergency_stop
-        {
-            if let Err(error) = self.run_execution_cycle().await {
-                let mut event = ConductorEvent::new(
-                    "approval.execution_trigger.failed",
-                    format!("post-approval execution trigger failed: {}", error),
-                    json!({"error": error.to_string()}),
-                );
-                event.status = Some("failure".to_string());
-                self.publish_event(event);
-            }
-        }
 
         Ok(approved)
     }
@@ -3040,16 +3017,15 @@ pub fn spawn_background_loops(service: ConductorService) {
     let maintenance_interval =
         Duration::from_secs(service.config.storage.maintenance_interval_seconds.max(300));
 
-    // One scheduler owns discovery, planning, approval, and execution. The
-    // operations remain asynchronous and the external sync loops below remain
-    // concurrent, but the control-plane stages cannot race with one another or
-    // plan against a discovery snapshot that is still being replaced.
+    // One scheduler owns discovery, planning, and approval so those control
+    // plane stages cannot race. Execution has its own loop below: Refiner jobs
+    // can take many minutes, and must not hold up discovery, planning, or
+    // approval, or have those shorter cycles continually postpone dispatch.
     let control_service = service.clone();
     tokio::spawn(async move {
         let mut next_discovery = Instant::now();
         let mut next_planning = Instant::now();
         let mut next_approval = Instant::now();
-        let mut next_execution = Instant::now();
         let mut discovery_available = false;
         loop {
             let now = Instant::now();
@@ -3100,31 +3076,26 @@ pub fn spawn_background_loops(service: ConductorService) {
                     control_service.publish_event(event);
                 }
                 next_approval = Instant::now() + approval_interval;
-                // The approval method triggers execution when it schedules
-                // ready work. Avoid immediately launching a redundant second
-                // execution scan in the same control-plane turn.
-                next_execution = Instant::now() + execution_interval;
-            }
-            if Instant::now() >= next_execution {
-                if let Err(error) = control_service.run_execution_cycle().await {
-                    tracing::warn!(error = %error, "execution cycle failed");
-                    let mut event = ConductorEvent::new(
-                        "execution.cycle.failed",
-                        format!("execution cycle failed: {}", error),
-                        json!({"error": error.to_string()}),
-                    );
-                    event.status = Some("failure".to_string());
-                    control_service.publish_event(event);
-                }
-                next_execution = Instant::now() + execution_interval;
             }
 
-            let next = [next_discovery, next_planning, next_approval, next_execution]
+            let next = [next_discovery, next_planning, next_approval]
                 .into_iter()
                 .min()
                 .unwrap_or_else(Instant::now);
             let wait = next.saturating_duration_since(Instant::now());
             tokio::time::sleep(wait.min(Duration::from_secs(5))).await;
+        }
+    });
+
+    let execution_service = service.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(execution_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if let Err(error) = execution_service.run_execution_cycle().await {
+                tracing::warn!(error = %error, "execution cycle failed");
+            }
         }
     });
 
