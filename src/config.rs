@@ -205,6 +205,11 @@ pub struct AtlassianConfig {
 pub struct PlanningConfig {
     pub refresh_interval_seconds: u64,
     pub auto_queue: bool,
+    /// Maximum number of failed Refiner executions for one unchanged planner
+    /// recommendation, including the initial attempt. Zero disables retries.
+    pub failed_item_retry_max_attempts: usize,
+    /// Minimum time between a terminal failure and its bounded planner retry.
+    pub failed_item_retry_backoff_seconds: u64,
     pub gail_workflow: String,
     pub minimum_priority: i32,
     /// Maximum serialized estate context sent to Gail's planning model.
@@ -481,6 +486,8 @@ impl Default for PlanningConfig {
         Self {
             refresh_interval_seconds: 240,
             auto_queue: true,
+            failed_item_retry_max_attempts: 2,
+            failed_item_retry_backoff_seconds: 21_600,
             gail_workflow: "conductor_improvement_planner".to_string(),
             minimum_priority: 40,
             max_prompt_chars: 12_000,

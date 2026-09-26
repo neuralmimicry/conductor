@@ -8,9 +8,9 @@ use crate::{
     improvement_catalog::{ImprovementGap, KNOWN_GAPS},
     integrations::gail_plan_summary,
     models::{
-        DeliveryStage, FindingSeverity, ImprovementCycle, NewWorkItem, RepositorySnapshot,
-        RolloutStrategy, RunStatus, ServiceSnapshot, ServiceTrendSummary, WorkItem, WorkStatus,
-        now_utc,
+        DeliveryStage, ExecutionStatus, FindingSeverity, ImprovementCycle, NewWorkItem,
+        RepositorySnapshot, RolloutStrategy, RunStatus, ServiceSnapshot, ServiceTrendSummary,
+        WorkItem, WorkStatus, now_utc,
     },
     repository::ConductorRepository,
     trends::summarize_trends,
@@ -70,6 +70,7 @@ pub async fn run_planning_cycle(
         .await?;
     let recommendations =
         derive_recommendations(&detected_findings, config.planning.minimum_priority);
+    let mut queued_recommendations = 0usize;
 
     // Formal gaps are the durable programme backlog and must remain visible
     // even when operators temporarily disable dynamic finding auto-queueing.
@@ -78,7 +79,9 @@ pub async fn run_planning_cycle(
     }
     if config.planning.auto_queue {
         for recommendation in &recommendations {
-            upsert_recommendation(repository, recommendation).await?;
+            if upsert_recommendation(repository, recommendation, &config.planning).await? {
+                queued_recommendations += 1;
+            }
         }
     }
 
@@ -119,8 +122,9 @@ pub async fn run_planning_cycle(
             )
         } else {
             format!(
-                "Reconciled {} known platform gaps and queued {} finding-driven improvement items from {} findings across {} services.",
+                "Reconciled {} known platform gaps and queued {} of {} finding-driven recommendations from {} findings across {} services.",
                 KNOWN_GAPS.len(),
+                queued_recommendations,
                 recommendations.len(),
                 findings.len(),
                 unique_service_targets(&recommendations).len()
@@ -542,13 +546,14 @@ async fn upsert_catalogue_gap(
 async fn upsert_recommendation(
     repository: &dyn ConductorRepository,
     recommendation: &ImprovementRecommendation,
-) -> Result<()> {
+    planning: &crate::config::PlanningConfig,
+) -> Result<bool> {
     if let Some(existing) = repository
         .find_work_item_by_dedupe_key(&recommendation.dedupe_key)
         .await?
     {
         if existing.admin_override {
-            return Ok(());
+            return Ok(false);
         }
         // Scheduling may upgrade direct delivery to canary for a protected
         // target. Keep that conservative choice when the deterministic
@@ -595,23 +600,52 @@ async fn upsert_recommendation(
                 "planner confirmed recommendation"
             }
         ));
-        if material_change && (updated.execution_approved || updated.approval_metadata != json!({}))
-        {
-            updated.execution_approved = false;
-            updated.approval_metadata = json!({});
-            if matches!(
-                updated.status,
-                WorkStatus::Planned | WorkStatus::Scheduled | WorkStatus::OnHold
-            ) {
+        if material_change {
+            let was_failed = updated.status == WorkStatus::Failure;
+            let had_approval = updated.execution_approved || updated.approval_metadata != json!({});
+            if had_approval {
+                updated.execution_approved = false;
+                updated.approval_metadata = json!({});
+                if matches!(
+                    updated.status,
+                    WorkStatus::Planned
+                        | WorkStatus::Scheduled
+                        | WorkStatus::OnHold
+                        | WorkStatus::Failure
+                ) {
+                    updated.status = WorkStatus::Planned;
+                }
+                updated.notes.push(format!(
+                    "{} planner reset approval because the recommended change changed",
+                    now_utc().to_rfc3339()
+                ));
+            } else if was_failed {
                 updated.status = WorkStatus::Planned;
             }
+            if was_failed {
+                updated.finished_at = None;
+                updated.scheduled_for = None;
+                updated.progress_pct = 0;
+                updated.started_at = None;
+                updated.notes.push(format!(
+                    "{} planner reopened failed work after a material recommendation change",
+                    now_utc().to_rfc3339()
+                ));
+            }
+        } else if updated.status == WorkStatus::Failure
+            && retry_failed_recommendation(repository, &mut updated, planning).await?
+        {
             updated.notes.push(format!(
-                "{} planner reset approval because the recommended change changed",
+                "{} planner queued a bounded retry for the still-active recommendation",
                 now_utc().to_rfc3339()
             ));
         }
+        let queued = matches!(
+            updated.status,
+            WorkStatus::Planned | WorkStatus::Scheduled | WorkStatus::OnHold
+        );
         repository.upsert_work_item(&updated).await?;
-        return Ok(());
+        return Ok(queued);
     }
 
     let item = WorkItem::from_new(NewWorkItem {
@@ -634,7 +668,57 @@ async fn upsert_recommendation(
         source: Some("planner".to_string()),
         scheduled_for: None,
     });
-    repository.upsert_work_item(&item).await
+    repository.upsert_work_item(&item).await?;
+    Ok(true)
+}
+
+async fn retry_failed_recommendation(
+    repository: &dyn ConductorRepository,
+    item: &mut WorkItem,
+    planning: &crate::config::PlanningConfig,
+) -> Result<bool> {
+    let max_attempts = planning.failed_item_retry_max_attempts;
+    if max_attempts == 0 {
+        return Ok(false);
+    }
+
+    let executions = repository
+        .list_work_executions_for_item(item.id, 1_000)
+        .await?;
+    let failed_executions = executions
+        .iter()
+        .filter(|execution| execution.status == ExecutionStatus::Failure)
+        .collect::<Vec<_>>();
+    if failed_executions.len() >= max_attempts {
+        return Ok(false);
+    }
+
+    let last_failure_at = failed_executions
+        .iter()
+        .map(|execution| execution.finished_at.unwrap_or(execution.updated_at))
+        .max()
+        .or(item.finished_at);
+    let Some(last_failure_at) = last_failure_at else {
+        return Ok(false);
+    };
+    let retry_backoff = chrono::Duration::seconds(
+        planning
+            .failed_item_retry_backoff_seconds
+            .min(i64::MAX as u64) as i64,
+    );
+    if now_utc().signed_duration_since(last_failure_at) < retry_backoff {
+        return Ok(false);
+    }
+
+    item.status = WorkStatus::Planned;
+    item.progress_pct = 0;
+    item.execution_approved = false;
+    item.approval_metadata = json!({});
+    item.scheduled_for = None;
+    item.started_at = None;
+    item.finished_at = None;
+    item.updated_at = now_utc();
+    Ok(true)
 }
 
 fn recommendation_to_value(recommendation: &ImprovementRecommendation) -> Value {
@@ -670,8 +754,8 @@ mod tests {
     use crate::{
         findings::detect_findings,
         models::{
-            DeliveryStage, NewWorkItem, RolloutStrategy, ServiceHealth, ServiceSnapshot,
-            ServiceTrendSummary, WorkStatus,
+            DeliveryStage, ExecutionStatus, NewWorkItem, RolloutStrategy, ServiceHealth,
+            ServiceSnapshot, ServiceTrendSummary, WorkExecution, WorkStatus,
         },
         storage::memory::MemoryRepository,
     };
@@ -905,9 +989,13 @@ mod tests {
             depends_on: Vec::new(),
         };
 
-        upsert_recommendation(repository.as_ref(), &recommendation)
-            .await
-            .expect("upsert");
+        upsert_recommendation(
+            repository.as_ref(),
+            &recommendation,
+            &crate::config::PlanningConfig::default(),
+        )
+        .await
+        .expect("upsert");
 
         let updated = repository
             .find_work_item_by_dedupe_key("gail:trading")
@@ -918,6 +1006,243 @@ mod tests {
         assert_eq!(updated.approval_metadata, json!({}));
         assert_eq!(updated.status, WorkStatus::Planned);
         assert_eq!(updated.scheduled_for, Some(queue_time));
+    }
+
+    #[tokio::test]
+    async fn planner_retries_unchanged_failure_once_after_backoff() {
+        let repository = MemoryRepository::new();
+        let failed_at = now_utc() - chrono::Duration::hours(7);
+        let mut item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("gail:risk-controls".to_string()),
+            title: "Improve Gail risk controls".to_string(),
+            summary: "Review risk-control findings and correct the identified gap.".to_string(),
+            target_service: Some("gail".to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: Vec::new(),
+            rollout_strategy: Some(RolloutStrategy::Direct),
+            status: Some(WorkStatus::Failure),
+            priority: Some(80),
+            progress_pct: Some(75),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec!["gail".to_string(), "risk".to_string()],
+            plan: json!({"action": "review_risk_controls"}),
+            depends_on: Vec::new(),
+            source: Some("planner".to_string()),
+            scheduled_for: Some(failed_at),
+        });
+        item.started_at = Some(failed_at);
+        item.finished_at = Some(failed_at);
+        item.approval_metadata = json!({"approved": true, "schedule_now": true});
+
+        let mut execution = WorkExecution::new(
+            item.id,
+            item.target_service.clone(),
+            item.delivery_stage,
+            item.rollout_strategy,
+        );
+        execution.mark_status(ExecutionStatus::Failure);
+        execution.updated_at = failed_at;
+        execution.finished_at = Some(failed_at);
+        item.last_execution_id = Some(execution.id);
+        repository
+            .upsert_work_item(&item)
+            .await
+            .expect("failed item");
+        repository
+            .upsert_work_execution(&execution)
+            .await
+            .expect("failed execution");
+
+        let recommendation = ImprovementRecommendation {
+            finding_id: uuid::Uuid::new_v4(),
+            finding_key: "gail_risk_controls".to_string(),
+            dedupe_key: "gail:risk-controls".to_string(),
+            title: item.title.clone(),
+            summary: item.summary.clone(),
+            target_service: item.target_service.clone(),
+            delivery_stage: item.delivery_stage,
+            rollout_strategy: item.rollout_strategy,
+            priority: item.priority,
+            tags: item.tags.clone(),
+            plan: item.plan.clone(),
+            depends_on: Vec::new(),
+        };
+
+        let queued = upsert_recommendation(
+            &repository,
+            &recommendation,
+            &crate::config::PlanningConfig::default(),
+        )
+        .await
+        .expect("retry upsert");
+        assert!(queued);
+
+        let updated = repository
+            .find_work_item_by_dedupe_key("gail:risk-controls")
+            .await
+            .expect("lookup")
+            .expect("updated item");
+        assert_eq!(updated.status, WorkStatus::Planned);
+        assert_eq!(updated.progress_pct, 0);
+        assert!(!updated.execution_approved);
+        assert_eq!(updated.approval_metadata, json!({}));
+        assert_eq!(updated.scheduled_for, None);
+        assert_eq!(updated.finished_at, None);
+        assert_eq!(updated.last_execution_id, Some(execution.id));
+    }
+
+    #[tokio::test]
+    async fn planner_does_not_retry_recent_or_exhausted_failures() {
+        for failure_count in [1usize, 2] {
+            let repository = MemoryRepository::new();
+            let failed_at = now_utc()
+                - if failure_count == 1 {
+                    chrono::Duration::hours(1)
+                } else {
+                    chrono::Duration::hours(8)
+                };
+            let mut item = WorkItem::from_new(NewWorkItem {
+                dedupe_key: Some(format!("repo:baseline:{failure_count}")),
+                title: "Establish test baseline".to_string(),
+                summary: "Create a minimal test baseline.".to_string(),
+                target_service: Some("conductor".to_string()),
+                delivery_stage: Some(DeliveryStage::Development),
+                validated_stages: Vec::new(),
+                rollout_strategy: Some(RolloutStrategy::Direct),
+                status: Some(WorkStatus::Failure),
+                priority: Some(70),
+                progress_pct: Some(0),
+                admin_override: false,
+                execution_approved: false,
+                verification_required: Some(true),
+                tags: vec!["tests".to_string()],
+                plan: json!({"action": "baseline"}),
+                depends_on: Vec::new(),
+                source: Some("planner".to_string()),
+                scheduled_for: None,
+            });
+            item.finished_at = Some(failed_at);
+            repository
+                .upsert_work_item(&item)
+                .await
+                .expect("failed item");
+
+            for attempt in 0..failure_count {
+                let attempt_at = failed_at - chrono::Duration::hours(attempt as i64);
+                let mut execution = WorkExecution::new(
+                    item.id,
+                    item.target_service.clone(),
+                    item.delivery_stage,
+                    item.rollout_strategy,
+                );
+                execution.mark_status(ExecutionStatus::Failure);
+                execution.updated_at = attempt_at;
+                execution.finished_at = Some(attempt_at);
+                repository
+                    .upsert_work_execution(&execution)
+                    .await
+                    .expect("failed execution");
+            }
+
+            let recommendation = ImprovementRecommendation {
+                finding_id: uuid::Uuid::new_v4(),
+                finding_key: "repository_test_baseline:conductor".to_string(),
+                dedupe_key: format!("repo:baseline:{failure_count}"),
+                title: item.title.clone(),
+                summary: item.summary.clone(),
+                target_service: item.target_service.clone(),
+                delivery_stage: item.delivery_stage,
+                rollout_strategy: item.rollout_strategy,
+                priority: item.priority,
+                tags: item.tags.clone(),
+                plan: item.plan.clone(),
+                depends_on: Vec::new(),
+            };
+            let queued = upsert_recommendation(
+                &repository,
+                &recommendation,
+                &crate::config::PlanningConfig::default(),
+            )
+            .await
+            .expect("failure upsert");
+            let updated = repository
+                .find_work_item_by_dedupe_key(&recommendation.dedupe_key)
+                .await
+                .expect("lookup")
+                .expect("updated item");
+
+            if failure_count == 1 {
+                assert!(!queued, "the retry cooldown has not elapsed");
+                assert_eq!(updated.status, WorkStatus::Failure);
+            } else {
+                assert!(!queued, "the retry limit has been reached");
+                assert_eq!(updated.status, WorkStatus::Failure);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn planner_reopens_failed_item_when_recommendation_changes() {
+        let repository = MemoryRepository::new();
+        let mut item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("gail:risk-controls".to_string()),
+            title: "Improve Gail risk controls".to_string(),
+            summary: "Review risk-control findings.".to_string(),
+            target_service: Some("gail".to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: Vec::new(),
+            rollout_strategy: Some(RolloutStrategy::Direct),
+            status: Some(WorkStatus::Failure),
+            priority: Some(80),
+            progress_pct: Some(75),
+            admin_override: false,
+            execution_approved: false,
+            verification_required: Some(true),
+            tags: vec!["gail".to_string(), "risk".to_string()],
+            plan: json!({"action": "old_scope"}),
+            depends_on: Vec::new(),
+            source: Some("planner".to_string()),
+            scheduled_for: None,
+        });
+        item.finished_at = Some(now_utc());
+        repository
+            .upsert_work_item(&item)
+            .await
+            .expect("failed item");
+
+        let recommendation = ImprovementRecommendation {
+            finding_id: uuid::Uuid::new_v4(),
+            finding_key: "gail_risk_controls".to_string(),
+            dedupe_key: "gail:risk-controls".to_string(),
+            title: item.title.clone(),
+            summary: item.summary.clone(),
+            target_service: item.target_service.clone(),
+            delivery_stage: item.delivery_stage,
+            rollout_strategy: item.rollout_strategy,
+            priority: item.priority,
+            tags: item.tags.clone(),
+            plan: json!({"action": "new_scope"}),
+            depends_on: Vec::new(),
+        };
+
+        let queued = upsert_recommendation(
+            &repository,
+            &recommendation,
+            &crate::config::PlanningConfig::default(),
+        )
+        .await
+        .expect("changed recommendation");
+        assert!(queued);
+        let updated = repository
+            .find_work_item_by_dedupe_key("gail:risk-controls")
+            .await
+            .expect("lookup")
+            .expect("updated item");
+        assert_eq!(updated.status, WorkStatus::Planned);
+        assert_eq!(updated.finished_at, None);
+        assert_eq!(updated.progress_pct, 0);
     }
 
     #[tokio::test]
@@ -971,9 +1296,13 @@ mod tests {
             depends_on: Vec::new(),
         };
 
-        upsert_recommendation(repository.as_ref(), &recommendation)
-            .await
-            .expect("upsert");
+        upsert_recommendation(
+            repository.as_ref(),
+            &recommendation,
+            &crate::config::PlanningConfig::default(),
+        )
+        .await
+        .expect("upsert");
 
         let updated = repository
             .find_work_item_by_dedupe_key("repo:test_baseline:swarmhpc")
