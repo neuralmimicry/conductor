@@ -2151,6 +2151,21 @@ fn format_authoritative_delivery_constraints(plan: &Value) -> String {
     };
 
     let mut lines = Vec::new();
+    if let Some(outcomes) = plan.get("outcomes").and_then(Value::as_array) {
+        for (index, outcome) in outcomes
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|outcome| !outcome.is_empty())
+            .enumerate()
+        {
+            lines.push(format!(
+                "- Required work-item outcome REQ-{:03}: {} (must be implemented and verified).",
+                index + 14,
+                outcome
+            ));
+        }
+    }
     if let Some(files) = plan.get("required_files").and_then(Value::as_array) {
         for path in files
             .iter()
@@ -2164,17 +2179,19 @@ fn format_authoritative_delivery_constraints(plan: &Value) -> String {
             ));
         }
     }
-    if let Some(commands) = plan.get("required_verifications").and_then(Value::as_array) {
-        for command in commands
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .filter(|command| !command.is_empty())
-        {
-            lines.push(format!(
-                "- Required verification command: {} (must be run and pass).",
-                command
-            ));
+    for field in ["required_verifications", "validation"] {
+        if let Some(commands) = plan.get(field).and_then(Value::as_array) {
+            for command in commands
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+            {
+                lines.push(format!(
+                    "- Required verification command: {} (must be run and pass).",
+                    command
+                ));
+            }
         }
     }
     if lines.is_empty() {
@@ -3823,15 +3840,33 @@ mod tests {
     #[test]
     fn requirements_text_makes_structured_delivery_constraints_authoritative() {
         let constraints = format_authoritative_delivery_constraints(&json!({
+            "outcomes": [
+                "Conductor records scoped requirements for Refiner",
+                "planner validation commands are enforced",
+            ],
             "required_files": ["docs/refiner-supported-languages.md"],
             "required_verifications": ["cargo fmt --check", "cargo test"],
+            "validation": ["cargo test --all-targets", "gh run watch"],
         }));
+        assert!(constraints.contains(
+            "Required work-item outcome REQ-014: Conductor records scoped requirements for Refiner (must be implemented and verified)."
+        ));
+        assert!(constraints.contains(
+            "Required work-item outcome REQ-015: planner validation commands are enforced (must be implemented and verified)."
+        ));
         assert!(constraints.contains(
             "Required file: docs/refiner-supported-languages.md (must exist in the delivered repository)."
         ));
         assert!(
             constraints
                 .contains("Required verification command: cargo test (must be run and pass).")
+        );
+        assert!(constraints.contains(
+            "Required verification command: cargo test --all-targets (must be run and pass)."
+        ));
+        assert!(
+            constraints
+                .contains("Required verification command: gh run watch (must be run and pass).")
         );
     }
 
