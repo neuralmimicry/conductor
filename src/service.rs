@@ -59,6 +59,8 @@ pub struct ConductorService {
 }
 
 const EXTERNAL_SYNC_CONCURRENCY: usize = 8;
+const REFINER_SYNC_TERMINAL_REFRESH_SECONDS: i64 = 6 * 60 * 60;
+const REFINER_SYNC_NOT_FOUND_RETRY_SECONDS: i64 = 24 * 60 * 60;
 // Gail approval is an independent, fail-closed control-plane operation. Run
 // Approval reviews are control-plane traffic and must remain reliable under
 // single-slot native llama.cpp providers.  Running several reviews at once
@@ -1340,9 +1342,23 @@ impl ConductorService {
         } else {
             self.repository.list_work_executions(1000).await?
         };
+        let existing_job_links = self
+            .repository
+            .list_traceability_links(None, None, None, 5000)
+            .await?
+            .into_iter()
+            .filter(|link| link.system == "refiner" && link.reference_type == "job")
+            .filter_map(|link| link.execution_id.map(|execution_id| (execution_id, link)))
+            .collect::<HashMap<_, _>>();
         let executions = executions
             .into_iter()
-            .filter(|execution| execution.refiner_job_id.is_some())
+            .filter(|execution| {
+                execution.refiner_job_id.is_some()
+                    && should_sync_refiner_execution(
+                        execution,
+                        existing_job_links.get(&execution.id),
+                    )
+            })
             .collect::<Vec<_>>();
         if executions.is_empty() {
             return Ok((Vec::new(), Vec::new()));
@@ -2255,6 +2271,41 @@ impl ConductorService {
         let services = self.repository.list_service_snapshots().await?;
         Ok(topology_from_services(&services))
     }
+}
+
+fn should_sync_refiner_execution(
+    execution: &WorkExecution,
+    existing_job_link: Option<&TraceabilityLink>,
+) -> bool {
+    if !execution.status.is_terminal() {
+        return true;
+    }
+
+    let Some(link) = existing_job_link else {
+        return true;
+    };
+    if let Some(error) = link.metadata.get("last_sync_error").and_then(Value::as_str) {
+        let normalized = error.to_ascii_lowercase();
+        let is_not_found = normalized.contains("404")
+            || normalized.contains("not_found")
+            || normalized.contains("not found");
+        if !is_not_found {
+            return true;
+        }
+
+        return link.updated_at
+            <= now_utc() - ChronoDuration::seconds(REFINER_SYNC_NOT_FOUND_RETRY_SECONDS);
+    }
+
+    let terminal_status = link.status.as_deref().is_some_and(|status| {
+        matches!(
+            status.trim().to_ascii_lowercase().as_str(),
+            "completed" | "failed" | "cancelled" | "stopped" | "success" | "failure"
+        )
+    });
+    !terminal_status
+        || link.updated_at
+            <= now_utc() - ChronoDuration::seconds(REFINER_SYNC_TERMINAL_REFRESH_SECONDS)
 }
 
 fn compute_dora_metrics(
@@ -5951,6 +6002,59 @@ mod tests {
         assert_eq!(metrics.correlated_change_failure_rate_pct, 100.0);
         assert_eq!(metrics.bug_linked_production_deployments, 1);
         assert_eq!(metrics.incident_linked_production_deployments, 1);
+    }
+
+    #[test]
+    fn terminal_refiner_jobs_back_off_successful_and_missing_history_polls() {
+        let work_item_id = Uuid::new_v4();
+        let mut execution = WorkExecution::new(
+            work_item_id,
+            Some("conductor".to_string()),
+            DeliveryStage::Development,
+            RolloutStrategy::Direct,
+        );
+        execution.refiner_job_id = Some("missing-job".to_string());
+        execution.status = ExecutionStatus::Failure;
+
+        let mut link = TraceabilityLink::from_new(
+            Some(work_item_id),
+            NewTraceabilityLink {
+                execution_id: Some(execution.id),
+                finding_key: None,
+                system: "refiner".to_string(),
+                reference_type: "job".to_string(),
+                reference_key: "missing-job".to_string(),
+                title: Some("Old Refiner job".to_string()),
+                status: Some("failure".to_string()),
+                url: None,
+                metadata: json!({"last_sync_error": "not_found (status 404): job does not exist"}),
+            },
+        );
+
+        assert!(
+            !should_sync_refiner_execution(&execution, Some(&link)),
+            "a missing terminal job should not be polled again on every five-minute sync"
+        );
+
+        link.updated_at -= ChronoDuration::hours(25);
+        assert!(
+            should_sync_refiner_execution(&execution, Some(&link)),
+            "missing history should remain eligible for an occasional recovery check"
+        );
+
+        link.metadata = json!({});
+        link.status = Some("completed".to_string());
+        link.updated_at = now_utc();
+        assert!(
+            !should_sync_refiner_execution(&execution, Some(&link)),
+            "a recently synchronized terminal job should not need another immediate refresh"
+        );
+
+        execution.status = ExecutionStatus::Running;
+        assert!(
+            should_sync_refiner_execution(&execution, Some(&link)),
+            "active work must keep polling regardless of the previous terminal link"
+        );
     }
 
     #[tokio::test]
