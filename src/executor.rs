@@ -514,13 +514,17 @@ async fn dispatch_claimed_work_item_inner(
     let repositories = repository.list_repository_snapshots().await?;
     let mut policy = evaluate_work_item(config, item, target_service);
     apply_repository_safety_policy(config, item, target_service, &repositories, &mut policy);
+    let requires_live_protected_readiness =
+        !policy.sensitive_targets.is_empty() && item.delivery_stage.requires_live_readiness();
     let safety_contract = safety_contract(config, &policy, item);
-    let safety_baseline = if policy.sensitive_targets.is_empty() {
+    let safety_baseline = if !requires_live_protected_readiness {
         json!({"required": false})
     } else {
         capture_safety_probe(config, target_service).await
     };
-    apply_safety_baseline_gate(&mut policy, &safety_baseline);
+    if requires_live_protected_readiness {
+        apply_safety_baseline_gate(&mut policy, &safety_baseline);
+    }
     let github_actions =
         production_github_actions_evidence(config, item, target_service, &repositories).await;
     apply_github_actions_gate(&mut policy, github_actions.as_ref());
@@ -706,7 +710,7 @@ async fn dispatch_claimed_work_item_inner(
         };
     if let Some(object) = job_payload.as_object_mut() {
         object.insert("protected_rollout".to_string(), safety_contract.clone());
-        if !policy.sensitive_targets.is_empty() {
+        if requires_live_protected_readiness {
             let requirements = object
                 .get("requirements_text")
                 .and_then(Value::as_str)
@@ -915,7 +919,7 @@ async fn dispatch_claimed_work_item_inner(
     let mut safety_post_rollout = json!({"required": false});
     let mut rollback = json!({"attempted": false});
     let refiner_completed = refiner_effective_status(&terminal) == "completed";
-    if !policy.sensitive_targets.is_empty() && refiner_completed {
+    if requires_live_protected_readiness && refiner_completed {
         safety_post_rollout = run_safety_health_window(config, target_service).await;
         if let Some(object) = verification.as_object_mut() {
             object.insert(
@@ -924,7 +928,7 @@ async fn dispatch_claimed_work_item_inner(
             );
         }
     }
-    if !policy.sensitive_targets.is_empty() {
+    if requires_live_protected_readiness {
         let rollout_evidence =
             protected_rollout_evidence(item, &execution.request_payload, &terminal);
         if let Some(object) = verification.as_object_mut() {
@@ -948,7 +952,7 @@ async fn dispatch_claimed_work_item_inner(
         .get("passed")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if policy.sensitive_targets.len() > 0
+    if requires_live_protected_readiness
         && safety_post_rollout.get("passed").and_then(Value::as_bool) == Some(false)
     {
         verification_passed = false;
@@ -962,7 +966,7 @@ async fn dispatch_claimed_work_item_inner(
             }
         }
     }
-    if !verification_passed && !policy.sensitive_targets.is_empty() {
+    if !verification_passed && requires_live_protected_readiness {
         if let Some(commit_sha) = extract_commit_sha(&terminal) {
             rollback = automatic_rollback(
                 &client,
@@ -1166,7 +1170,8 @@ fn safety_contract(
     item: &WorkItem,
 ) -> Value {
     json!({
-        "required": !policy.sensitive_targets.is_empty(),
+        "required": !policy.sensitive_targets.is_empty()
+            && item.delivery_stage.requires_live_readiness(),
         "targets": policy.sensitive_targets,
         "delivery_stage": item.delivery_stage.as_str(),
         "rollout_strategy": item.rollout_strategy.as_str(),
@@ -2084,7 +2089,9 @@ fn requirements_text(
     } else {
         String::new()
     };
-    let protected_rollout_requirements = if service.is_some() {
+    let protected_rollout_requirements = if service.is_some()
+        && work_item.delivery_stage.requires_live_readiness()
+    {
         "\n- REQ-009: Capture a fresh protected-target readiness baseline before any change.\n- REQ-010: Use the selected canary or red-green rollout strategy and verify the post-rollout health window.\n- REQ-011: Automatically revert the exact produced commit without rewriting history if health or verification degrades.\n- REQ-012: Verify rollback readiness and recovery before finalising the delivery."
             .to_string()
     } else {
@@ -3435,6 +3442,45 @@ mod tests {
         assert!(
             constraints
                 .contains("Required verification command: cargo test (must be run and pass).")
+        );
+    }
+
+    #[test]
+    fn protected_rollout_contract_starts_at_integration_stage() {
+        let config = ConductorConfig::default();
+        let mut item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("conductor:protected-development".to_string()),
+            title: "Improve Conductor tests".to_string(),
+            summary: "Add a focused repository regression test.".to_string(),
+            target_service: Some("conductor".to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: vec![],
+            rollout_strategy: Some(crate::models::RolloutStrategy::Canary),
+            status: None,
+            priority: None,
+            progress_pct: None,
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "repository_test_baseline"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        let service = sample_service();
+        let development_policy = evaluate_work_item(&config, &item, Some(&service));
+        assert!(!development_policy.sensitive_targets.is_empty());
+        assert_eq!(
+            safety_contract(&config, &development_policy, &item)["required"].as_bool(),
+            Some(false)
+        );
+
+        item.delivery_stage = DeliveryStage::Integration;
+        let integration_policy = evaluate_work_item(&config, &item, Some(&service));
+        assert_eq!(
+            safety_contract(&config, &integration_policy, &item)["required"].as_bool(),
+            Some(true)
         );
     }
 

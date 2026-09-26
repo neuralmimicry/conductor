@@ -319,6 +319,16 @@ impl DeliveryStage {
     pub fn is_release_gate(self) -> bool {
         matches!(self, Self::Uat | Self::Production)
     }
+
+    /// Live service readiness is a rollout gate beginning with integration
+    /// deployments. Development and testing work changes repository code and
+    /// runs project checks without requiring a runtime HTTP endpoint.
+    pub fn requires_live_readiness(self) -> bool {
+        matches!(
+            self,
+            Self::Integration | Self::IntegrationTesting | Self::Uat | Self::Production
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]

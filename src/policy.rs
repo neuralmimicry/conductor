@@ -21,6 +21,8 @@ pub fn evaluate_work_item(
         config.delivery.require_uat_before_production,
     );
     let sensitive_targets = sensitive_target_names(config, work_item, service);
+    let requires_live_readiness =
+        !sensitive_targets.is_empty() && work_item.delivery_stage.requires_live_readiness();
 
     // Ordinary policy can be disabled for local diagnostics, but the safety
     // transaction is deliberately not bypassable for protected platform
@@ -65,14 +67,10 @@ pub fn evaluate_work_item(
                 "protected target requires a discovered service snapshot before execution"
                     .to_string(),
             );
-        } else if service
-            .and_then(|candidate| {
-                candidate
-                    .internal_url
-                    .as_ref()
-                    .or(candidate.public_url.as_ref())
+        } else if requires_live_readiness
+            && service.is_some_and(|candidate| {
+                candidate.internal_url.is_none() && candidate.public_url.is_none()
             })
-            .is_none()
         {
             reasons.push(
                 "protected target requires an HTTP readiness endpoint before execution".to_string(),
@@ -166,7 +164,7 @@ pub fn evaluate_work_item(
         service,
         work_item.delivery_stage,
         work_item.rollout_strategy,
-        !sensitive_targets.is_empty(),
+        requires_live_readiness,
     );
     if config.policy.require_verification && !work_item.verification_required {
         reasons.push("verification gate is required for execution".to_string());
@@ -437,6 +435,7 @@ pub fn apply_repository_safety_policy(
     {
         policy.sensitive_targets.push(service.service_key.clone());
     }
+    let requires_live_readiness = work_item.delivery_stage.requires_live_readiness();
     if !matches!(
         work_item.rollout_strategy,
         RolloutStrategy::Canary | RolloutStrategy::RedGreen
@@ -447,25 +446,27 @@ pub fn apply_repository_safety_policy(
         policy.verdict = PolicyVerdict::Blocked;
         policy.risk_level = "critical".to_string();
     }
-    if service.internal_url.is_none() && service.public_url.is_none() {
+    if requires_live_readiness && service.internal_url.is_none() && service.public_url.is_none() {
         policy.reasons.push(
             "protected target requires an HTTP readiness endpoint before execution".to_string(),
         );
         policy.verdict = PolicyVerdict::Blocked;
         policy.risk_level = "critical".to_string();
     }
-    for verification in [
-        "fresh protected-target readiness baseline",
-        "post-rollout readiness health window",
-        "automatic rollback on degradation",
-        "rollback readiness and recovery verification",
-    ] {
-        if !policy
-            .required_verifications
-            .iter()
-            .any(|candidate| candidate == verification)
-        {
-            policy.required_verifications.push(verification.to_string());
+    if requires_live_readiness {
+        for verification in [
+            "fresh protected-target readiness baseline",
+            "post-rollout readiness health window",
+            "automatic rollback on degradation",
+            "rollback readiness and recovery verification",
+        ] {
+            if !policy
+                .required_verifications
+                .iter()
+                .any(|candidate| candidate == verification)
+            {
+                policy.required_verifications.push(verification.to_string());
+            }
         }
     }
 }
@@ -745,8 +746,9 @@ mod tests {
 
     #[test]
     fn own_organisation_repository_is_sensitive_even_with_an_unprotected_service_name() {
-        let config = ConductorConfig::default();
-        let item = WorkItem::from_new(NewWorkItem {
+        let mut config = ConductorConfig::default();
+        config.policy.allow_external_repo_execution = true;
+        let mut item = WorkItem::from_new(NewWorkItem {
             dedupe_key: Some("sensitive:custom".to_string()),
             title: "Update custom platform service".to_string(),
             summary: "Change an existing service owned by the platform organisation".to_string(),
@@ -777,7 +779,7 @@ mod tests {
             namespace: None,
             service_name: None,
             deployment_environment: None,
-            internal_url: Some("http://custom.internal".to_string()),
+            internal_url: None,
             public_url: None,
             repo_path: Some("/srv/custom-service".to_string()),
             repo_url: Some("https://github.com/neuralmimicry/custom-service".to_string()),
@@ -805,8 +807,32 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("requires a canary or red_green"))
         );
+        assert!(evaluation.sensitive_targets.iter().any(|target| {
+            target == "repository:https://github.com/neuralmimicry/custom-service"
+        }));
+
+        item.rollout_strategy = RolloutStrategy::Canary;
+        let development = evaluate_work_item(&config, &item, Some(&service));
+        assert_eq!(development.verdict, PolicyVerdict::Allowed);
+        assert!(development.sensitive_targets.iter().any(|target| {
+            target == "repository:https://github.com/neuralmimicry/custom-service"
+        }));
+        assert!(development.required_verifications.iter().all(|check| {
+            !check.contains("readiness baseline") && !check.contains("automatic rollback")
+        }));
+
+        item.delivery_stage = DeliveryStage::Uat;
+        item.validated_stages = vec![DeliveryStage::IntegrationTesting];
+        let release = evaluate_work_item(&config, &item, Some(&service));
+        assert_eq!(release.verdict, PolicyVerdict::Blocked);
         assert!(
-            evaluation
+            release
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("HTTP readiness endpoint"))
+        );
+        assert!(
+            release
                 .required_verifications
                 .iter()
                 .any(|check| check.contains("automatic rollback"))

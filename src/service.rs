@@ -1988,6 +1988,7 @@ impl ConductorService {
             // next discovery refresh makes the item eligible again after the
             // service recovers.
             if !policy.sensitive_targets.is_empty()
+                && item.delivery_stage.requires_live_readiness()
                 && !target_service.is_some_and(|service| {
                     matches!(service.health, crate::models::ServiceHealth::Healthy)
                 })
@@ -6409,5 +6410,79 @@ mod tests {
             .expect("item");
         assert_eq!(current.status, WorkStatus::OnHold);
         assert!(current.execution_approved);
+    }
+
+    #[tokio::test]
+    async fn development_work_for_protected_service_without_http_url_is_scheduled() {
+        let repository = Arc::new(MemoryRepository::new());
+        let mut item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("octobot:development-without-probe".to_string()),
+            title: "Improve OctoBot tests".to_string(),
+            summary: "Add a repository-level regression test.".to_string(),
+            target_service: Some("octobot".to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: vec![],
+            rollout_strategy: Some(RolloutStrategy::Canary),
+            status: Some(WorkStatus::Planned),
+            priority: Some(100),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec!["octobot".to_string()],
+            plan: json!({"action": "repository_test_baseline"}),
+            depends_on: vec![],
+            source: Some("test".to_string()),
+            scheduled_for: None,
+        });
+        item.approval_metadata = json!({"approved": true, "schedule_now": true});
+        repository.upsert_work_item(&item).await.expect("work item");
+        repository
+            .replace_service_snapshots(&[ServiceSnapshot {
+                service_key: "octobot".to_string(),
+                display_name: "OctoBot".to_string(),
+                kind: "tenant_service".to_string(),
+                role_name: "continuum_tenant_octobot".to_string(),
+                playbooks: vec![],
+                host_targets: vec![],
+                hosts: vec![],
+                namespace: Some("octobot".to_string()),
+                service_name: Some("octobot".to_string()),
+                deployment_environment: Some(DeliveryStage::Development),
+                internal_url: None,
+                public_url: None,
+                repo_path: None,
+                repo_url: None,
+                repo_branch: None,
+                health: crate::models::ServiceHealth::Healthy,
+                capabilities: vec![],
+                dependencies: vec![],
+                storage_paths: vec![],
+                raw_defaults: json!({}),
+                probe: json!({}),
+                discovered_at: now_utc(),
+                updated_at: now_utc(),
+            }])
+            .await
+            .expect("service snapshot");
+
+        let mut config = ConductorConfig::default();
+        config.policy.protected_services.push("octobot".to_string());
+        let service = ConductorService::new(
+            config,
+            repository.clone(),
+            build_http_client(2).expect("http client"),
+        );
+
+        assert_eq!(
+            service.schedule_ready_approved_work_items().await.unwrap(),
+            1
+        );
+        let current = repository
+            .get_work_item(item.id)
+            .await
+            .expect("fetch")
+            .expect("item");
+        assert_eq!(current.status, WorkStatus::Scheduled);
     }
 }
