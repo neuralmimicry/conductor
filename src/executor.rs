@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -657,17 +658,23 @@ async fn dispatch_claimed_work_item_inner(
     }
 
     let prompt = build_refiner_prompt(config, item, target_service, &policy);
-    let plan_response = match post_refiner_json(
-        &client,
-        config,
-        &refiner_base_url,
-        REFINER_EXECUTION_PLAN_PATH,
-        &json!({
-            "prompt": prompt,
-            "provider": config.execution.llm_provider,
-            "model": config.execution.llm_model,
-            "codingagent": config.execution.coding_agent,
-        }),
+    let heartbeat_interval = execution_heartbeat_interval(config);
+    let plan_response = match refiner_request_with_heartbeat(
+        post_refiner_json(
+            &client,
+            config,
+            &refiner_base_url,
+            REFINER_EXECUTION_PLAN_PATH,
+            &json!({
+                "prompt": prompt,
+                "provider": config.execution.llm_provider,
+                "model": config.execution.llm_model,
+                "codingagent": config.execution.coding_agent,
+            }),
+        ),
+        &mut execution,
+        repository,
+        heartbeat_interval,
     )
     .await
     .context("failed to create Refiner execution plan")
@@ -744,12 +751,17 @@ async fn dispatch_claimed_work_item_inner(
         }),
     );
 
-    let estimate_response = match post_refiner_json(
-        &client,
-        config,
-        &refiner_base_url,
-        "/api/jobs/estimate",
-        &job_payload,
+    let estimate_response = match refiner_request_with_heartbeat(
+        post_refiner_json(
+            &client,
+            config,
+            &refiner_base_url,
+            "/api/jobs/estimate",
+            &job_payload,
+        ),
+        &mut execution,
+        repository,
+        heartbeat_interval,
     )
     .await
     .context("failed Refiner estimate gate")
@@ -772,12 +784,17 @@ async fn dispatch_claimed_work_item_inner(
     });
     repository.upsert_work_execution(&execution).await?;
 
-    let submit_response = match post_refiner_json(
-        &client,
-        config,
-        &refiner_base_url,
-        "/api/jobs",
-        &job_payload,
+    let submit_response = match refiner_request_with_heartbeat(
+        post_refiner_json(
+            &client,
+            config,
+            &refiner_base_url,
+            "/api/jobs",
+            &job_payload,
+        ),
+        &mut execution,
+        repository,
+        heartbeat_interval,
     )
     .await
     .context("failed to submit Refiner job")
@@ -2612,19 +2629,30 @@ async fn poll_refiner_job(
     let deadline = tokio::time::Instant::now()
         + Duration::from_secs(config.execution.job_timeout_seconds.max(30));
     let poll_interval = Duration::from_secs(config.execution.poll_interval_seconds.max(1));
+    // Refiner may accept a job immediately but leave it queued while its
+    // workers are busy. Keep the durable execution lease alive even when a
+    // detail request itself takes longer than the normal polling interval.
+    let heartbeat_interval = poll_interval.min(Duration::from_secs(30));
+    let mut next_heartbeat = tokio::time::Instant::now() + heartbeat_interval;
     let mut last_status = String::new();
     let mut transient_failures = 0usize;
     let mut not_found_failures = 0usize;
 
     loop {
-        let detail = match get_refiner_json(
-            client,
-            config,
-            base_url,
-            format!("/api/jobs/{}", job_id).as_str(),
-        )
-        .await
-        {
+        let job_detail_path = format!("/api/jobs/{}", job_id);
+        let detail_request = get_refiner_json(client, config, base_url, &job_detail_path);
+        tokio::pin!(detail_request);
+        let detail_result = loop {
+            tokio::select! {
+                result = &mut detail_request => break result,
+                _ = tokio::time::sleep_until(next_heartbeat) => {
+                    execution.updated_at = crate::models::now_utc();
+                    repository.upsert_work_execution(execution).await?;
+                    next_heartbeat = tokio::time::Instant::now() + heartbeat_interval;
+                }
+            }
+        };
+        let detail = match detail_result {
             Ok(detail) => {
                 transient_failures = 0;
                 not_found_failures = 0;
@@ -3034,6 +3062,38 @@ async fn post_refiner_json(
     result
 }
 
+fn execution_heartbeat_interval(config: &ConductorConfig) -> Duration {
+    Duration::from_secs((config.execution.claim_ttl_seconds.max(60) / 3).clamp(1, 30))
+}
+
+/// Keep planning, estimate, and submission requests from expiring the durable
+/// execution lease while Refiner is busy. The request deadline remains owned
+/// by `post_refiner_json`; this only refreshes the execution record while it
+/// waits for a response.
+async fn refiner_request_with_heartbeat<T, F>(
+    request: F,
+    execution: &mut WorkExecution,
+    repository: &dyn ConductorRepository,
+    heartbeat_interval: Duration,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let heartbeat_interval = heartbeat_interval.max(Duration::from_secs(1));
+    tokio::pin!(request);
+    let mut next_heartbeat = tokio::time::Instant::now() + heartbeat_interval;
+    loop {
+        tokio::select! {
+            result = &mut request => return result,
+            _ = tokio::time::sleep_until(next_heartbeat) => {
+                execution.updated_at = crate::models::now_utc();
+                repository.upsert_work_execution(execution).await?;
+                next_heartbeat = tokio::time::Instant::now() + heartbeat_interval;
+            }
+        }
+    }
+}
+
 async fn get_refiner_json(
     client: &Client,
     config: &ConductorConfig,
@@ -3387,6 +3447,26 @@ mod tests {
                 .expect("serve flaky refiner surface");
         });
         (format!("http://{}", addr), attempts, handle)
+    }
+
+    async fn spawn_slow_refiner_poll_surface() -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/api/jobs/{job_id}",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Json(json!({"status": "queued", "progress": 0, "stages": []}))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow Refiner surface");
+        let addr = listener.local_addr().expect("slow Refiner addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve slow Refiner surface");
+        });
+        (format!("http://{}", addr), handle)
     }
 
     async fn spawn_mock_rollback_surface(
@@ -4272,6 +4352,172 @@ mod tests {
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn poll_refiner_job_heartbeats_while_detail_request_is_slow() {
+        let (base_url, server) = spawn_slow_refiner_poll_surface().await;
+        let mut config = ConductorConfig::default();
+        config.integrations.refiner.base_url = Some(base_url.clone());
+        config.integrations.refiner.timeout_seconds = 15;
+        config.execution.poll_interval_seconds = 1;
+        config.execution.job_timeout_seconds = 30;
+        config.execution.claim_ttl_seconds = 60;
+
+        let repository = Arc::new(MemoryRepository::new());
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("poll:slow-refiner-heartbeat".to_string()),
+            title: "Keep a slow Refiner poll alive".to_string(),
+            summary: "A queued Refiner job can take longer than one detail request".to_string(),
+            target_service: Some("conductor".to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: vec![],
+            rollout_strategy: Some(RolloutStrategy::Canary),
+            status: Some(WorkStatus::InOperation),
+            priority: Some(80),
+            progress_pct: Some(40),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "poll"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        repository
+            .upsert_work_item(&item)
+            .await
+            .expect("insert slow-poll work item");
+        let mut execution = WorkExecution::new(
+            item.id,
+            item.target_service.clone(),
+            item.delivery_stage,
+            item.rollout_strategy,
+        );
+        execution.mark_status(ExecutionStatus::Running);
+        execution.refiner_job_id = Some("slow-job".to_string());
+        execution.updated_at = crate::models::now_utc() - ChronoDuration::seconds(120);
+        repository
+            .upsert_work_execution(&execution)
+            .await
+            .expect("insert active execution with an old heartbeat");
+
+        let poll_repository = Arc::clone(&repository);
+        let poll_config = config.clone();
+        let client = build_http_client(15).expect("client");
+        let poll = tokio::spawn(async move {
+            let mut item = item;
+            poll_refiner_job(
+                &client,
+                &poll_config,
+                &base_url,
+                "slow-job",
+                &mut item,
+                &mut execution,
+                poll_repository.as_ref(),
+                None,
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let reconciled = reconcile_stale_executions(repository.as_ref(), &config, None)
+            .await
+            .expect("reconcile active executions");
+        assert_eq!(
+            reconciled, 0,
+            "slow Refiner requests must refresh the lease"
+        );
+        assert_eq!(
+            repository
+                .list_active_work_executions()
+                .await
+                .expect("list active executions")
+                .len(),
+            1,
+            "the in-flight execution must remain active"
+        );
+
+        poll.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn slow_pre_submit_refiner_request_keeps_execution_lease_alive() {
+        let config = ConductorConfig::default();
+        let repository = Arc::new(MemoryRepository::new());
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("plan:slow-refiner-heartbeat".to_string()),
+            title: "Keep a slow Refiner plan alive".to_string(),
+            summary: "Planning can take longer than the execution lease".to_string(),
+            target_service: Some("conductor".to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: vec![],
+            rollout_strategy: Some(RolloutStrategy::Canary),
+            status: Some(WorkStatus::InOperation),
+            priority: Some(80),
+            progress_pct: Some(5),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "plan"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        repository
+            .upsert_work_item(&item)
+            .await
+            .expect("insert slow-plan work item");
+        let mut execution = WorkExecution::new(
+            item.id,
+            item.target_service.clone(),
+            item.delivery_stage,
+            item.rollout_strategy,
+        );
+        execution.mark_status(ExecutionStatus::Planning);
+        execution.updated_at = crate::models::now_utc() - ChronoDuration::seconds(120);
+        repository
+            .upsert_work_execution(&execution)
+            .await
+            .expect("insert active execution with an old heartbeat");
+
+        let request_repository = Arc::clone(&repository);
+        let request = tokio::spawn(async move {
+            let request = async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Ok::<_, anyhow::Error>(json!({"planned": true}))
+            };
+            refiner_request_with_heartbeat(
+                request,
+                &mut execution,
+                request_repository.as_ref(),
+                Duration::from_secs(1),
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let reconciled = reconcile_stale_executions(repository.as_ref(), &config, None)
+            .await
+            .expect("reconcile active executions");
+        assert_eq!(
+            reconciled, 0,
+            "slow pre-submit Refiner requests must refresh the lease"
+        );
+        assert_eq!(
+            repository
+                .list_active_work_executions()
+                .await
+                .expect("list active executions")
+                .len(),
+            1,
+            "the in-flight planning execution must remain active"
+        );
+
+        request.abort();
     }
 
     #[test]
