@@ -125,6 +125,8 @@ integrations:
 planning:
   refresh_interval_seconds: 240
   auto_queue: true
+  failed_item_retry_max_attempts: 2
+  failed_item_retry_backoff_seconds: 21600
   gail_workflow: "conductor_improvement_planner"
   minimum_priority: 40
   max_prompt_chars: 12000
