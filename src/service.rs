@@ -2000,10 +2000,14 @@ impl ConductorService {
                 continue;
             }
 
+            let scheduled_at = now_utc();
             item.status = WorkStatus::Scheduled;
+            if item.scheduled_for.is_none() {
+                item.scheduled_for = Some(scheduled_at);
+            }
             item.notes.push(format!(
                 "{} scheduled for execution after approval gates passed",
-                now_utc().to_rfc3339()
+                scheduled_at.to_rfc3339()
             ));
             self.repository.upsert_work_item(&item).await?;
             scheduled += 1;
@@ -6484,5 +6488,10 @@ mod tests {
             .expect("fetch")
             .expect("item");
         assert_eq!(current.status, WorkStatus::Scheduled);
+        assert!(
+            current
+                .scheduled_for
+                .is_some_and(|scheduled_for| { scheduled_for <= now_utc() })
+        );
     }
 }

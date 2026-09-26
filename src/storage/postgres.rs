@@ -665,10 +665,10 @@ impl ConductorRepository for PostgresRepository {
               AND status = 'scheduled'
               AND (scheduled_for IS NULL OR scheduled_for <= $1)
               AND (claim_expires_at IS NULL OR claim_expires_at <= $1)
-            -- Preserve queue age across continuous planning cycles. Priority
-            -- breaks ties without allowing newly-created high-priority work to
-            -- keep older approved work waiting forever.
-            ORDER BY updated_at ASC, priority DESC
+            -- scheduled_for is set when immediate work enters the queue and
+            -- is preserved across planner refreshes. Older inventory rows
+            -- without it fall back to creation time.
+            ORDER BY COALESCE(scheduled_for, created_at) ASC, priority DESC
             FOR UPDATE SKIP LOCKED
             LIMIT $2
             "#,
@@ -869,6 +869,15 @@ impl ConductorRepository for PostgresRepository {
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await?;
+        rows.into_iter().map(map_work_execution).collect()
+    }
+
+    async fn list_active_work_executions(&self) -> Result<Vec<WorkExecution>> {
+        let rows = sqlx::query(
+            "SELECT * FROM work_executions WHERE status IN ('pending', 'planning', 'submitted', 'running', 'verifying') ORDER BY updated_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter().map(map_work_execution).collect()
     }
 

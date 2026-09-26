@@ -870,6 +870,8 @@ mod tests {
             source: Some("planner".to_string()),
             scheduled_for: None,
         });
+        let queue_time = now_utc() - chrono::Duration::minutes(10);
+        item.scheduled_for = Some(queue_time);
         item.approval_metadata = json!({"verdict": "approved"});
         repository.upsert_work_item(&item).await.expect("work item");
 
@@ -900,5 +902,6 @@ mod tests {
         assert!(!updated.execution_approved);
         assert_eq!(updated.approval_metadata, json!({}));
         assert_eq!(updated.status, WorkStatus::Planned);
+        assert_eq!(updated.scheduled_for, Some(queue_time));
     }
 }

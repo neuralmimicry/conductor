@@ -57,7 +57,7 @@ async fn reconcile_stale_executions(
 ) -> Result<usize> {
     let now = crate::models::now_utc();
     let stale_after = ChronoDuration::seconds(config.execution.claim_ttl_seconds.max(60) as i64);
-    let executions = repository.list_work_executions(10_000).await?;
+    let executions = repository.list_active_work_executions().await?;
     let mut reconciled = 0;
 
     for mut execution in executions {
@@ -4370,6 +4370,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execution_claim_order_uses_enqueue_time_after_item_refreshes() {
+        let repository = MemoryRepository::new();
+        let now = crate::models::now_utc();
+        let mut older = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("queue:older".to_string()),
+            title: "Older queued item".to_string(),
+            summary: "This item entered the queue first".to_string(),
+            target_service: Some("conductor".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
+            status: Some(WorkStatus::Scheduled),
+            priority: Some(20),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: Some(now - ChronoDuration::minutes(10)),
+        });
+        older.updated_at = now;
+        let mut newer = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("queue:newer".to_string()),
+            title: "Newer queued item".to_string(),
+            summary: "This item entered the queue later".to_string(),
+            target_service: Some("conductor".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
+            status: Some(WorkStatus::Scheduled),
+            priority: Some(100),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: Some(now - ChronoDuration::minutes(5)),
+        });
+        newer.updated_at = now - ChronoDuration::hours(1);
+        repository
+            .upsert_work_item(&older)
+            .await
+            .expect("older item");
+        repository
+            .upsert_work_item(&newer)
+            .await
+            .expect("newer item");
+
+        let claimed = repository
+            .claim_scheduled_work_items(now, "test", 1, 60)
+            .await
+            .expect("claim scheduled work");
+
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, older.id);
+        assert_eq!(claimed[0].scheduled_for, older.scheduled_for);
+    }
+
+    #[tokio::test]
     async fn execution_cycle_reconciles_stale_execution_and_releases_capacity() {
         let repository = Arc::new(MemoryRepository::new());
         let mut config = ConductorConfig::default();
@@ -4403,16 +4468,32 @@ mod tests {
             item.delivery_stage,
             item.rollout_strategy,
         );
+        let stale_execution_id = execution.id;
         let stale_at = crate::models::now_utc() - ChronoDuration::seconds(120);
         execution.started_at = stale_at;
         execution.updated_at = stale_at;
         item.last_execution_id = Some(execution.id);
+
+        let mut terminal_execution = WorkExecution::new(
+            item.id,
+            item.target_service.clone(),
+            item.delivery_stage,
+            item.rollout_strategy,
+        );
+        terminal_execution.mark_status(ExecutionStatus::Success);
+        terminal_execution.started_at = stale_at;
+        terminal_execution.updated_at = stale_at;
+        terminal_execution.finished_at = Some(stale_at);
 
         repository.upsert_work_item(&item).await.expect("work item");
         repository
             .upsert_work_execution(&execution)
             .await
             .expect("execution");
+        repository
+            .upsert_work_execution(&terminal_execution)
+            .await
+            .expect("terminal execution");
 
         let executed = run_execution_cycle(repository.as_ref(), &config, None)
             .await
@@ -4423,7 +4504,8 @@ mod tests {
             .list_work_executions(10)
             .await
             .expect("execution list")
-            .pop()
+            .into_iter()
+            .find(|candidate| candidate.id == stale_execution_id)
             .expect("recovered execution");
         assert_eq!(recovered.status, ExecutionStatus::Failure);
         assert!(
@@ -4432,6 +4514,14 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("without a heartbeat"))
         );
+        let terminal = repository
+            .list_work_executions(10)
+            .await
+            .expect("execution history")
+            .into_iter()
+            .find(|execution| execution.id == terminal_execution.id)
+            .expect("terminal execution remains in history");
+        assert_eq!(terminal.status, ExecutionStatus::Success);
         let recovered_item = repository
             .get_work_item(item.id)
             .await

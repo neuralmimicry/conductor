@@ -272,8 +272,9 @@ impl ConductorRepository for MemoryRepository {
         let expires_at = now + ChronoDuration::seconds(claim_ttl_seconds as i64);
         let mut items: Vec<_> = self.work_items.read().await.values().cloned().collect();
         items.sort_by(|left, right| {
-            left.updated_at
-                .cmp(&right.updated_at)
+            left.scheduled_for
+                .unwrap_or(left.created_at)
+                .cmp(&right.scheduled_for.unwrap_or(right.created_at))
                 .then_with(|| right.priority.cmp(&left.priority))
         });
 
@@ -388,6 +389,18 @@ impl ConductorRepository for MemoryRepository {
         let mut items: Vec<_> = self.executions.read().await.values().cloned().collect();
         items.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
         items.truncate(limit);
+        Ok(items)
+    }
+
+    async fn list_active_work_executions(&self) -> Result<Vec<WorkExecution>> {
+        let items: Vec<_> = self
+            .executions
+            .read()
+            .await
+            .values()
+            .filter(|execution| !execution.status.is_terminal())
+            .cloned()
+            .collect();
         Ok(items)
     }
 

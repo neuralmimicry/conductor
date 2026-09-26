@@ -90,6 +90,7 @@ pub trait ConductorRepository: Send + Sync {
 
     async fn upsert_work_execution(&self, execution: &WorkExecution) -> anyhow::Result<()>;
     async fn list_work_executions(&self, limit: usize) -> anyhow::Result<Vec<WorkExecution>>;
+    async fn list_active_work_executions(&self) -> anyhow::Result<Vec<WorkExecution>>;
     async fn list_work_executions_for_item(
         &self,
         work_item_id: uuid::Uuid,
