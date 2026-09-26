@@ -1828,6 +1828,14 @@ fn build_refiner_prompt(
 ) -> String {
     let repo_context = service
         .and_then(|service| service.repo_path.as_deref().or(service.repo_url.as_deref()))
+        .or_else(|| {
+            work_item
+                .plan
+                .get("repository")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
         .unwrap_or("no repository context discovered");
     let service_name = service
         .map(|service| service.display_name.as_str())
@@ -2005,57 +2013,68 @@ fn build_job_payload(
         "llm_max_tokens".to_string(),
         json!(requested_tokens.max(DEFAULT_REFINER_LLM_MAX_TOKENS)),
     );
-    if let Some(service) = service {
-        if config.execution.use_local_project_root {
-            if let Some(project_root) = service.repo_path.as_deref() {
-                payload.insert("project_root".to_string(), json!(project_root));
-            }
-        }
-        // Prefer an explicit planner value, then enrich the service snapshot
-        // from the repository inventory.  The latter is essential when the
-        // Ansible checkout is a copied/mounted tree without a Git remote.
-        if !payload.contains_key("repo_url") {
-            if let Some((repo_url, branches)) =
-                rollout_repository_context(Some(service), repositories)
-            {
-                payload.insert("repo_url".to_string(), json!(repo_url));
-                if !payload.contains_key("repo_branch") {
-                    if let Some(repo_branch) = branches.first() {
-                        payload.insert("repo_branch".to_string(), json!(repo_branch));
-                    }
+    if let Some(service) = service
+        && config.execution.use_local_project_root
+        && let Some(project_root) = service.repo_path.as_deref()
+    {
+        payload.insert("project_root".to_string(), json!(project_root));
+    }
+    // Prefer an explicit planner value, then resolve the work item's planned
+    // repository against the discovered repository inventory and service
+    // context. The repository slug remains useful when a mounted source tree
+    // has no Git remote of its own.
+    if !payload.contains_key("repo_url") {
+        if let Some((repo_url, branches)) =
+            rollout_repository_context(Some(work_item), service, repositories)
+        {
+            payload.insert("repo_url".to_string(), json!(repo_url));
+            if !payload.contains_key("repo_branch") {
+                if let Some(repo_branch) = branches.first() {
+                    payload.insert("repo_branch".to_string(), json!(repo_branch));
                 }
             }
         }
-        if !payload.contains_key("repo_branch") {
-            if let Some(repo_branch) = service.repo_branch.as_deref() {
-                payload.insert("repo_branch".to_string(), json!(repo_branch));
-            }
+    }
+    if !payload.contains_key("repo_branch") {
+        if let Some(repo_branch) = service.and_then(|service| service.repo_branch.as_deref()) {
+            payload.insert("repo_branch".to_string(), json!(repo_branch));
         }
-        payload.insert(
-            "work_branch".to_string(),
-            json!(work_branch_name(work_item)),
-        );
+    }
+    payload.insert(
+        "work_branch".to_string(),
+        json!(work_branch_name(work_item)),
+    );
 
-        // A repository-delivery work item targets the owning repository.  Do
-        // not ask Refiner to fork a repository into the same GitHub
-        // organisation: GitHub rejects that operation (typically as 404),
-        // even when the caller has valid repository permissions.  External
-        // repositories retain Refiner's normal fork behaviour.
-        let is_repository_delivery = work_item
+    // A work item with an explicit repository target should use that
+    // repository directly when it belongs to the configured GitHub
+    // organisation. Asking Refiner to fork an organisation-owned repo back
+    // into the same organisation fails (usually as 404). External repositories
+    // retain Refiner's normal fork behaviour.
+    let is_repository_delivery = work_item
+        .plan
+        .get("action")
+        .and_then(Value::as_str)
+        .is_some_and(|action| action.eq_ignore_ascii_case("repository_delivery"));
+    let has_explicit_repository_target = is_repository_delivery
+        || work_item
             .plan
-            .get("action")
+            .get("repository")
             .and_then(Value::as_str)
-            .is_some_and(|action| action.eq_ignore_ascii_case("repository_delivery"));
-        if is_repository_delivery {
-            if let Some(repo_url) = payload.get("repo_url").and_then(Value::as_str) {
-                if let Some((owner, _repository)) = github_repository_coordinate(repo_url) {
-                    let configured_owner = config.discovery.github.owner.trim();
-                    if !configured_owner.is_empty() && owner.eq_ignore_ascii_case(configured_owner)
-                    {
-                        payload.insert("fork_org".to_string(), json!(owner));
-                        payload.insert("skip_fork".to_string(), json!(true));
-                    }
-                }
+            .is_some_and(|value| !value.trim().is_empty())
+        || service.is_some_and(|service| {
+            service
+                .repo_url
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        });
+    if has_explicit_repository_target {
+        if let Some(repo_url) = payload.get("repo_url").and_then(Value::as_str)
+            && let Some((owner, _repository)) = github_repository_coordinate(repo_url)
+        {
+            let configured_owner = config.discovery.github.owner.trim();
+            if !configured_owner.is_empty() && owner.eq_ignore_ascii_case(configured_owner) {
+                payload.insert("fork_org".to_string(), json!(owner));
+                payload.insert("skip_fork".to_string(), json!(true));
             }
         }
     }
@@ -2303,7 +2322,7 @@ async fn production_github_actions_evidence(
     }
 
     let workflow_file = config.policy.github_actions_workflow_file.clone();
-    let context = rollout_repository_context(service, repositories);
+    let context = rollout_repository_context(Some(item), service, repositories);
     let Some((repo_url, branches)) = context else {
         return Some(GitHubActionsEvidence {
             workflow_file,
@@ -2397,38 +2416,54 @@ async fn production_github_actions_evidence(
 }
 
 fn rollout_repository_context(
+    work_item: Option<&WorkItem>,
     service: Option<&ServiceSnapshot>,
     repositories: &[RepositorySnapshot],
 ) -> Option<(String, Vec<String>)> {
-    let service = service?;
-    let matched = service
-        .repo_path
-        .as_deref()
-        .and_then(|repo_path| {
-            repositories
-                .iter()
-                .find(|repository| repository.local_path.as_deref() == Some(repo_path))
-        })
-        .or_else(|| {
-            service.repo_url.as_deref().and_then(|repo_url| {
+    let planned_reference = work_item
+        .and_then(|item| item.plan.get("repository"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let planned_repository = planned_reference.and_then(|reference| {
+        repositories
+            .iter()
+            .find(|repository| repository_matches_reference(repository, reference))
+    });
+    let service_repository = service.and_then(|service| {
+        service
+            .repo_path
+            .as_deref()
+            .and_then(|repo_path| {
                 repositories
                     .iter()
-                    .find(|repository| repository.repo_url.as_deref() == Some(repo_url))
+                    .find(|repository| repository.local_path.as_deref() == Some(repo_path))
             })
-        })
-        .or_else(|| {
-            repositories
-                .iter()
-                .find(|repository| repository.linked_services.contains(&service.service_key))
-        });
+            .or_else(|| {
+                service.repo_url.as_deref().and_then(|repo_url| {
+                    repositories
+                        .iter()
+                        .find(|repository| repository.repo_url.as_deref() == Some(repo_url))
+                })
+            })
+            .or_else(|| {
+                repositories
+                    .iter()
+                    .find(|repository| repository.linked_services.contains(&service.service_key))
+            })
+    });
+    let matched = planned_repository.or(service_repository);
 
-    let repo_url = service
-        .repo_url
-        .clone()
-        .or_else(|| matched.and_then(|repository| repository.repo_url.clone()))?;
+    let repo_url = planned_repository
+        .and_then(repository_snapshot_url)
+        .or_else(|| planned_reference.and_then(github_repository_url))
+        .or_else(|| service.and_then(|service| service.repo_url.clone()))
+        .or_else(|| service_repository.and_then(repository_snapshot_url))?;
     let mut branches = Vec::new();
     for branch in [
-        service.repo_branch.clone(),
+        planned_repository.and_then(|repository| repository.current_branch.clone()),
+        planned_repository.and_then(|repository| repository.default_branch.clone()),
+        service.and_then(|service| service.repo_branch.clone()),
         matched.and_then(|repository| repository.current_branch.clone()),
         matched.and_then(|repository| repository.default_branch.clone()),
     ]
@@ -2442,6 +2477,75 @@ fn rollout_repository_context(
     }
 
     Some((repo_url, branches))
+}
+
+fn normalized_github_repository_reference(reference: &str) -> Option<String> {
+    let reference = reference.trim().trim_end_matches('/');
+    let path = reference
+        .strip_prefix("https://github.com/")
+        .or_else(|| reference.strip_prefix("http://github.com/"))
+        .or_else(|| reference.strip_prefix("git@github.com:"))
+        .unwrap_or(reference);
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let repository = parts.next()?.trim().trim_end_matches(".git");
+    if parts.next().is_some()
+        || !valid_github_repository_segment(owner)
+        || !valid_github_repository_segment(repository)
+    {
+        return None;
+    }
+    Some(format!(
+        "{}/{}",
+        owner.to_ascii_lowercase(),
+        repository.to_ascii_lowercase()
+    ))
+}
+
+fn valid_github_repository_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn github_repository_url(reference: &str) -> Option<String> {
+    let identity = normalized_github_repository_reference(reference)?;
+    Some(format!("https://github.com/{identity}.git"))
+}
+
+fn repository_matches_reference(repository: &RepositorySnapshot, reference: &str) -> bool {
+    let Some(identity) = normalized_github_repository_reference(reference) else {
+        return reference.trim().eq_ignore_ascii_case(&repository.name);
+    };
+    let repo_key_matches = normalized_github_repository_reference(&repository.repo_key)
+        .is_some_and(|repo_key| repo_key == identity);
+    let owner_name_matches = repository.owner.as_deref().is_some_and(|owner| {
+        normalized_github_repository_reference(&format!("{owner}/{}", repository.name))
+            .is_some_and(|owner_name| owner_name == identity)
+    });
+    let repository_name_matches = !reference.contains('/')
+        && !reference.contains(':')
+        && repository.name.eq_ignore_ascii_case(reference.trim());
+    repo_key_matches || owner_name_matches || repository_name_matches
+}
+
+fn repository_snapshot_url(repository: &RepositorySnapshot) -> Option<String> {
+    repository
+        .repo_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| github_repository_url(&repository.repo_key))
+        .or_else(|| {
+            repository
+                .owner
+                .as_deref()
+                .and_then(|owner| github_repository_url(&format!("{owner}/{}", repository.name)))
+        })
 }
 
 async fn poll_refiner_job(
@@ -3387,6 +3491,92 @@ mod tests {
         assert_eq!(
             payload.get("repo_url").and_then(Value::as_str),
             Some("git@github.com:neuralmimicry/conductor.git")
+        );
+        assert_eq!(
+            payload.get("repo_branch").and_then(Value::as_str),
+            Some("main")
+        );
+        assert_eq!(
+            payload.get("fork_org").and_then(Value::as_str),
+            Some("neuralmimicry")
+        );
+        assert_eq!(
+            payload.get("skip_fork").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn job_payload_uses_planned_repository_when_inventory_has_no_remote() {
+        let mut config = ConductorConfig::default();
+        config.discovery.github.owner = "neuralmimicry".to_string();
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("repository-context:swarmhpc".to_string()),
+            title: "Establish a test baseline for SwarmHPC".to_string(),
+            summary: "Add a minimal regression and smoke-test baseline.".to_string(),
+            target_service: Some("swarmhpc".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
+            status: None,
+            priority: None,
+            progress_pct: None,
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({
+                "action": "establish_repository_test_baseline",
+                "repository": "neuralmimicry/swarmhpc"
+            }),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        let mut service = sample_service();
+        service.service_key = "swarmhpc".to_string();
+        service.repo_path = None;
+        service.repo_url = None;
+        service.repo_branch = None;
+        let repository = RepositorySnapshot {
+            repo_key: "neuralmimicry/swarmhpc".to_string(),
+            name: "swarmhpc".to_string(),
+            owner: None,
+            repo_url: None,
+            local_path: Some("/srv/neuralmimicry/swarmhpc".to_string()),
+            default_branch: Some("main".to_string()),
+            current_branch: None,
+            language: Some("Ansible".to_string()),
+            frameworks: vec![],
+            build_systems: vec![],
+            package_managers: vec![],
+            runtime_type: Some("infrastructure".to_string()),
+            deployment_type: Some("infrastructure".to_string()),
+            purpose: None,
+            criticality: "critical".to_string(),
+            visibility: Some("public".to_string()),
+            archived: false,
+            linked_services: vec!["swarmhpc".to_string()],
+            dependencies: vec![],
+            capabilities: vec![],
+            inventory_sources: vec!["ansible_inventory".to_string()],
+            metadata: json!({}),
+            discovered_at: crate::models::now_utc(),
+            updated_at: crate::models::now_utc(),
+        };
+
+        let payload = build_job_payload(
+            &config,
+            &item,
+            Some(&service),
+            &[repository],
+            &json!({"job_payload": {"workflow": "project_solver"}}),
+        )
+        .expect("payload");
+
+        assert_eq!(
+            payload.get("repo_url").and_then(Value::as_str),
+            Some("https://github.com/neuralmimicry/swarmhpc.git")
         );
         assert_eq!(
             payload.get("repo_branch").and_then(Value::as_str),
