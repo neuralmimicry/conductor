@@ -550,11 +550,26 @@ async fn upsert_recommendation(
         if existing.admin_override {
             return Ok(());
         }
+        // Scheduling may upgrade direct delivery to canary for a protected
+        // target. Keep that conservative choice when the deterministic
+        // recommendation still says direct; otherwise every planning refresh
+        // looks like a changed recommendation and clears its approval.
+        let rollout_strategy = if existing.rollout_strategy == RolloutStrategy::Canary
+            && recommendation.rollout_strategy == RolloutStrategy::Direct
+            && existing.notes.iter().any(|note| {
+                note.contains(
+                    "automatic execution upgraded protected-target rollout from direct to canary",
+                )
+            }) {
+            existing.rollout_strategy
+        } else {
+            recommendation.rollout_strategy
+        };
         let material_change = existing.title != recommendation.title
             || existing.summary != recommendation.summary
             || existing.target_service != recommendation.target_service
             || existing.delivery_stage != recommendation.delivery_stage
-            || existing.rollout_strategy != recommendation.rollout_strategy
+            || existing.rollout_strategy != rollout_strategy
             || existing.priority != recommendation.priority
             || existing.tags != recommendation.tags
             || existing.plan != recommendation.plan
@@ -565,7 +580,7 @@ async fn upsert_recommendation(
         updated.summary = recommendation.summary.clone();
         updated.target_service = recommendation.target_service.clone();
         updated.delivery_stage = recommendation.delivery_stage;
-        updated.rollout_strategy = recommendation.rollout_strategy;
+        updated.rollout_strategy = rollout_strategy;
         updated.priority = recommendation.priority;
         updated.tags = recommendation.tags.clone();
         updated.plan = recommendation.plan.clone();
@@ -903,5 +918,71 @@ mod tests {
         assert_eq!(updated.approval_metadata, json!({}));
         assert_eq!(updated.status, WorkStatus::Planned);
         assert_eq!(updated.scheduled_for, Some(queue_time));
+    }
+
+    #[tokio::test]
+    async fn planner_preserves_safety_upgraded_canary_without_resetting_approval() {
+        let repository = Arc::new(MemoryRepository::new());
+        let mut item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("repo:test_baseline:swarmhpc".to_string()),
+            title: "Establish a test baseline for swarmhpc".to_string(),
+            summary: "Establish a minimal regression test baseline.".to_string(),
+            target_service: Some("swarmhpc".to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: Vec::new(),
+            rollout_strategy: Some(RolloutStrategy::Canary),
+            status: Some(WorkStatus::Scheduled),
+            priority: Some(66),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec!["repository".to_string(), "tests".to_string()],
+            plan: json!({
+                "action": "establish_repository_test_baseline",
+                "finding_id": "stable-finding-id",
+                "finding_key": "repository_test_baseline:swarmhpc",
+                "linked_services": ["swarmhpc"],
+                "repository": "swarmhpc",
+            }),
+            depends_on: Vec::new(),
+            source: Some("planner".to_string()),
+            scheduled_for: Some(now_utc()),
+        });
+        item.approval_metadata = json!({"approved": true, "schedule_now": true});
+        item.notes.push(
+            "automatic execution upgraded protected-target rollout from direct to canary"
+                .to_string(),
+        );
+        repository.upsert_work_item(&item).await.expect("work item");
+
+        let recommendation = ImprovementRecommendation {
+            finding_id: uuid::Uuid::new_v4(),
+            finding_key: "repository_test_baseline:swarmhpc".to_string(),
+            dedupe_key: "repo:test_baseline:swarmhpc".to_string(),
+            title: item.title.clone(),
+            summary: item.summary.clone(),
+            target_service: item.target_service.clone(),
+            delivery_stage: DeliveryStage::Development,
+            rollout_strategy: RolloutStrategy::Direct,
+            priority: item.priority,
+            tags: item.tags.clone(),
+            plan: item.plan.clone(),
+            depends_on: Vec::new(),
+        };
+
+        upsert_recommendation(repository.as_ref(), &recommendation)
+            .await
+            .expect("upsert");
+
+        let updated = repository
+            .find_work_item_by_dedupe_key("repo:test_baseline:swarmhpc")
+            .await
+            .expect("lookup")
+            .expect("updated item");
+        assert!(updated.execution_approved);
+        assert_eq!(updated.approval_metadata, item.approval_metadata);
+        assert_eq!(updated.status, WorkStatus::Scheduled);
+        assert_eq!(updated.rollout_strategy, RolloutStrategy::Canary);
     }
 }
