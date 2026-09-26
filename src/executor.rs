@@ -2024,9 +2024,12 @@ fn build_job_payload(
     // context. The repository slug remains useful when a mounted source tree
     // has no Git remote of its own.
     if !payload.contains_key("repo_url") {
-        if let Some((repo_url, branches)) =
-            rollout_repository_context(Some(work_item), service, repositories)
-        {
+        if let Some((repo_url, branches)) = rollout_repository_context(
+            Some(work_item),
+            service,
+            repositories,
+            Some(config.discovery.github.owner.as_str()),
+        ) {
             payload.insert("repo_url".to_string(), json!(repo_url));
             if !payload.contains_key("repo_branch") {
                 if let Some(repo_branch) = branches.first() {
@@ -2059,6 +2062,10 @@ fn build_job_payload(
         || work_item
             .plan
             .get("repository")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        || payload
+            .get("repo_url")
             .and_then(Value::as_str)
             .is_some_and(|value| !value.trim().is_empty())
         || service.is_some_and(|service| {
@@ -2322,7 +2329,12 @@ async fn production_github_actions_evidence(
     }
 
     let workflow_file = config.policy.github_actions_workflow_file.clone();
-    let context = rollout_repository_context(Some(item), service, repositories);
+    let context = rollout_repository_context(
+        Some(item),
+        service,
+        repositories,
+        Some(config.discovery.github.owner.as_str()),
+    );
     let Some((repo_url, branches)) = context else {
         return Some(GitHubActionsEvidence {
             workflow_file,
@@ -2419,6 +2431,7 @@ fn rollout_repository_context(
     work_item: Option<&WorkItem>,
     service: Option<&ServiceSnapshot>,
     repositories: &[RepositorySnapshot],
+    default_github_owner: Option<&str>,
 ) -> Option<(String, Vec<String>)> {
     let planned_reference = work_item
         .and_then(|item| item.plan.get("repository"))
@@ -2455,10 +2468,20 @@ fn rollout_repository_context(
     let matched = planned_repository.or(service_repository);
 
     let repo_url = planned_repository
-        .and_then(repository_snapshot_url)
-        .or_else(|| planned_reference.and_then(github_repository_url))
+        .and_then(|repository| {
+            repository_snapshot_url_with_owner_fallback(repository, default_github_owner)
+        })
+        .or_else(|| {
+            planned_reference.and_then(|reference| {
+                github_repository_url_with_owner_fallback(reference, default_github_owner)
+            })
+        })
         .or_else(|| service.and_then(|service| service.repo_url.clone()))
-        .or_else(|| service_repository.and_then(repository_snapshot_url))?;
+        .or_else(|| {
+            service_repository.and_then(|repository| {
+                repository_snapshot_url_with_owner_fallback(repository, default_github_owner)
+            })
+        })?;
     let mut branches = Vec::new();
     for branch in [
         planned_repository.and_then(|repository| repository.current_branch.clone()),
@@ -2516,6 +2539,23 @@ fn github_repository_url(reference: &str) -> Option<String> {
     Some(format!("https://github.com/{identity}.git"))
 }
 
+fn github_repository_url_with_owner_fallback(
+    reference: &str,
+    default_owner: Option<&str>,
+) -> Option<String> {
+    github_repository_url(reference).or_else(|| {
+        let owner = default_owner?.trim();
+        let repository = reference.trim().trim_end_matches(".git");
+        if repository.contains('/')
+            || repository.contains(':')
+            || !valid_github_repository_segment(repository)
+        {
+            return None;
+        }
+        github_repository_url(&format!("{owner}/{repository}"))
+    })
+}
+
 fn repository_matches_reference(repository: &RepositorySnapshot, reference: &str) -> bool {
     let Some(identity) = normalized_github_repository_reference(reference) else {
         return reference.trim().eq_ignore_ascii_case(&repository.name);
@@ -2546,6 +2586,15 @@ fn repository_snapshot_url(repository: &RepositorySnapshot) -> Option<String> {
                 .as_deref()
                 .and_then(|owner| github_repository_url(&format!("{owner}/{}", repository.name)))
         })
+}
+
+fn repository_snapshot_url_with_owner_fallback(
+    repository: &RepositorySnapshot,
+    default_owner: Option<&str>,
+) -> Option<String> {
+    repository_snapshot_url(repository)
+        .or_else(|| github_repository_url_with_owner_fallback(&repository.repo_key, default_owner))
+        .or_else(|| github_repository_url_with_owner_fallback(&repository.name, default_owner))
 }
 
 async fn poll_refiner_job(
@@ -3581,6 +3630,172 @@ mod tests {
         assert_eq!(
             payload.get("repo_branch").and_then(Value::as_str),
             Some("main")
+        );
+        assert_eq!(
+            payload.get("fork_org").and_then(Value::as_str),
+            Some("neuralmimicry")
+        );
+        assert_eq!(
+            payload.get("skip_fork").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn job_payload_resolves_short_planned_repository_from_configured_github_owner() {
+        let mut config = ConductorConfig::default();
+        config.discovery.github.owner = "neuralmimicry".to_string();
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("repository-context:swarmhpc-short".to_string()),
+            title: "Establish a test baseline for SwarmHPC".to_string(),
+            summary: "Add a minimal regression and smoke-test baseline.".to_string(),
+            target_service: Some("swarmhpc".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
+            status: None,
+            priority: None,
+            progress_pct: None,
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({
+                "action": "establish_repository_test_baseline",
+                "repository": "swarmhpc"
+            }),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        let mut service = sample_service();
+        service.service_key = "swarmhpc".to_string();
+        service.repo_path = Some("/srv/neuralmimicry/swarmhpc".to_string());
+        service.repo_url = None;
+        service.repo_branch = None;
+        let repository = RepositorySnapshot {
+            repo_key: "swarmhpc".to_string(),
+            name: "swarmhpc".to_string(),
+            owner: None,
+            repo_url: None,
+            local_path: Some("/srv/neuralmimicry/swarmhpc".to_string()),
+            default_branch: Some("main".to_string()),
+            current_branch: None,
+            language: Some("Ansible".to_string()),
+            frameworks: vec![],
+            build_systems: vec![],
+            package_managers: vec![],
+            runtime_type: Some("infrastructure".to_string()),
+            deployment_type: Some("infrastructure".to_string()),
+            purpose: None,
+            criticality: "critical".to_string(),
+            visibility: Some("public".to_string()),
+            archived: false,
+            linked_services: vec!["swarmhpc".to_string()],
+            dependencies: vec![],
+            capabilities: vec![],
+            inventory_sources: vec!["ansible_inventory".to_string()],
+            metadata: json!({}),
+            discovered_at: crate::models::now_utc(),
+            updated_at: crate::models::now_utc(),
+        };
+
+        let payload = build_job_payload(
+            &config,
+            &item,
+            Some(&service),
+            &[repository],
+            &json!({"job_payload": {"workflow": "project_solver"}}),
+        )
+        .expect("payload");
+
+        assert_eq!(
+            payload.get("repo_url").and_then(Value::as_str),
+            Some("https://github.com/neuralmimicry/swarmhpc.git")
+        );
+        assert_eq!(
+            payload.get("repo_branch").and_then(Value::as_str),
+            Some("main")
+        );
+        assert_eq!(
+            payload.get("fork_org").and_then(Value::as_str),
+            Some("neuralmimicry")
+        );
+        assert_eq!(
+            payload.get("skip_fork").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn job_payload_resolves_service_inventory_slug_from_configured_github_owner() {
+        let mut config = ConductorConfig::default();
+        config.discovery.github.owner = "neuralmimicry".to_string();
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("formal-gap:conductor-repository-context".to_string()),
+            title: "Close estate discovery and resource-drift coverage".to_string(),
+            summary: "Close the remaining estate discovery and resource-drift coverage gap."
+                .to_string(),
+            target_service: Some("conductor".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
+            status: None,
+            priority: None,
+            progress_pct: None,
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: vec![],
+            plan: json!({"action": "close_formal_gap"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        let mut service = sample_service();
+        service.service_key = "conductor".to_string();
+        service.repo_path = Some("/srv/neuralmimicry/conductor".to_string());
+        service.repo_url = None;
+        service.repo_branch = None;
+        let repository = RepositorySnapshot {
+            repo_key: "conductor".to_string(),
+            name: "conductor".to_string(),
+            owner: None,
+            repo_url: None,
+            local_path: Some("/srv/neuralmimicry/conductor".to_string()),
+            default_branch: None,
+            current_branch: None,
+            language: Some("Rust".to_string()),
+            frameworks: vec![],
+            build_systems: vec!["cargo".to_string()],
+            package_managers: vec![],
+            runtime_type: Some("service".to_string()),
+            deployment_type: Some("kubernetes".to_string()),
+            purpose: None,
+            criticality: "critical".to_string(),
+            visibility: Some("public".to_string()),
+            archived: false,
+            linked_services: vec!["conductor".to_string()],
+            dependencies: vec![],
+            capabilities: vec![],
+            inventory_sources: vec!["ansible_inventory".to_string()],
+            metadata: json!({}),
+            discovered_at: crate::models::now_utc(),
+            updated_at: crate::models::now_utc(),
+        };
+
+        let payload = build_job_payload(
+            &config,
+            &item,
+            Some(&service),
+            &[repository],
+            &json!({"job_payload": {"workflow": "project_solver"}}),
+        )
+        .expect("payload");
+
+        assert_eq!(
+            payload.get("repo_url").and_then(Value::as_str),
+            Some("https://github.com/neuralmimicry/conductor.git")
         );
         assert_eq!(
             payload.get("fork_org").and_then(Value::as_str),
