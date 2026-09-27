@@ -45,7 +45,10 @@ use crate::{
         unique_strings,
     },
     planner::run_planning_cycle,
-    policy::{evaluate_work_item, project_native_verification_commands},
+    policy::{
+        evaluate_work_item, evaluate_work_item_with_repositories,
+        project_native_verification_commands,
+    },
     repository::ConductorRepository,
     trends::collect_metric_samples,
     validation::{failure_reasons, run_independent_validation},
@@ -1904,6 +1907,7 @@ impl ConductorService {
 
     async fn schedule_ready_approved_work_items(&self) -> Result<usize> {
         let services = self.repository.list_service_snapshots().await?;
+        let repositories = self.repository.list_repository_snapshots().await?;
         let mut work_items = self.repository.list_work_items().await?;
 
         // Automatic execution has no separate AI approval pass in deployments
@@ -1913,7 +1917,12 @@ impl ConductorService {
         // permanently in planned/on_hold without ever reaching Refiner.
         let normalise_protected_rollout =
             |item: &mut WorkItem, target_service: Option<&ServiceSnapshot>| {
-                let policy = evaluate_work_item(&self.config, item, target_service);
+                let policy = evaluate_work_item_with_repositories(
+                    &self.config,
+                    item,
+                    target_service,
+                    &repositories,
+                );
                 if !policy.sensitive_targets.is_empty()
                     && matches!(
                         item.rollout_strategy,
@@ -1950,7 +1959,12 @@ impl ConductorService {
                 if normalise_protected_rollout(&mut item, target_service) {
                     self.repository.upsert_work_item(&item).await?;
                 }
-                let policy = evaluate_work_item(&self.config, &item, target_service);
+                let policy = evaluate_work_item_with_repositories(
+                    &self.config,
+                    &item,
+                    target_service,
+                    &repositories,
+                );
                 if matches!(policy.verdict, crate::models::PolicyVerdict::Blocked) {
                     continue;
                 }
@@ -1988,7 +2002,12 @@ impl ConductorService {
             if normalise_protected_rollout(&mut item, target_service) {
                 self.repository.upsert_work_item(&item).await?;
             }
-            let policy = evaluate_work_item(&self.config, &item, target_service);
+            let policy = evaluate_work_item_with_repositories(
+                &self.config,
+                &item,
+                target_service,
+                &repositories,
+            );
             // A policy-blocked item must never be re-scheduled merely because
             // it targets a protected service.  The executor is fail-closed,
             // but scheduling such an item first consumes the execution slot
@@ -6600,5 +6619,110 @@ mod tests {
                 .scheduled_for
                 .is_some_and(|scheduled_for| { scheduled_for <= now_utc() })
         );
+    }
+
+    #[tokio::test]
+    async fn automatic_scheduler_applies_repository_inventory_safety_policy() {
+        let repository = Arc::new(MemoryRepository::new());
+        let mut item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("aria:repository-inventory-policy".to_string()),
+            title: "Improve Aria reliability tests".to_string(),
+            summary: "Add a repository regression test for Aria.".to_string(),
+            target_service: Some("aria".to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: vec![],
+            rollout_strategy: Some(RolloutStrategy::Direct),
+            status: Some(WorkStatus::Planned),
+            priority: Some(100),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: false,
+            verification_required: Some(true),
+            tags: vec!["aria".to_string()],
+            plan: json!({"action": "repository_test_baseline"}),
+            depends_on: vec![],
+            source: Some("planner".to_string()),
+            scheduled_for: None,
+        });
+        item.approval_metadata = json!({"approved": true, "schedule_now": true});
+        repository.upsert_work_item(&item).await.expect("work item");
+        repository
+            .replace_service_snapshots(&[ServiceSnapshot {
+                service_key: "aria".to_string(),
+                display_name: "Aria".to_string(),
+                kind: "tenant_service".to_string(),
+                role_name: "continuum_tenant_aria".to_string(),
+                playbooks: vec![],
+                host_targets: vec![],
+                hosts: vec![],
+                namespace: Some("aria".to_string()),
+                service_name: Some("aria".to_string()),
+                deployment_environment: Some(DeliveryStage::Development),
+                internal_url: None,
+                public_url: None,
+                repo_path: None,
+                repo_url: None,
+                repo_branch: None,
+                health: crate::models::ServiceHealth::Healthy,
+                capabilities: vec![],
+                dependencies: vec![],
+                storage_paths: vec![],
+                raw_defaults: json!({}),
+                probe: json!({}),
+                discovered_at: now_utc(),
+                updated_at: now_utc(),
+            }])
+            .await
+            .expect("service snapshot");
+        repository
+            .replace_repository_snapshots(&[RepositorySnapshot {
+                repo_key: "neuralmimicry/aria".to_string(),
+                name: "aria".to_string(),
+                owner: Some("neuralmimicry".to_string()),
+                repo_url: Some("https://github.com/neuralmimicry/aria".to_string()),
+                local_path: None,
+                default_branch: Some("main".to_string()),
+                current_branch: Some("main".to_string()),
+                language: Some("Rust".to_string()),
+                frameworks: vec![],
+                build_systems: vec!["cargo".to_string()],
+                package_managers: vec!["cargo".to_string()],
+                runtime_type: Some("native".to_string()),
+                deployment_type: Some("kubernetes".to_string()),
+                purpose: Some("Gail governance service".to_string()),
+                criticality: "high".to_string(),
+                visibility: Some("public".to_string()),
+                archived: false,
+                linked_services: vec!["aria".to_string()],
+                dependencies: vec![],
+                capabilities: vec![],
+                inventory_sources: vec!["test".to_string()],
+                metadata: json!({}),
+                discovered_at: now_utc(),
+                updated_at: now_utc(),
+            }])
+            .await
+            .expect("repository snapshot");
+
+        let mut config = ConductorConfig::default();
+        config.policy.require_admin_approval = false;
+        let service = ConductorService::new(
+            config,
+            repository.clone(),
+            build_http_client(2).expect("http client"),
+        );
+
+        assert_eq!(
+            service.schedule_ready_approved_work_items().await.unwrap(),
+            1
+        );
+        let current = repository
+            .get_work_item(item.id)
+            .await
+            .expect("fetch")
+            .expect("item");
+        assert_eq!(current.status, WorkStatus::Scheduled);
+        assert!(current.execution_approved);
+        assert_eq!(current.rollout_strategy, RolloutStrategy::Canary);
     }
 }

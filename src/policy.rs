@@ -471,6 +471,20 @@ pub fn apply_repository_safety_policy(
     }
 }
 
+/// Evaluate a work item with the same repository-derived safety context used
+/// by execution. Service discovery can omit repository URLs while the
+/// repository inventory still links the checkout to its owning service.
+pub fn evaluate_work_item_with_repositories(
+    config: &ConductorConfig,
+    work_item: &WorkItem,
+    service: Option<&ServiceSnapshot>,
+    repositories: &[RepositorySnapshot],
+) -> PolicyEvaluation {
+    let mut policy = evaluate_work_item(config, work_item, service);
+    apply_repository_safety_policy(config, work_item, service, repositories, &mut policy);
+    policy
+}
+
 pub(crate) fn project_native_verification_commands(
     service: Option<&ServiceSnapshot>,
 ) -> Vec<String> {

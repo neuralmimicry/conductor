@@ -22,7 +22,7 @@ use crate::{
         RolloutStrategy, ServiceHealth, ServiceSnapshot, WorkExecution, WorkItem, WorkItemPatch,
         WorkStatus,
     },
-    policy::{apply_repository_safety_policy, evaluate_work_item, policy_evaluation_to_value},
+    policy::{evaluate_work_item_with_repositories, policy_evaluation_to_value},
     repository::ConductorRepository,
     validation::{failure_reasons, preview_independent_validation, run_independent_validation},
 };
@@ -513,8 +513,8 @@ async fn dispatch_claimed_work_item_inner(
     // local checkout can silently fall back to a starter project and never
     // push the requested change to its owning repository.
     let repositories = repository.list_repository_snapshots().await?;
-    let mut policy = evaluate_work_item(config, item, target_service);
-    apply_repository_safety_policy(config, item, target_service, &repositories, &mut policy);
+    let mut policy =
+        evaluate_work_item_with_repositories(config, item, target_service, &repositories);
     let requires_live_protected_readiness =
         !policy.sensitive_targets.is_empty() && item.delivery_stage.requires_live_readiness();
     let safety_contract = safety_contract(config, &policy, item);
@@ -1637,7 +1637,8 @@ async fn preview_work_item_execution(
             .iter()
             .find(|service| service.service_key == target)
     });
-    let mut policy = evaluate_work_item(config, &item, target_service);
+    let mut policy =
+        evaluate_work_item_with_repositories(config, &item, target_service, &repositories);
     // A dry run never reaches Refiner or a deployment target.  Preserve the
     // safety findings in the preview, but allow the preview itself to be
     // generated so operators can see exactly which gates would be required.
@@ -3213,6 +3214,7 @@ async fn decode_response(response: reqwest::Response) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::evaluate_work_item;
     use crate::{
         config::ConductorConfig,
         models::{DeliveryStage, NewWorkItem, ServiceHealth},
