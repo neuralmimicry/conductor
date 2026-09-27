@@ -25,6 +25,7 @@ use crate::{
         ExecutionEventCallback, execute_prepared_work_item, execute_specific_work_item,
         prepare_specific_work_item, run_execution_cycle,
     },
+    host_resources::reconcile_service_host_resources,
     integrations::{
         atlassian::AtlassianClients, continuum::ContinuumClient, refiner::RefinerClient,
         tracey::TraceyClient,
@@ -151,7 +152,9 @@ impl ConductorService {
     pub async fn run_discovery_cycle(&self) -> Result<DiscoveryRun> {
         let started = Instant::now();
         let result = async {
-            let discovery = discover_and_probe(&self.config, &self.http).await?;
+            let previous_services = self.repository.list_service_snapshots().await?;
+            let mut discovery = discover_and_probe(&self.config, &self.http).await?;
+            reconcile_service_host_resources(&previous_services, &mut discovery.services);
             let metric_samples = collect_metric_samples(discovery.run.id, &discovery.services);
             self.repository
                 .replace_service_snapshots(&discovery.services)

@@ -19,6 +19,7 @@ use crate::{
         ConductorConfig, ExternalServiceConfig, PostgresIntegrationConfig,
         SharedStorageIntegrationConfig,
     },
+    host_resources::node_snapshots_from_api,
     models::{ProbeResult, ServiceHealth, ServiceSnapshot},
 };
 
@@ -557,13 +558,28 @@ async fn probe_swarmhpc(
                 .is_some_and(|extension| matches!(extension, "yml" | "yaml"))
         })
         .count();
+    let host_resource_inventory = kubernetes_node_inventory().await;
+    let host_count = host_resource_inventory
+        .get("hosts")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let inventory_status = host_resource_inventory
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unavailable");
     let healthy = config_path.exists() && inventory_path.exists() && roles_path.exists();
     Ok(ProbeResult {
         endpoint: None,
-        summary: if healthy {
+        summary: if healthy && inventory_status == "available" {
             format!(
-                "SwarmHPC deployment automation is available with {} playbook(s)",
-                playbook_count
+                "SwarmHPC automation is available with {} playbook(s) and {} observed Kubernetes node(s)",
+                playbook_count, host_count
+            )
+        } else if healthy {
+            format!(
+                "SwarmHPC automation is available with {} playbook(s); Kubernetes node inventory is {}",
+                playbook_count, inventory_status
             )
         } else {
             "SwarmHPC deployment automation is missing one or more core Ansible paths".to_string()
@@ -580,12 +596,127 @@ async fn probe_swarmhpc(
             "secrets_path_exists": secrets_path.exists(),
             "playbook_count": playbook_count,
             "playbooks": service.playbooks,
+            "host_resource_inventory": host_resource_inventory,
         }),
         health: if healthy {
             ServiceHealth::Healthy
         } else {
             ServiceHealth::Degraded
         },
+    })
+}
+
+async fn kubernetes_node_inventory() -> Value {
+    let (Ok(host), Ok(port)) = (
+        std::env::var("KUBERNETES_SERVICE_HOST"),
+        std::env::var("KUBERNETES_SERVICE_PORT"),
+    ) else {
+        return json!({
+            "source": "kubernetes_nodes_api",
+            "status": "unconfigured",
+            "reason_code": "in_cluster_api_environment_missing",
+            "hosts": [],
+            "events": [],
+        });
+    };
+
+    let token_path = Path::new("/var/run/secrets/kubernetes.io/serviceaccount/token");
+    let ca_path = Path::new("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt");
+    let Ok(token) = fs::read_to_string(token_path) else {
+        return json!({
+            "source": "kubernetes_nodes_api",
+            "status": "unavailable",
+            "reason_code": "service_account_token_unavailable",
+            "hosts": [],
+            "events": [],
+        });
+    };
+    let Ok(ca_pem) = fs::read(ca_path) else {
+        return json!({
+            "source": "kubernetes_nodes_api",
+            "status": "unavailable",
+            "reason_code": "service_account_ca_unavailable",
+            "hosts": [],
+            "events": [],
+        });
+    };
+    let Ok(certificate) = reqwest::Certificate::from_pem(&ca_pem) else {
+        return json!({
+            "source": "kubernetes_nodes_api",
+            "status": "unavailable",
+            "reason_code": "service_account_ca_invalid",
+            "hosts": [],
+            "events": [],
+        });
+    };
+    let Ok(api_client) = Client::builder()
+        .add_root_certificate(certificate)
+        .timeout(Duration::from_secs(10))
+        .build()
+    else {
+        return json!({
+            "source": "kubernetes_nodes_api",
+            "status": "unavailable",
+            "reason_code": "kubernetes_api_client_unavailable",
+            "hosts": [],
+            "events": [],
+        });
+    };
+    let api_host = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    let url = format!("https://{api_host}:{port}/api/v1/nodes");
+    let response = match api_client.get(url).bearer_auth(token.trim()).send().await {
+        Ok(response) => response,
+        Err(_) => {
+            return json!({
+                "source": "kubernetes_nodes_api",
+                "status": "unavailable",
+                "reason_code": "kubernetes_api_request_failed",
+                "hosts": [],
+                "events": [],
+            });
+        }
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return json!({
+            "source": "kubernetes_nodes_api",
+            "status": "unavailable",
+            "reason_code": "kubernetes_api_rejected_request",
+            "http_status": status.as_u16(),
+            "hosts": [],
+            "events": [],
+        });
+    }
+    let Ok(payload) = response.json::<Value>().await else {
+        return json!({
+            "source": "kubernetes_nodes_api",
+            "status": "unavailable",
+            "reason_code": "kubernetes_node_list_invalid_response",
+            "hosts": [],
+            "events": [],
+        });
+    };
+    let observed_at = crate::models::now_utc();
+    let Some(hosts) = node_snapshots_from_api(&payload, observed_at) else {
+        return json!({
+            "source": "kubernetes_nodes_api",
+            "status": "unavailable",
+            "reason_code": "kubernetes_node_list_missing_items",
+            "hosts": [],
+            "events": [],
+        });
+    };
+
+    json!({
+        "source": "kubernetes_nodes_api",
+        "status": "available",
+        "observed_at": observed_at.to_rfc3339(),
+        "hosts": hosts,
+        "events": [],
     })
 }
 

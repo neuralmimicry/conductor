@@ -278,6 +278,12 @@ pub fn detect_findings(
             ));
         }
 
+        findings.extend(host_resource_findings(
+            service,
+            source_run_id,
+            &existing_by_key,
+        ));
+
         if service.service_key == "gail"
             && !service.capabilities.contains(&"local_repo".to_string())
         {
@@ -1773,6 +1779,160 @@ fn trend_findings(
     }
 }
 
+fn host_resource_findings(
+    service: &ServiceSnapshot,
+    source_run_id: Option<Uuid>,
+    existing_by_key: &BTreeMap<String, &FindingRecord>,
+) -> Vec<DetectedFinding> {
+    if service.service_key != "swarmhpc" {
+        return Vec::new();
+    }
+    let Some(events) = service
+        .probe
+        .pointer("/metrics/host_resource_inventory/events")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    events
+        .iter()
+        .filter_map(|event| {
+            let host = event.get("host").and_then(Value::as_str)?.trim();
+            let event_type = event.get("type").and_then(Value::as_str)?;
+            if host.is_empty() {
+                return None;
+            }
+
+            let finding_key = format!("host_resource_drift:{host}");
+            let (title, summary, severity, priority, recommendation) = match event_type {
+                "host_missing" => (
+                    format!("Cluster node {host} is missing"),
+                    format!(
+                        "The Kubernetes node inventory no longer contains {host}. Its last observed resource fingerprint is retained for recovery comparison."
+                    ),
+                    FindingSeverity::Critical,
+                    96,
+                    "restore_cluster_node_visibility",
+                ),
+                "host_reintegrated" => (
+                    format!("Cluster node {host} has rejoined"),
+                    format!(
+                        "The Kubernetes node {host} is Ready again. Conductor refreshed its resource fingerprint and can recalculate host capacity."
+                    ),
+                    FindingSeverity::Medium,
+                    84,
+                    "reconcile_reintegrated_node_capacity",
+                ),
+                "resource_drift" => (
+                    format!("Cluster node {host} resource profile changed"),
+                    format!(
+                        "The resource fingerprint for Kubernetes node {host} changed. Review the recorded CPU, memory, accelerator, and node identity evidence before updating placement assumptions."
+                    ),
+                    FindingSeverity::High,
+                    89,
+                    "review_host_resource_drift",
+                ),
+                _ => return None,
+            };
+
+            let detail = json!({
+                "rule": "host_resource_fingerprint_change",
+                "event": event,
+            });
+            let observed_at = event
+                .get("observed_at")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let source_reference = format!("kubernetes/node/{host}");
+            let evidence_payload = json!({
+                "host": host,
+                "event": event,
+                "resource_inventory_status": service
+                    .probe
+                    .pointer("/metrics/host_resource_inventory/status"),
+            });
+
+            Some(build_detected_finding(
+                existing_by_key.get(&finding_key),
+                source_run_id,
+                &finding_key,
+                &title,
+                &summary,
+                "resource_drift",
+                severity,
+                Some("swarmhpc".to_string()),
+                Some("swarmhpc".to_string()),
+                0.99,
+                vec![
+                    "host_resources".to_string(),
+                    "kubernetes".to_string(),
+                    "resource_drift".to_string(),
+                ],
+                detail,
+                vec![EvidenceSeed {
+                    evidence_type: "host_resource_snapshot".to_string(),
+                    source_kind: "kubernetes_api".to_string(),
+                    source_ref: source_reference,
+                    summary: format!(
+                        "Kubernetes node {host} produced a {event_type} observation at {observed_at}"
+                    ),
+                    payload: evidence_payload,
+                }],
+                vec![
+                    provenance_seed(
+                        "observation",
+                        "kubernetes_api",
+                        "conductor.discovery",
+                        &format!("observed {event_type} for Kubernetes node {host}"),
+                        Some(0.99),
+                        json!({
+                            "host": host,
+                            "source": "kubernetes_nodes_api",
+                            "node_uid": event.get("node_uid"),
+                            "resource_version": event.get("resource_version"),
+                            "observed_at": observed_at,
+                        }),
+                    ),
+                    provenance_seed(
+                        "analysis",
+                        "deterministic_rule",
+                        "conductor.findings",
+                        "host_resource_fingerprint_change",
+                        Some(0.99),
+                        json!({
+                            "event_type": event_type,
+                            "previous_fingerprint": event.get("previous_fingerprint"),
+                            "current_fingerprint": event.get("current_fingerprint"),
+                        }),
+                    ),
+                ],
+                RecommendationSeed {
+                    dedupe_key: format!("host-resource:{host}"),
+                    title: title.clone(),
+                    summary: summary.clone(),
+                    target_service: Some("swarmhpc".to_string()),
+                    priority,
+                    tags: vec![
+                        "host_resources".to_string(),
+                        "kubernetes".to_string(),
+                        "resource_drift".to_string(),
+                    ],
+                    plan: json!({
+                        "action": recommendation,
+                        "host": host,
+                        "event_type": event_type,
+                        "previous_fingerprint": event.get("previous_fingerprint"),
+                        "current_fingerprint": event.get("current_fingerprint"),
+                        "required_verifications": ["confirm Kubernetes node readiness and refreshed resource capacity"],
+                    }),
+                    depends_on: Vec::new(),
+                },
+            ))
+        })
+        .collect()
+}
+
 fn build_detected_finding(
     existing: Option<&&FindingRecord>,
     source_run_id: Option<Uuid>,
@@ -2204,5 +2364,40 @@ mod tests {
             finding.finding.details["coverage_access_limited"],
             Value::Bool(true)
         );
+    }
+
+    #[test]
+    fn detect_findings_records_host_resource_drift_with_kubernetes_provenance() {
+        let mut swarmhpc = base_service("swarmhpc");
+        swarmhpc.probe = json!({
+            "metrics": {
+                "host_resource_inventory": {
+                    "status": "available",
+                    "events": [{
+                        "host": "qc01",
+                        "type": "resource_drift",
+                        "previous_fingerprint": "before",
+                        "current_fingerprint": "after",
+                        "resource_changed": true,
+                        "node_uid": "node-uid",
+                        "resource_version": "42",
+                        "source": "kubernetes_nodes_api",
+                        "observed_at": "2026-09-26T07:00:00Z"
+                    }]
+                }
+            }
+        });
+
+        let detected = detect_findings(&[swarmhpc], &[], &[], None, &[]);
+        let finding = detected
+            .iter()
+            .find(|item| item.finding.finding_key == "host_resource_drift:qc01")
+            .expect("host resource finding");
+
+        assert_eq!(finding.finding.category, "resource_drift");
+        assert_eq!(finding.finding.target_service.as_deref(), Some("swarmhpc"));
+        assert_eq!(finding.evidence[0].source_kind, "kubernetes_api");
+        assert_eq!(finding.provenance[0].origin, "kubernetes_api");
+        assert_eq!(finding.recommendation.plan["current_fingerprint"], "after");
     }
 }

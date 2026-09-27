@@ -4,6 +4,7 @@ use anyhow::Result;
 use serde_json::{Map, Value, json};
 
 use crate::{
+    approvals::metadata_schedule_now,
     findings::{DetectedFinding, detect_findings},
     improvement_catalog::{ImprovementGap, KNOWN_GAPS},
     integrations::gail_plan_summary,
@@ -514,6 +515,27 @@ async fn upsert_catalogue_gap(
             now_utc().to_rfc3339(),
             gap.id
         ));
+        // A failed catalogue item otherwise remains terminal forever even
+        // after its plan is corrected. Reopen it only when the formal plan
+        // changes; unchanged failures are never retried on every planning
+        // cycle, and execution approval/dependency gates still apply.
+        if changed
+            && updated.source == "formal_gap_catalogue"
+            && updated.status == WorkStatus::Failure
+        {
+            updated.status = WorkStatus::Planned;
+            updated.progress_pct = 0;
+            updated.started_at = None;
+            updated.finished_at = None;
+            if updated.execution_approved && metadata_schedule_now(&updated.approval_metadata) {
+                updated.scheduled_for = Some(now_utc());
+            }
+            updated.notes.push(format!(
+                "{} reopened failed formal gap {} after its catalogue plan changed",
+                now_utc().to_rfc3339(),
+                gap.id
+            ));
+        }
         repository.upsert_work_item(&updated).await?;
         return Ok(());
     }
@@ -863,6 +885,128 @@ mod tests {
                 .as_deref()
                 .is_some_and(|key| key.starts_with("formal-gap:"))
         }));
+    }
+
+    #[tokio::test]
+    async fn revised_approved_formal_gap_reopens_once_and_preserves_approval_gates() {
+        let repository = crate::storage::memory::MemoryRepository::new();
+        let gap = KNOWN_GAPS
+            .iter()
+            .find(|gap| gap.id == "estate-discovery-resource-drift")
+            .expect("estate discovery gap");
+        let mut failed = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("formal-gap:estate-discovery-resource-drift".to_string()),
+            title: gap.title.to_string(),
+            summary: gap.summary.to_string(),
+            target_service: Some(gap.target_service.to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: Vec::new(),
+            rollout_strategy: Some(RolloutStrategy::Direct),
+            status: Some(WorkStatus::Failure),
+            priority: Some(gap.priority),
+            progress_pct: Some(100),
+            admin_override: false,
+            execution_approved: true,
+            verification_required: Some(true),
+            tags: gap.tags.iter().map(|tag| (*tag).to_string()).collect(),
+            plan: json!({
+                "kind": "formal_gap",
+                "gap_id": gap.id,
+                "repositories": ["conductor", "swarmhpc"],
+                "outcomes": gap.outcomes,
+                "validation": ["cargo test --lib", "ansible-playbook --syntax-check"],
+            }),
+            depends_on: Vec::new(),
+            source: Some("formal_gap_catalogue".to_string()),
+            scheduled_for: None,
+        });
+        failed.approval_metadata = json!({"approved": true, "schedule_now": true});
+        failed.started_at = Some(now_utc());
+        failed.finished_at = Some(now_utc());
+        repository
+            .upsert_work_item(&failed)
+            .await
+            .expect("seed failed formal gap");
+
+        upsert_catalogue_gap(&repository, gap)
+            .await
+            .expect("reconcile revised formal gap");
+        let reopened = repository
+            .find_work_item_by_dedupe_key("formal-gap:estate-discovery-resource-drift")
+            .await
+            .expect("read revised item")
+            .expect("revised formal gap");
+        assert_eq!(reopened.status, WorkStatus::Planned);
+        assert_eq!(reopened.progress_pct, 0);
+        assert!(reopened.started_at.is_none());
+        assert!(reopened.finished_at.is_none());
+        assert!(reopened.scheduled_for.is_some());
+        assert!(reopened.execution_approved);
+        assert_eq!(reopened.depends_on, Vec::<String>::new());
+        assert_eq!(reopened.plan["repositories"], json!(["conductor"]));
+
+        upsert_catalogue_gap(&repository, gap)
+            .await
+            .expect("repeat unchanged catalogue reconciliation");
+        let unchanged = repository
+            .find_work_item_by_dedupe_key("formal-gap:estate-discovery-resource-drift")
+            .await
+            .expect("read item after repeat")
+            .expect("formal gap remains present");
+        assert_eq!(unchanged.status, WorkStatus::Planned);
+    }
+
+    #[tokio::test]
+    async fn revised_unapproved_formal_gap_reopens_without_being_scheduled() {
+        let repository = crate::storage::memory::MemoryRepository::new();
+        let gap = KNOWN_GAPS
+            .iter()
+            .find(|gap| gap.id == "estate-discovery-resource-drift")
+            .expect("estate discovery gap");
+        let mut failed = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("formal-gap:estate-discovery-resource-drift".to_string()),
+            title: gap.title.to_string(),
+            summary: gap.summary.to_string(),
+            target_service: Some(gap.target_service.to_string()),
+            delivery_stage: Some(DeliveryStage::Development),
+            validated_stages: Vec::new(),
+            rollout_strategy: Some(RolloutStrategy::Direct),
+            status: Some(WorkStatus::Failure),
+            priority: Some(gap.priority),
+            progress_pct: Some(100),
+            admin_override: false,
+            execution_approved: false,
+            verification_required: Some(true),
+            tags: gap.tags.iter().map(|tag| (*tag).to_string()).collect(),
+            plan: json!({
+                "kind": "formal_gap",
+                "gap_id": gap.id,
+                "repositories": ["conductor", "swarmhpc"],
+                "outcomes": gap.outcomes,
+                "validation": ["cargo test --lib", "ansible-playbook --syntax-check"],
+            }),
+            depends_on: Vec::new(),
+            source: Some("formal_gap_catalogue".to_string()),
+            scheduled_for: None,
+        });
+        failed.approval_metadata = json!({"approved": false, "schedule_now": false});
+        failed.finished_at = Some(now_utc());
+        repository
+            .upsert_work_item(&failed)
+            .await
+            .expect("seed unapproved failed formal gap");
+
+        upsert_catalogue_gap(&repository, gap)
+            .await
+            .expect("reconcile revised formal gap");
+        let reopened = repository
+            .find_work_item_by_dedupe_key("formal-gap:estate-discovery-resource-drift")
+            .await
+            .expect("read revised item")
+            .expect("revised formal gap");
+        assert_eq!(reopened.status, WorkStatus::Planned);
+        assert!(!reopened.execution_approved);
+        assert!(reopened.scheduled_for.is_none());
     }
 
     #[test]
