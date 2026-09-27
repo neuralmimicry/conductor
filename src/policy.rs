@@ -54,12 +54,15 @@ pub fn evaluate_work_item(
                 "safety controls cannot be disabled for protected platform targets".to_string(),
             );
         }
-        if !matches!(
-            work_item.rollout_strategy,
-            RolloutStrategy::Canary | RolloutStrategy::RedGreen
-        ) {
+        if requires_live_readiness
+            && !matches!(
+                work_item.rollout_strategy,
+                RolloutStrategy::Canary | RolloutStrategy::RedGreen
+            )
+        {
             reasons.push(
-                "protected target requires a canary or red_green rollout strategy".to_string(),
+                "protected live rollout requires a canary or red_green rollout strategy"
+                    .to_string(),
             );
         }
         if service.is_none() {
@@ -436,13 +439,15 @@ pub fn apply_repository_safety_policy(
         policy.sensitive_targets.push(service.service_key.clone());
     }
     let requires_live_readiness = work_item.delivery_stage.requires_live_readiness();
-    if !matches!(
-        work_item.rollout_strategy,
-        RolloutStrategy::Canary | RolloutStrategy::RedGreen
-    ) {
-        policy
-            .reasons
-            .push("protected target requires a canary or red_green rollout strategy".to_string());
+    if requires_live_readiness
+        && !matches!(
+            work_item.rollout_strategy,
+            RolloutStrategy::Canary | RolloutStrategy::RedGreen
+        )
+    {
+        policy.reasons.push(
+            "protected live rollout requires a canary or red_green rollout strategy".to_string(),
+        );
         policy.verdict = PolicyVerdict::Blocked;
         policy.risk_level = "critical".to_string();
     }
@@ -759,9 +764,10 @@ mod tests {
     }
 
     #[test]
-    fn own_organisation_repository_is_sensitive_even_with_an_unprotected_service_name() {
+    fn development_work_on_own_organisation_repo_does_not_need_live_rollout_strategy() {
         let mut config = ConductorConfig::default();
         config.policy.allow_external_repo_execution = true;
+        config.discovery.github.owner = "neuralmimicry".to_string();
         let mut item = WorkItem::from_new(NewWorkItem {
             dedupe_key: Some("sensitive:custom".to_string()),
             title: "Update custom platform service".to_string(),
@@ -807,37 +813,84 @@ mod tests {
             discovered_at: now_utc(),
             updated_at: now_utc(),
         };
+        let repository = RepositorySnapshot {
+            repo_key: "custom-service".to_string(),
+            name: "custom-service".to_string(),
+            owner: Some("neuralmimicry".to_string()),
+            repo_url: Some("https://github.com/neuralmimicry/custom-service".to_string()),
+            local_path: Some("/srv/custom-service".to_string()),
+            default_branch: Some("main".to_string()),
+            current_branch: Some("main".to_string()),
+            language: Some("Rust".to_string()),
+            frameworks: vec![],
+            build_systems: vec!["cargo".to_string()],
+            package_managers: vec!["cargo".to_string()],
+            runtime_type: Some("service".to_string()),
+            deployment_type: Some("container".to_string()),
+            purpose: Some("application".to_string()),
+            criticality: "high".to_string(),
+            visibility: Some("private".to_string()),
+            archived: false,
+            linked_services: vec!["custom-service".to_string()],
+            dependencies: vec![],
+            capabilities: vec![],
+            inventory_sources: vec!["test".to_string()],
+            metadata: json!({}),
+            discovered_at: now_utc(),
+            updated_at: now_utc(),
+        };
 
-        let evaluation = evaluate_work_item(&config, &item, Some(&service));
+        let evaluation = evaluate_work_item_with_repositories(
+            &config,
+            &item,
+            Some(&service),
+            std::slice::from_ref(&repository),
+        );
         assert!(
             evaluation.sensitive_targets.iter().any(
                 |target| target == "repository:https://github.com/neuralmimicry/custom-service"
             )
         );
-        assert_eq!(evaluation.verdict, PolicyVerdict::Blocked);
+        assert_eq!(evaluation.verdict, PolicyVerdict::Allowed);
         assert!(
             evaluation
                 .reasons
                 .iter()
-                .any(|reason| reason.contains("requires a canary or red_green"))
+                .all(|reason| { !reason.contains("requires a canary or red_green") })
         );
         assert!(evaluation.sensitive_targets.iter().any(|target| {
             target == "repository:https://github.com/neuralmimicry/custom-service"
         }));
 
-        item.rollout_strategy = RolloutStrategy::Canary;
-        let development = evaluate_work_item(&config, &item, Some(&service));
-        assert_eq!(development.verdict, PolicyVerdict::Allowed);
-        assert!(development.sensitive_targets.iter().any(|target| {
-            target == "repository:https://github.com/neuralmimicry/custom-service"
-        }));
-        assert!(development.required_verifications.iter().all(|check| {
-            !check.contains("readiness baseline") && !check.contains("automatic rollback")
-        }));
-
         item.delivery_stage = DeliveryStage::Uat;
         item.validated_stages = vec![DeliveryStage::IntegrationTesting];
-        let release = evaluate_work_item(&config, &item, Some(&service));
+        let direct_release = evaluate_work_item_with_repositories(
+            &config,
+            &item,
+            Some(&service),
+            std::slice::from_ref(&repository),
+        );
+        assert_eq!(direct_release.verdict, PolicyVerdict::Blocked);
+        assert!(
+            direct_release
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("requires a canary or red_green"))
+        );
+        assert!(
+            direct_release
+                .required_verifications
+                .iter()
+                .any(|check| check.contains("automatic rollback"))
+        );
+
+        item.rollout_strategy = RolloutStrategy::Canary;
+        let release = evaluate_work_item_with_repositories(
+            &config,
+            &item,
+            Some(&service),
+            std::slice::from_ref(&repository),
+        );
         assert_eq!(release.verdict, PolicyVerdict::Blocked);
         assert!(
             release
