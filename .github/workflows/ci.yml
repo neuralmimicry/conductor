@@ -20,8 +20,6 @@ jobs:
         include:
           - runner_arch: X64
             runs_on: '["self-hosted", "Linux", "X64"]'
-          - runner_arch: ARM64
-            runs_on: '["self-hosted","Linux","ARM64"]'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
