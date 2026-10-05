@@ -170,3 +170,9 @@ ENV ANSIBLE_ROLES_PATH=/workspace/swarmhpc/swarmhpc/ansible/roles:/usr/share/ans
 ENV ANSIBLE_COLLECTIONS_PATH=/home/conductor/.ansible/collections:/usr/share/ansible/collections
 EXPOSE 8091
 CMD ["conductor", "--config", "/app/config/conductor.yaml"]
+
+# OCI metadata (final stage) so GHCR links the package to its source repository.
+LABEL org.opencontainers.image.source="https://github.com/neuralmimicry/conductor" \
+      org.opencontainers.image.url="https://github.com/neuralmimicry/conductor" \
+      org.opencontainers.image.description="Estate control-plane: topology discovery, evidence-backed findings, governed work-item queue, and staged delivery pipeline" \
+      org.opencontainers.image.vendor="NeuralMimicry"
