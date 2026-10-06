@@ -2041,7 +2041,11 @@ fn build_job_payload(
     // repository against the discovered repository inventory and service
     // context. The repository slug remains useful when a mounted source tree
     // has no Git remote of its own.
-    if !payload.contains_key("repo_url") {
+    if !payload
+        .get("repo_url")
+        .and_then(Value::as_str)
+        .is_some_and(|repo_url| !repo_url.trim().is_empty())
+    {
         if let Some((repo_url, branches)) = rollout_repository_context(
             Some(work_item),
             service,
@@ -2049,14 +2053,22 @@ fn build_job_payload(
             Some(config.discovery.github.owner.as_str()),
         ) {
             payload.insert("repo_url".to_string(), json!(repo_url));
-            if !payload.contains_key("repo_branch") {
+            if !payload
+                .get("repo_branch")
+                .and_then(Value::as_str)
+                .is_some_and(|branch| !branch.trim().is_empty())
+            {
                 if let Some(repo_branch) = branches.first() {
                     payload.insert("repo_branch".to_string(), json!(repo_branch));
                 }
             }
         }
     }
-    if !payload.contains_key("repo_branch") {
+    if !payload
+        .get("repo_branch")
+        .and_then(Value::as_str)
+        .is_some_and(|branch| !branch.trim().is_empty())
+    {
         if let Some(repo_branch) = service.and_then(|service| service.repo_branch.as_deref()) {
             payload.insert("repo_branch".to_string(), json!(repo_branch));
         }
@@ -2485,7 +2497,25 @@ fn rollout_repository_context(
                     .find(|repository| repository.linked_services.contains(&service.service_key))
             })
     });
-    let matched = planned_repository.or(service_repository);
+    let service_repository_has_url = service
+        .and_then(|service| service.repo_url.as_deref())
+        .is_some_and(|repo_url| !repo_url.trim().is_empty())
+        || service_repository
+            .and_then(|repository| {
+                repository_snapshot_url_with_owner_fallback(repository, default_github_owner)
+            })
+            .is_some();
+    let target_service = work_item
+        .and_then(|item| item.target_service.as_deref())
+        .or_else(|| service.map(|service| service.service_key.as_str()));
+    let infrastructure_repository = if planned_reference.is_none() && !service_repository_has_url {
+        infrastructure_service_repository(target_service, repositories)
+    } else {
+        None
+    };
+    let matched = planned_repository
+        .or(service_repository)
+        .or(infrastructure_repository);
 
     let repo_url = planned_repository
         .and_then(|repository| {
@@ -2499,6 +2529,11 @@ fn rollout_repository_context(
         .or_else(|| service.and_then(|service| service.repo_url.clone()))
         .or_else(|| {
             service_repository.and_then(|repository| {
+                repository_snapshot_url_with_owner_fallback(repository, default_github_owner)
+            })
+        })
+        .or_else(|| {
+            infrastructure_repository.and_then(|repository| {
                 repository_snapshot_url_with_owner_fallback(repository, default_github_owner)
             })
         })?;
@@ -2518,8 +2553,31 @@ fn rollout_repository_context(
             branches.push(branch.to_string());
         }
     }
+    if branches.is_empty() && infrastructure_repository.is_some() {
+        // The deployment-automation repository's verified default branch is
+        // main; older discovery snapshots may not carry its branch metadata.
+        branches.push("main".to_string());
+    }
 
     Some((repo_url, branches))
+}
+
+fn infrastructure_service_repository<'a>(
+    target_service: Option<&str>,
+    repositories: &'a [RepositorySnapshot],
+) -> Option<&'a RepositorySnapshot> {
+    let target_service = target_service?.trim().to_ascii_lowercase();
+    if !matches!(
+        target_service.as_str(),
+        "grafana" | "node" | "postgres" | "prometheus" | "shared-storage"
+    ) {
+        return None;
+    }
+
+    repositories.iter().find(|repository| {
+        repository.repo_key.eq_ignore_ascii_case("swarmhpc")
+            || repository.name.eq_ignore_ascii_case("swarmhpc")
+    })
 }
 
 fn normalized_github_repository_reference(reference: &str) -> Option<String> {
@@ -3637,6 +3695,102 @@ mod tests {
             payload.get("skip_fork").and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn infrastructure_jobs_use_swarmhpc_when_planner_repository_is_null_or_blank() {
+        let config = ConductorConfig::default();
+        let repository = RepositorySnapshot {
+            repo_key: "swarmhpc".to_string(),
+            name: "swarmhpc".to_string(),
+            owner: None,
+            repo_url: None,
+            local_path: Some("/srv/swarmhpc".to_string()),
+            default_branch: None,
+            current_branch: None,
+            language: Some("YAML".to_string()),
+            frameworks: vec![],
+            build_systems: vec!["ansible".to_string()],
+            package_managers: vec![],
+            runtime_type: Some("infrastructure".to_string()),
+            deployment_type: Some("ansible".to_string()),
+            purpose: Some("infrastructure automation".to_string()),
+            criticality: "critical".to_string(),
+            visibility: None,
+            archived: false,
+            linked_services: vec!["swarmhpc".to_string()],
+            dependencies: vec![],
+            capabilities: vec!["ansible".to_string()],
+            inventory_sources: vec!["ansible_service".to_string()],
+            metadata: json!({}),
+            discovered_at: crate::models::now_utc(),
+            updated_at: crate::models::now_utc(),
+        };
+
+        for target_service in [
+            "postgres",
+            "prometheus",
+            "grafana",
+            "shared-storage",
+            "node",
+        ] {
+            let item = WorkItem::from_new(NewWorkItem {
+                dedupe_key: Some(format!("infrastructure-repo:{target_service}")),
+                title: format!("Review {target_service} infrastructure"),
+                summary: "Apply a verified infrastructure change".to_string(),
+                target_service: Some(target_service.to_string()),
+                delivery_stage: None,
+                validated_stages: vec![],
+                rollout_strategy: None,
+                status: None,
+                priority: None,
+                progress_pct: None,
+                admin_override: false,
+                execution_approved: true,
+                verification_required: Some(true),
+                tags: vec![],
+                plan: json!({}),
+                depends_on: vec![],
+                source: None,
+                scheduled_for: None,
+            });
+            let service = if target_service == "node" {
+                None
+            } else {
+                let mut service = sample_service();
+                service.service_key = target_service.to_string();
+                service.display_name = target_service.to_string();
+                service.repo_path = None;
+                service.repo_url = None;
+                service.repo_branch = None;
+                Some(service)
+            };
+            let planner_payload = if target_service == "postgres" {
+                json!({"job_payload": {"workflow": "project_solver", "repo_url": null, "repo_branch": ""}})
+            } else {
+                json!({"job_payload": {"workflow": "project_solver", "repo_url": "", "repo_branch": null}})
+            };
+
+            let payload = build_job_payload(
+                &config,
+                &item,
+                service.as_ref(),
+                &[repository.clone()],
+                &planner_payload,
+            )
+            .expect("payload");
+
+            assert_eq!(
+                payload.get("repo_url").and_then(Value::as_str),
+                Some("https://github.com/neuralmimicry/swarmhpc.git"),
+                "target service {target_service}",
+            );
+            assert_eq!(
+                payload.get("repo_branch").and_then(Value::as_str),
+                Some("main"),
+                "target service {target_service}",
+            );
+        }
     }
 
     #[test]
