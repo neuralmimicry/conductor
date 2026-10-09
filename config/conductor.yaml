@@ -178,6 +178,7 @@ policy:
     - "rm -rf"
     - "wipe"
     - "destroy"
+    - "manual-procurement"
 
 # Non-bypassable rollout protection for Conductor's own organisation-owned
 # platform services and repositories.  A sensitive execution must pass a

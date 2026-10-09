@@ -554,6 +554,7 @@ impl Default for PolicyConfig {
                 "rm -rf".to_string(),
                 "wipe".to_string(),
                 "destroy".to_string(),
+                "manual-procurement".to_string(),
             ],
         }
     }

@@ -97,6 +97,7 @@ Read APIs are protected by default. Set `allow_dashboard_without_token` to `true
 - `GET /api/v1/events`
 - `GET /api/v1/work-items`
 - `GET /api/v1/work-items/{id}`
+- `GET /api/v1/work-items/{id}/policy-preview`
 - `PATCH /api/v1/work-items/{id}`
 - `GET /api/v1/executions`
 - `GET /api/v1/work-items/{id}/executions`
@@ -119,6 +120,8 @@ effective limit, offset, filtered total, and `has_more` flag. For example:
 `GET /api/v1/work-items?status=planned&target_service=refiner&search=solver&limit=50&offset=0`.
 Use the per-item endpoint when you need a single record; the collection endpoint
 does not return an unbounded result set.
+The per-item policy preview evaluates the same current rules as execution but
+does not persist a verdict, change approval state, or create an execution.
 
 ## Storage Model
 
