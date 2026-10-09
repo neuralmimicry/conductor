@@ -112,6 +112,14 @@ Read APIs are protected by default. Set `allow_dashboard_without_token` to `true
 - `POST /api/v1/discovery/run`
 - `POST /api/v1/planning/run`
 
+`GET /api/v1/work-items` returns at most 100 work items by default and accepts
+`limit` (1–500), `offset`, `status`, `target_service`, and `search` filters. The
+response keeps the `work_items` array and adds `pagination` metadata with the
+effective limit, offset, filtered total, and `has_more` flag. For example:
+`GET /api/v1/work-items?status=planned&target_service=refiner&search=solver&limit=50&offset=0`.
+Use the per-item endpoint when you need a single record; the collection endpoint
+does not return an unbounded result set.
+
 ## Storage Model
 
 - Postgres is the system of record.

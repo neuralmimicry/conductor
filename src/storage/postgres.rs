@@ -15,7 +15,8 @@ use crate::{
         ConductorEvent, DeliveryStage, DiscoveryRun, ExecutionStatus, FindingEvidence,
         FindingProvenance, FindingRecord, FindingSeverity, FindingStatus, ImprovementCycle,
         RepositorySnapshot, RolloutStrategy, RunStatus, ServiceHealth, ServiceMetricSample,
-        ServiceSnapshot, TraceabilityLink, WorkExecution, WorkItem, WorkItemPatch, WorkStatus,
+        ServiceSnapshot, TraceabilityLink, WorkExecution, WorkItem, WorkItemListFilter,
+        WorkItemListPage, WorkItemPatch, WorkStatus,
     },
     repository::ConductorRepository,
 };
@@ -587,6 +588,53 @@ impl ConductorRepository for PostgresRepository {
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(map_work_item).collect()
+    }
+
+    async fn list_work_items_page(&self, filter: &WorkItemListFilter) -> Result<WorkItemListPage> {
+        let status = filter.status.map(WorkStatus::as_str);
+        let target_service = filter.target_service.as_deref();
+        let search = filter.search.as_deref();
+        let total: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM work_items
+            WHERE ($1::text IS NULL OR status = $1)
+              AND ($2::text IS NULL OR target_service = $2)
+              AND ($3::text IS NULL OR strpos(lower(title), lower($3)) > 0
+                   OR strpos(lower(summary), lower($3)) > 0)
+            "#,
+        )
+        .bind(status)
+        .bind(target_service)
+        .bind(search)
+        .fetch_one(&self.pool)
+        .await?;
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM work_items
+            WHERE ($1::text IS NULL OR status = $1)
+              AND ($2::text IS NULL OR target_service = $2)
+              AND ($3::text IS NULL OR strpos(lower(title), lower($3)) > 0
+                   OR strpos(lower(summary), lower($3)) > 0)
+            ORDER BY priority DESC, updated_at DESC, id ASC
+            LIMIT $4 OFFSET $5
+            "#,
+        )
+        .bind(status)
+        .bind(target_service)
+        .bind(search)
+        .bind(filter.limit as i64)
+        .bind(filter.offset as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(WorkItemListPage {
+            items: rows
+                .into_iter()
+                .map(map_work_item)
+                .collect::<Result<Vec<_>>>()?,
+            total: usize::try_from(total).unwrap_or(usize::MAX),
+        })
     }
 
     async fn get_work_item(&self, id: Uuid) -> Result<Option<WorkItem>> {

@@ -10,7 +10,8 @@ use crate::{
     models::{
         ConductorEvent, DiscoveryRun, FindingEvidence, FindingProvenance, FindingRecord,
         ImprovementCycle, RepositorySnapshot, ServiceMetricSample, ServiceSnapshot,
-        TraceabilityLink, WorkExecution, WorkItem, WorkItemPatch,
+        TraceabilityLink, WorkExecution, WorkItem, WorkItemListFilter, WorkItemListPage,
+        WorkItemPatch,
     },
     repository::ConductorRepository,
 };
@@ -218,6 +219,34 @@ impl ConductorRepository for MemoryRepository {
                 .then_with(|| right.updated_at.cmp(&left.updated_at))
         });
         Ok(items)
+    }
+
+    async fn list_work_items_page(&self, filter: &WorkItemListFilter) -> Result<WorkItemListPage> {
+        let items = self.list_work_items().await?;
+        let search = filter.search.as_deref().map(str::to_lowercase);
+        let matching: Vec<_> = items
+            .into_iter()
+            .filter(|item| filter.status.is_none_or(|status| item.status == status))
+            .filter(|item| {
+                filter
+                    .target_service
+                    .as_deref()
+                    .is_none_or(|service| item.target_service.as_deref() == Some(service))
+            })
+            .filter(|item| {
+                search.as_deref().is_none_or(|needle| {
+                    item.title.to_lowercase().contains(needle)
+                        || item.summary.to_lowercase().contains(needle)
+                })
+            })
+            .collect();
+        let total = matching.len();
+        let page = matching
+            .into_iter()
+            .skip(filter.offset)
+            .take(filter.limit)
+            .collect();
+        Ok(WorkItemListPage { items: page, total })
     }
 
     async fn get_work_item(&self, id: Uuid) -> Result<Option<WorkItem>> {

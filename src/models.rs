@@ -484,6 +484,21 @@ pub struct WorkItem {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct WorkItemListFilter {
+    pub status: Option<WorkStatus>,
+    pub target_service: Option<String>,
+    pub search: Option<String>,
+    pub limit: usize,
+    pub offset: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkItemListPage {
+    pub items: Vec<WorkItem>,
+    pub total: usize,
+}
+
 impl WorkItem {
     pub fn from_new(input: NewWorkItem) -> Self {
         let now = now_utc();

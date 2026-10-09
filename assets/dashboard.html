@@ -164,6 +164,9 @@
     .section-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 14px; }
     .section-title { margin: 0; font-family: var(--serif); font-size: 1.6rem; }
     .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+    .work-item-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 12px; }
+    .work-item-filters input, .work-item-filters select { width: 100%; }
+    .work-item-pagination { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--muted); }
     .grid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 18px; }
     .table-wrap { overflow: auto; border-radius: 16px; border: 1px solid var(--line); }
     table { width: 100%; border-collapse: collapse; min-width: 760px; }
@@ -255,11 +258,33 @@
           <button id="run-execution">Run Execution</button>
         </div>
       </div>
+      <div class="work-item-filters">
+        <select id="work-items-status-filter" aria-label="Filter work items by status">
+          <option value="">All statuses</option>
+          <option value="planned">Planned</option>
+          <option value="scheduled">Scheduled</option>
+          <option value="in_operation">In operation</option>
+          <option value="success">Success</option>
+          <option value="failure">Failure</option>
+          <option value="aborted">Aborted</option>
+          <option value="on_hold">On hold</option>
+        </select>
+        <input id="work-items-service-filter" type="search" placeholder="Filter target service" aria-label="Filter by target service" />
+        <input id="work-items-search-filter" type="search" placeholder="Search title or summary" aria-label="Search work items" />
+        <button class="secondary" id="work-items-apply-filter">Apply filters</button>
+      </div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Work</th><th>Status</th><th>Stage</th><th>Rollout</th><th>Priority</th><th>Progress</th><th>Schedule</th><th>Target</th><th>Execution</th><th>Admin</th></tr></thead>
-          <tbody id="work-items"></tbody>
-        </table>
+        <tbody id="work-items"></tbody>
+      </table>
+      </div>
+      <div class="section-head" style="margin:12px 0 0">
+        <div class="work-item-pagination" id="work-items-page-label" aria-live="polite"></div>
+        <div class="actions">
+          <button class="secondary" id="work-items-previous" disabled>Previous</button>
+          <button class="secondary" id="work-items-next" disabled>Next</button>
+        </div>
       </div>
     </div>
     <div class="panel">
@@ -299,6 +324,8 @@
 const state = {
   token: localStorage.getItem('conductor_admin_token') || '',
   selectedWorkItemId: localStorage.getItem('conductor_selected_work_item') || '',
+  workItemsOffset: 0,
+  workItemsPageSize: 100,
   servicesCache: null,
   servicesFetchedAt: 0,
   cyclesCache: null,
@@ -322,6 +349,13 @@ const els = {
   runDiscovery: document.getElementById('run-discovery'), runPlanning: document.getElementById('run-planning'), runExecution: document.getElementById('run-execution'),
   traceabilityDetail: document.getElementById('traceability-detail'), externalReferenceSummary: document.getElementById('external-reference-summary'),
   estateGraphSummary: document.getElementById('estate-graph-summary'),
+  workItemsStatusFilter: document.getElementById('work-items-status-filter'),
+  workItemsServiceFilter: document.getElementById('work-items-service-filter'),
+  workItemsSearchFilter: document.getElementById('work-items-search-filter'),
+  workItemsApplyFilter: document.getElementById('work-items-apply-filter'),
+  workItemsPageLabel: document.getElementById('work-items-page-label'),
+  workItemsPrevious: document.getElementById('work-items-previous'),
+  workItemsNext: document.getElementById('work-items-next'),
   syncSelected: document.getElementById('sync-selected'), createJira: document.getElementById('create-jira'), publishConfluence: document.getElementById('publish-confluence'),
 };
 els.token.value = state.token; updateAuthBadge();
@@ -488,11 +522,19 @@ function toDateTimeLocal(value) {
   const pad = (item) => String(item).padStart(2, '0');
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
-function renderWorkItems(items) {
+function renderWorkItems(items, pagination = { limit: state.workItemsPageSize, offset: state.workItemsOffset, total: items.length, has_more: false }) {
   const statuses = ['planned', 'scheduled', 'in_operation', 'success', 'failure', 'aborted', 'on_hold'];
   const stages = ['development', 'testing', 'integration', 'integration_testing', 'uat', 'production'];
   const rolloutStrategies = ['direct', 'canary', 'red_green'];
   els.workItems.innerHTML = items.map((item) => `<tr class="${state.selectedWorkItemId === item.id ? 'selected-row' : ''}"><td><strong>${item.title}</strong><br><div class="muted">${item.summary}</div><div>${(item.tags || []).map((tag) => `<span class="pill">${tag}</span>`).join('')}</div><div>${(item.validated_stages || []).map((stage) => `<span class="pill">${stage}</span>`).join('') || '<span class="muted">no validated stages yet</span>'}</div>${(item.depends_on || []).length ? `<div class="muted mono">depends_on: ${(item.depends_on || []).join(', ')}</div>` : ''}</td><td><select data-field="status" data-id="${item.id}">${statuses.map((status) => `<option value="${status}" ${status === item.status ? 'selected' : ''}>${status}</option>`).join('')}</select></td><td><div class="stack"><select data-field="delivery_stage" data-id="${item.id}">${stages.map((stage) => `<option value="${stage}" ${stage === item.delivery_stage ? 'selected' : ''}>${stage}</option>`).join('')}</select><div class="muted">validated ${(item.validated_stages || []).length}/${stages.length}</div></div></td><td><select data-field="rollout_strategy" data-id="${item.id}">${rolloutStrategies.map((strategy) => `<option value="${strategy}" ${strategy === item.rollout_strategy ? 'selected' : ''}>${strategy}</option>`).join('')}</select></td><td><input type="number" data-field="priority" data-id="${item.id}" value="${item.priority}" /></td><td><input type="number" data-field="progress_pct" data-id="${item.id}" min="0" max="100" value="${item.progress_pct}" /></td><td><input type="datetime-local" data-field="scheduled_for" data-id="${item.id}" value="${toDateTimeLocal(item.scheduled_for)}" /></td><td>${item.target_service || '<span class="muted">none</span>'}</td><td><div class="row-actions"><label><input type="checkbox" data-field="execution_approved" data-id="${item.id}" ${item.execution_approved ? 'checked' : ''} /> execution approved</label><label><input type="checkbox" data-field="verification_required" data-id="${item.id}" ${item.verification_required ? 'checked' : ''} /> verification required</label><input data-field="depends_on" data-id="${item.id}" value="${(item.depends_on || []).join(', ')}" placeholder="comma-separated dependency ids or dedupe keys" />${item.last_execution_id ? `<div class="muted mono">last execution: ${item.last_execution_id}</div>` : '<div class="muted">no execution yet</div>'}<button class="secondary" data-action="execute" data-id="${item.id}">Execute</button><button class="secondary" data-action="traceability" data-id="${item.id}">${state.selectedWorkItemId === item.id ? 'Selected' : 'Traceability'}</button></div></td><td><div class="row-actions"><label><input type="checkbox" data-field="admin_override" data-id="${item.id}" ${item.admin_override ? 'checked' : ''} /> admin override</label><textarea data-field="note" data-id="${item.id}" placeholder="append note"></textarea><button class="secondary" data-action="save" data-id="${item.id}">Save</button></div></td></tr>`).join('');
+  const total = Number(pagination.total || 0);
+  const start = total === 0 ? 0 : Number(pagination.offset || 0) + 1;
+  const end = Math.min(Number(pagination.offset || 0) + items.length, total);
+  const pageCount = Math.max(1, Math.ceil(total / Number(pagination.limit || state.workItemsPageSize)));
+  const pageNumber = Math.floor(Number(pagination.offset || 0) / Number(pagination.limit || state.workItemsPageSize)) + 1;
+  els.workItemsPageLabel.textContent = `${start}–${end} of ${total} work items · page ${pageNumber} of ${pageCount}`;
+  els.workItemsPrevious.disabled = Number(pagination.offset || 0) === 0;
+  els.workItemsNext.disabled = !pagination.has_more;
   els.workItems.querySelectorAll('button[data-action="save"]').forEach((button) => {
     button.addEventListener('click', async () => {
       const id = button.dataset.id; const values = {};
@@ -615,10 +657,14 @@ async function load(force = false) {
     const traceabilityPromise = state.selectedWorkItemId
       ? fetchJson(`/api/v1/work-items/${state.selectedWorkItemId}/traceability`).catch((error) => ({ __error: error.message }))
       : Promise.resolve(null);
+    const workItemsParams = new URLSearchParams({ limit: String(state.workItemsPageSize), offset: String(state.workItemsOffset) });
+    if (els.workItemsStatusFilter.value) workItemsParams.set('status', els.workItemsStatusFilter.value);
+    if (els.workItemsServiceFilter.value.trim()) workItemsParams.set('target_service', els.workItemsServiceFilter.value.trim());
+    if (els.workItemsSearchFilter.value.trim()) workItemsParams.set('search', els.workItemsSearchFilter.value.trim());
     const [summary, services, workItems, cycles, traceability, graph] = await Promise.all([
       fetchJson('/api/v1/summary'),
       refreshServices ? fetchJson('/api/v1/services') : Promise.resolve(state.servicesCache),
-      fetchJson('/api/v1/work-items'),
+      fetchJson(`/api/v1/work-items?${workItemsParams.toString()}`),
       refreshCycles ? fetchJson('/api/v1/cycles?limit=10') : Promise.resolve(state.cyclesCache),
       traceabilityPromise,
       refreshGraph ? fetchJson('/api/v1/traceability/graph') : Promise.resolve(state.graphCache),
@@ -636,14 +682,10 @@ async function load(force = false) {
       state.graphFetchedAt = Date.now();
     }
     const items = workItems.work_items || workItems;
-    if (state.selectedWorkItemId && !(items || []).some((item) => item.id === state.selectedWorkItemId)) {
-      state.selectedWorkItemId = '';
-      localStorage.removeItem('conductor_selected_work_item');
-    }
     const servicesPayload = state.servicesCache || services;
     const cyclesPayload = state.cyclesCache || cycles;
     const graphPayload = state.graphCache || graph;
-    renderSummary(summary); renderExternalSummary(summary, graphPayload.graph || graphPayload); renderServices(servicesPayload.services || servicesPayload); renderWorkItems(items); renderCycles(cyclesPayload.cycles || cyclesPayload); renderTraceability(traceability?.traceability || null, traceability?.__error); updateAuthBadge();
+    renderSummary(summary); renderExternalSummary(summary, graphPayload.graph || graphPayload); renderServices(servicesPayload.services || servicesPayload); renderWorkItems(items, workItems.pagination); renderCycles(cyclesPayload.cycles || cyclesPayload); renderTraceability(traceability?.traceability || null, traceability?.__error); updateAuthBadge();
     connectEventStream();
   } catch (error) {
     closeEventStream();
@@ -660,6 +702,9 @@ async function load(force = false) {
 els.saveToken.addEventListener('click', () => { state.token = els.token.value.trim(); localStorage.setItem('conductor_admin_token', state.token); closeEventStream(); resetDashboardCaches(); load(true); });
 els.clearToken.addEventListener('click', () => { state.token = ''; els.token.value = ''; localStorage.removeItem('conductor_admin_token'); closeEventStream(); resetDashboardCaches(); load(true); });
 els.refresh.addEventListener('click', () => { resetDashboardCaches(); load(true); });
+els.workItemsApplyFilter.addEventListener('click', () => { state.workItemsOffset = 0; load(true); });
+els.workItemsPrevious.addEventListener('click', () => { state.workItemsOffset = Math.max(0, state.workItemsOffset - state.workItemsPageSize); load(true); });
+els.workItemsNext.addEventListener('click', () => { state.workItemsOffset += state.workItemsPageSize; load(true); });
 els.runDiscovery.addEventListener('click', async () => { try { await fetchJson('/api/v1/discovery/run', { method: 'POST' }); resetDashboardCaches(); await load(true); } catch (error) { updateAuthBadge(error.message); } });
 els.runPlanning.addEventListener('click', async () => { try { await fetchJson('/api/v1/planning/run', { method: 'POST' }); resetDashboardCaches(); await load(true); } catch (error) { updateAuthBadge(error.message); } });
 els.runExecution.addEventListener('click', async () => { try { await fetchJson('/api/v1/execution/run', { method: 'POST' }); resetDashboardCaches(); await load(true); } catch (error) { updateAuthBadge(error.message); } });
