@@ -10,6 +10,7 @@ use chrono::Duration as ChronoDuration;
 use futures::{StreamExt, stream};
 use reqwest::Client;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -27,8 +28,8 @@ use crate::{
     },
     host_resources::reconcile_service_host_resources,
     integrations::{
-        atlassian::AtlassianClients, continuum::ContinuumClient, refiner::RefinerClient,
-        tracey::TraceyClient,
+        atlassian::AtlassianClients, continuum::ContinuumClient, probe_service,
+        refiner::RefinerClient, tracey::TraceyClient,
     },
     metrics::{
         record_approval_cycle, record_claimed_work_items, record_discovery_cycle,
@@ -49,6 +50,7 @@ use crate::{
         evaluate_work_item, evaluate_work_item_with_repositories,
         project_native_verification_commands,
     },
+    recovery::{RecoveryAssessment, assess_recovery_target},
     repository::ConductorRepository,
     trends::collect_metric_samples,
     validation::{failure_reasons, run_independent_validation},
@@ -192,6 +194,481 @@ impl ConductorService {
         .await;
         record_discovery_cycle(result.is_ok(), started.elapsed().as_millis() as u64);
         result
+    }
+
+    /// Evaluate only explicitly configured Kubernetes workloads. Every restart
+    /// is gated by a fresh dependency graph, live Prometheus/Grafana probes,
+    /// Continuum's read-only host/rollout preflight, and a durable action event.
+    /// The default configuration is disabled and dry-run.
+    pub async fn run_recovery_cycle(&self) -> Result<usize> {
+        let policy = &self.config.recovery;
+        if !policy.enabled || policy.targets.is_empty() {
+            return Ok(0);
+        }
+
+        let mut services = self.repository.list_service_snapshots().await?;
+        let continuum_service = services
+            .iter()
+            .find(|service| service.service_key == "continuum");
+        let continuum =
+            ContinuumClient::from_sources(&self.config.integrations.continuum, continuum_service)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Continuum recovery integration is disabled"))?;
+        let events = self.repository.list_conductor_events(1_000).await?;
+        let pending = pending_recovery_actions(&events);
+        let resumed_requests = events
+            .iter()
+            .filter(|event| event.event_type == "recovery.action_resume_attempted")
+            .filter_map(|event| event.payload.get("request_id")?.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let pending_targets = pending
+            .iter()
+            .filter_map(|event| recovery_target_id_from_payload(&event.payload))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut actions = 0usize;
+
+        // A Conductor restart must resume verification or explicitly reconcile
+        // an uncertain request before considering another restart of the same
+        // workload. A repeated request uses the same id and is idempotent in NMC.
+        for event in pending {
+            if actions >= policy.max_actions_per_cycle {
+                break;
+            }
+            let Some(request_id) = event
+                .payload
+                .get("request_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Some(target) = configured_target_for_event(&policy.targets, &event.payload) else {
+                continue;
+            };
+            let status = match continuum
+                .deployment_recovery_status(&target.namespace, &target.deployment)
+                .await
+            {
+                Ok(status) => status,
+                Err(error) => {
+                    tracing::warn!(%error, service = %target.service_key, "pending recovery status check failed");
+                    continue;
+                }
+            };
+            let Some(data) = recovery_status_data(&status) else {
+                continue;
+            };
+            let observed_request = data
+                .get("template_recovery_request_id")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    data.get("recovery_request_id")
+                        .and_then(serde_json::Value::as_str)
+                });
+            let request_applied = observed_request == Some(request_id);
+            let eligible = data
+                .get("eligible")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let age = (chrono::Utc::now() - event.created_at).num_seconds().max(0) as u64;
+            if request_applied && eligible {
+                let affected = event
+                    .payload
+                    .get("affected_services")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let blockers = self
+                    .probe_recovery_services(&services, &affected, &target.service_key, false)
+                    .await;
+                if blockers.is_empty() {
+                    self.persist_recovery_event(recovery_terminal_event(
+                        "recovery.action_verified",
+                        "Workload recovery rollout and affected-service health were verified.",
+                        target,
+                        request_id,
+                        &affected,
+                        Vec::<String>::new(),
+                    ))
+                    .await?;
+                    services = self.repository.list_service_snapshots().await?;
+                    continue;
+                }
+                if age > policy.rollout_timeout_seconds {
+                    self.persist_recovery_event(recovery_terminal_event(
+                        "recovery.action_failed",
+                        "Workload became ready, but post-recovery service verification failed.",
+                        target,
+                        request_id,
+                        &affected,
+                        blockers,
+                    ))
+                    .await?;
+                }
+                continue;
+            }
+            if age > policy.rollout_timeout_seconds {
+                self.persist_recovery_event(recovery_terminal_event(
+                    "recovery.action_reconciled",
+                    "Pending recovery exceeded its verification window; no retry was made because live state did not prove the original request completed safely.",
+                    target,
+                    request_id,
+                    &[],
+                    vec!["verification window expired or request id was not observed".to_string()],
+                ))
+                .await?;
+                continue;
+            }
+            if !request_applied && eligible && !resumed_requests.contains(request_id) {
+                // This covers a Conductor restart after the durable intent was
+                // written but before the request reached NMC. Reuse the same
+                // request id; NMC serializes and deduplicates it.
+                let mut resume_event = ConductorEvent::new(
+                    "recovery.action_resume_attempted",
+                    "Resuming one durable recovery request with its original idempotency key.",
+                    serde_json::json!({
+                        "service_key": target.service_key,
+                        "namespace": target.namespace,
+                        "deployment": target.deployment,
+                        "request_id": request_id,
+                    }),
+                );
+                resume_event.status = Some("single_resume_attempt".to_string());
+                self.persist_recovery_event(resume_event).await?;
+                if let Err(error) = continuum
+                    .restart_deployment(&target.namespace, &target.deployment, request_id)
+                    .await
+                {
+                    tracing::warn!(%error, service = %target.service_key, "pending recovery request could not be resumed");
+                }
+                actions += 1;
+            }
+        }
+
+        for target in &policy.targets {
+            if actions >= policy.max_actions_per_cycle {
+                break;
+            }
+            let target_id = recovery_target_id(target);
+            if pending_targets.contains(&target_id) {
+                continue;
+            }
+            if recovery_cooldown_active(&events, target, policy.cooldown_seconds) {
+                continue;
+            }
+
+            let assessment = self
+                .live_recovery_assessment(target, &services, policy.max_snapshot_age_seconds)
+                .await;
+            if !assessment.eligible {
+                continue;
+            }
+            let status = match continuum
+                .deployment_recovery_status(&target.namespace, &target.deployment)
+                .await
+            {
+                Ok(status) => status,
+                Err(error) => {
+                    tracing::warn!(%error, service = %target.service_key, "Continuum recovery preflight failed");
+                    continue;
+                }
+            };
+            let Some(data) = recovery_status_data(&status) else {
+                continue;
+            };
+            if data.get("eligible").and_then(serde_json::Value::as_bool) != Some(true) {
+                continue;
+            }
+
+            if policy.dry_run {
+                if !recovery_dry_run_recent(&events, target, policy.interval_seconds) {
+                    let mut event = ConductorEvent::new(
+                        "recovery.dry_run",
+                        "Structured recovery preflight passed; dry-run mode suppressed mutation.",
+                        serde_json::json!({
+                            "service_key": target.service_key,
+                            "namespace": target.namespace,
+                            "deployment": target.deployment,
+                            "affected_services": assessment.affected_services,
+                            "continuum_preflight": data,
+                        }),
+                    );
+                    event.status = Some("dry_run".to_string());
+                    self.persist_recovery_event(event).await?;
+                }
+                continue;
+            }
+
+            let Some(target_snapshot) = services
+                .iter()
+                .find(|service| service.service_key == target.service_key)
+            else {
+                continue;
+            };
+            let Some(gail_advice) = self
+                .request_recovery_advice(target, target_snapshot, &assessment, data)
+                .await
+            else {
+                // Gail may veto or be unavailable, but can never waive local
+                // dependency, policy, allowlist, or Continuum safety gates.
+                let mut event = ConductorEvent::new(
+                    "recovery.advisory_blocked",
+                    "Gail did not provide a sufficiently confident approval; no mutation was attempted.",
+                    serde_json::json!({
+                        "service_key": target.service_key,
+                        "namespace": target.namespace,
+                        "deployment": target.deployment,
+                        "affected_services": assessment.affected_services,
+                    }),
+                );
+                event.status = Some("suppressed".to_string());
+                self.persist_recovery_event(event).await?;
+                continue;
+            };
+
+            let request_id = recovery_request_id(target, policy.cooldown_seconds);
+            let start_event =
+                recovery_started_event(target, &request_id, &assessment, data, &gail_advice);
+            // Durable intent must succeed before the external mutation.
+            self.persist_recovery_event(start_event).await?;
+            match continuum
+                .restart_deployment(&target.namespace, &target.deployment, &request_id)
+                .await
+            {
+                Ok(response)
+                    if response.get("success").and_then(serde_json::Value::as_bool)
+                        == Some(true) =>
+                {
+                    actions += 1;
+                }
+                Ok(response) => {
+                    tracing::warn!(
+                        service = %target.service_key,
+                        response = %response,
+                        "Continuum did not accept the recovery request; leaving it pending for reconciliation"
+                    );
+                    actions += 1;
+                }
+                Err(error) => {
+                    // A transport error can occur after NMC accepted the patch.
+                    // Leave the durable intent unresolved and reconcile by id.
+                    tracing::warn!(%error, service = %target.service_key, "recovery request response was uncertain");
+                    actions += 1;
+                }
+            }
+        }
+        Ok(actions)
+    }
+
+    async fn live_recovery_assessment(
+        &self,
+        target: &crate::config::RecoveryTargetConfig,
+        services: &[ServiceSnapshot],
+        max_age_seconds: u64,
+    ) -> RecoveryAssessment {
+        let initial = assess_recovery_target(target, services, chrono::Utc::now(), max_age_seconds);
+        if !initial.eligible {
+            return initial;
+        }
+        let mut fresh_services = services.to_vec();
+        let mut probe_keys = initial.affected_services.clone();
+        probe_keys.extend(["prometheus".to_string(), "grafana".to_string()]);
+        probe_keys.sort();
+        probe_keys.dedup();
+        for key in probe_keys {
+            let Some(snapshot) = fresh_services
+                .iter_mut()
+                .find(|service| service.service_key == key)
+            else {
+                continue;
+            };
+            match probe_service(&self.http, &self.config, snapshot).await {
+                Ok(probe) => {
+                    snapshot.health = probe.health;
+                    snapshot.updated_at = now_utc();
+                    snapshot.probe = serde_json::json!({
+                        "endpoint": probe.endpoint,
+                        "summary": probe.summary,
+                        "metrics": probe.metrics,
+                        "health": probe.health.as_str(),
+                    });
+                }
+                Err(error) => {
+                    let mut blocked = initial.clone();
+                    blocked.eligible = false;
+                    blocked
+                        .blockers
+                        .push(format!("fresh probe for `{key}` failed: {error}"));
+                    blocked.blockers.sort();
+                    blocked.blockers.dedup();
+                    return blocked;
+                }
+            }
+        }
+        assess_recovery_target(target, &fresh_services, chrono::Utc::now(), max_age_seconds)
+    }
+
+    async fn request_recovery_advice(
+        &self,
+        target: &crate::config::RecoveryTargetConfig,
+        target_snapshot: &ServiceSnapshot,
+        assessment: &RecoveryAssessment,
+        continuum_preflight: &Value,
+    ) -> Option<Value> {
+        let gail_service = self
+            .repository
+            .list_service_snapshots()
+            .await
+            .ok()?
+            .into_iter()
+            .find(|service| service.service_key == "gail");
+        let gail_base_url = gail_service.as_ref().and_then(|service| {
+            service
+                .internal_url
+                .as_deref()
+                .or(service.public_url.as_deref())
+        });
+        let request = crate::models::WorkItem::from_new(crate::models::NewWorkItem {
+            dedupe_key: Some(format!("recovery-advisory:{}", recovery_target_id(target))),
+            title: format!("Review scoped recovery for {}", target.service_key),
+            summary: format!(
+                "Assess whether a single workload restart is reasonable for {}/{}, given the dependency graph, Prometheus down-target evidence, fresh health probes and Continuum host/deployment preflight. Approve only when the evidence supports this bounded action.",
+                target.namespace, target.deployment
+            ),
+            target_service: Some(target.service_key.clone()),
+            delivery_stage: Some(crate::models::DeliveryStage::Development),
+            validated_stages: Vec::new(),
+            rollout_strategy: Some(crate::models::RolloutStrategy::Canary),
+            status: Some(WorkStatus::Planned),
+            priority: Some(80),
+            progress_pct: Some(0),
+            admin_override: false,
+            execution_approved: false,
+            verification_required: Some(true),
+            tags: vec!["structured-recovery-review".to_string()],
+            plan: serde_json::json!({
+                "recovery_target": {
+                    "service_key": target.service_key,
+                    "namespace": target.namespace,
+                    "deployment": target.deployment,
+                },
+                "affected_services": assessment.affected_services,
+                "continuum_preflight": continuum_preflight,
+                "rules": [
+                    "This is advisory only; local fail-closed gates remain authoritative.",
+                    "Do not recommend host, node, cluster, or shared-infrastructure restart.",
+                    "If any evidence is stale, ambiguous, unhealthy, or incomplete, deny."
+                ]
+            }),
+            depends_on: assessment.affected_services.clone(),
+            source: Some("conductor_structured_recovery".to_string()),
+            scheduled_for: None,
+        });
+        let policy = evaluate_work_item(&self.config, &request, Some(target_snapshot));
+        if matches!(policy.verdict, crate::models::PolicyVerdict::Blocked) {
+            return None;
+        }
+        let decision = match request_ai_approval(
+            &self.http,
+            &self.config,
+            &request,
+            Some(target_snapshot),
+            &policy,
+            &[],
+            gail_base_url,
+        )
+        .await
+        {
+            Ok(Some(decision)) => decision,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(%error, service = %target.service_key, "Gail recovery advice unavailable; suppressing mutation");
+                return None;
+            }
+        };
+        if !decision.approved
+            || decision.confidence < self.config.policy.ai_approval_min_confidence
+            || !decision.required_actions.is_empty()
+        {
+            tracing::info!(
+                service = %target.service_key,
+                confidence = decision.confidence,
+                approved = decision.approved,
+                "Gail advice did not clear the bounded recovery review"
+            );
+            return None;
+        }
+        Some(serde_json::json!({
+            "approved": decision.approved,
+            "confidence": decision.confidence,
+            "risk_level": decision.risk_level,
+            "reason": decision.reason,
+            "provider": decision.provider,
+            "model": decision.model,
+            "request_id": decision.request_id,
+        }))
+    }
+
+    async fn probe_recovery_services(
+        &self,
+        services: &[ServiceSnapshot],
+        affected: &[String],
+        target_key: &str,
+        expect_degraded_target: bool,
+    ) -> Vec<String> {
+        let mut keys = affected.to_vec();
+        keys.extend(["prometheus".to_string(), "grafana".to_string()]);
+        keys.sort();
+        keys.dedup();
+        let mut blockers = Vec::new();
+        for key in keys {
+            let Some(snapshot) = services.iter().find(|service| service.service_key == key) else {
+                blockers.push(format!("service `{key}` disappeared during verification"));
+                continue;
+            };
+            match probe_service(&self.http, &self.config, snapshot).await {
+                Ok(probe) => {
+                    let expected = if key == target_key && expect_degraded_target {
+                        matches!(
+                            probe.health,
+                            crate::models::ServiceHealth::Degraded
+                                | crate::models::ServiceHealth::Unreachable
+                        )
+                    } else {
+                        probe.health == crate::models::ServiceHealth::Healthy
+                    };
+                    if !expected {
+                        blockers.push(format!(
+                            "fresh `{key}` probe returned `{}`",
+                            probe.health.as_str()
+                        ));
+                    }
+                    if key == "prometheus"
+                        && !expect_degraded_target
+                        && prometheus_reports_target_down(&probe.metrics, target_key)
+                    {
+                        blockers.push(format!(
+                            "Prometheus still reports `{target_key}` down after rollout"
+                        ));
+                    }
+                }
+                Err(error) => blockers.push(format!("fresh probe for `{key}` failed: {error}")),
+            }
+        }
+        blockers.sort();
+        blockers.dedup();
+        blockers
+    }
+
+    async fn persist_recovery_event(&self, event: ConductorEvent) -> Result<()> {
+        self.repository.insert_conductor_event(&event).await?;
+        let _ = self.events.send(event);
+        Ok(())
     }
 
     pub async fn run_planning_cycle(&self) -> Result<ImprovementCycle> {
@@ -2915,6 +3392,179 @@ fn traceability_graph_node_id(kind: &str, key: &str) -> String {
     format!("{}:{}", kind.trim(), key.trim())
 }
 
+fn recovery_target_id(target: &crate::config::RecoveryTargetConfig) -> String {
+    format!(
+        "{}:{}/{}",
+        target.service_key, target.namespace, target.deployment
+    )
+}
+
+fn recovery_target_id_from_payload(payload: &Value) -> Option<String> {
+    Some(format!(
+        "{}:{}/{}",
+        payload.get("service_key")?.as_str()?,
+        payload.get("namespace")?.as_str()?,
+        payload.get("deployment")?.as_str()?
+    ))
+}
+
+fn configured_target_for_event<'a>(
+    targets: &'a [crate::config::RecoveryTargetConfig],
+    payload: &Value,
+) -> Option<&'a crate::config::RecoveryTargetConfig> {
+    let id = recovery_target_id_from_payload(payload)?;
+    targets
+        .iter()
+        .find(|target| recovery_target_id(target) == id)
+}
+
+fn pending_recovery_actions(events: &[ConductorEvent]) -> Vec<&ConductorEvent> {
+    let terminal_ids = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "recovery.action_verified"
+                    | "recovery.action_failed"
+                    | "recovery.action_reconciled"
+            )
+        })
+        .filter_map(|event| event.payload.get("request_id")?.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    events
+        .iter()
+        .filter(|event| event.event_type == "recovery.action_started")
+        .filter(|event| {
+            event
+                .payload
+                .get("request_id")
+                .and_then(Value::as_str)
+                .is_some_and(|request_id| !terminal_ids.contains(request_id))
+        })
+        .collect()
+}
+
+fn recovery_cooldown_active(
+    events: &[ConductorEvent],
+    target: &crate::config::RecoveryTargetConfig,
+    cooldown_seconds: u64,
+) -> bool {
+    let now = chrono::Utc::now();
+    events.iter().any(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "recovery.action_started" | "recovery.advisory_blocked"
+        ) && recovery_target_id_from_payload(&event.payload).as_deref()
+            == Some(recovery_target_id(target).as_str())
+            && (now - event.created_at).num_seconds() >= 0
+            && (now - event.created_at).num_seconds() < cooldown_seconds as i64
+    })
+}
+
+fn recovery_dry_run_recent(
+    events: &[ConductorEvent],
+    target: &crate::config::RecoveryTargetConfig,
+    interval_seconds: u64,
+) -> bool {
+    let now = chrono::Utc::now();
+    let target_id = recovery_target_id(target);
+    events.iter().any(|event| {
+        event.event_type == "recovery.dry_run"
+            && recovery_target_id_from_payload(&event.payload).as_deref() == Some(&target_id)
+            && (now - event.created_at).num_seconds() >= 0
+            && (now - event.created_at).num_seconds() < interval_seconds as i64
+    })
+}
+
+fn recovery_request_id(
+    target: &crate::config::RecoveryTargetConfig,
+    cooldown_seconds: u64,
+) -> String {
+    let slot = chrono::Utc::now().timestamp().max(0) as u64 / cooldown_seconds.max(1);
+    let digest = Sha256::digest(format!("{}:{slot}", recovery_target_id(target)).as_bytes());
+    let short_hash = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("recovery-{short_hash}")
+}
+
+fn recovery_status_data(payload: &Value) -> Option<&Value> {
+    if payload.get("success").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    payload.get("data").filter(|data| data.is_object())
+}
+
+fn prometheus_reports_target_down(metrics: &Value, target_key: &str) -> bool {
+    metrics
+        .pointer("/targets/jobs")
+        .and_then(Value::as_array)
+        .is_some_and(|jobs| {
+            jobs.iter().any(|job| {
+                job.get("service_key").and_then(Value::as_str) == Some(target_key)
+                    && job
+                        .get("down_targets")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|count| count > 0)
+            })
+        })
+}
+
+fn recovery_started_event(
+    target: &crate::config::RecoveryTargetConfig,
+    request_id: &str,
+    assessment: &RecoveryAssessment,
+    preflight: &Value,
+    gail_advice: &Value,
+) -> ConductorEvent {
+    let mut event = ConductorEvent::new(
+        "recovery.action_started",
+        "Dependency and live infrastructure gates passed; a workload-only recovery was submitted to Continuum.",
+        json!({
+            "service_key": target.service_key,
+            "namespace": target.namespace,
+            "deployment": target.deployment,
+            "request_id": request_id,
+            "affected_services": assessment.affected_services,
+            "continuum_preflight": preflight,
+            "gail_advice": gail_advice,
+        }),
+    );
+    event.status = Some("pending_verification".to_string());
+    event
+}
+
+fn recovery_terminal_event(
+    event_type: &str,
+    message: &str,
+    target: &crate::config::RecoveryTargetConfig,
+    request_id: &str,
+    affected_services: &[String],
+    blockers: Vec<String>,
+) -> ConductorEvent {
+    let mut event = ConductorEvent::new(
+        event_type,
+        message,
+        json!({
+            "service_key": target.service_key,
+            "namespace": target.namespace,
+            "deployment": target.deployment,
+            "request_id": request_id,
+            "affected_services": affected_services,
+            "blockers": blockers,
+        }),
+    );
+    event.status = Some(if event_type == "recovery.action_verified" {
+        "verified".to_string()
+    } else if event_type == "recovery.action_failed" {
+        "failed".to_string()
+    } else {
+        "reconciled_without_mutation".to_string()
+    });
+    event
+}
+
 fn persist_conductor_event_async(repository: Arc<dyn ConductorRepository>, event: ConductorEvent) {
     tokio::spawn(async move {
         let mut delay_ms = 25u64;
@@ -3094,6 +3744,23 @@ pub fn spawn_background_loops(service: ConductorService) {
     );
     let maintenance_interval =
         Duration::from_secs(service.config.storage.maintenance_interval_seconds.max(300));
+
+    if service.config.recovery.enabled {
+        let recovery_service = service.clone();
+        let recovery_interval =
+            Duration::from_secs(service.config.recovery.interval_seconds.max(15));
+        tokio::spawn(async move {
+            // Let initial service discovery populate the dependency graph before
+            // the first recovery assessment.
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            loop {
+                if let Err(error) = recovery_service.run_recovery_cycle().await {
+                    tracing::warn!(error = %error, "structured recovery cycle failed");
+                }
+                tokio::time::sleep(recovery_interval).await;
+            }
+        });
+    }
 
     // One scheduler owns discovery, planning, and approval so those control
     // plane stages cannot race. Execution has its own loop below: Refiner jobs
@@ -5451,6 +6118,65 @@ mod tests {
     use std::{fs, sync::Arc};
     use tempfile::tempdir;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn recovery_defaults_are_non_mutating_and_request_ids_are_scoped() {
+        let config = ConductorConfig::default();
+        assert!(!config.recovery.enabled);
+        assert!(config.recovery.dry_run);
+        assert!(config.recovery.targets.is_empty());
+
+        let target = crate::config::RecoveryTargetConfig {
+            service_key: "api".to_string(),
+            namespace: "apps".to_string(),
+            deployment: "api".to_string(),
+        };
+        let request_id = recovery_request_id(&target, 1_800);
+        assert_eq!(request_id.len(), 41);
+        assert!(request_id.starts_with("recovery-"));
+        assert!(
+            request_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        );
+    }
+
+    #[test]
+    fn recovery_pending_intent_closes_only_on_a_terminal_event() {
+        let target = crate::config::RecoveryTargetConfig {
+            service_key: "api".to_string(),
+            namespace: "apps".to_string(),
+            deployment: "api".to_string(),
+        };
+        let start = recovery_started_event(
+            &target,
+            "recovery-request-0001",
+            &RecoveryAssessment {
+                service_key: "api".to_string(),
+                namespace: "apps".to_string(),
+                deployment: "api".to_string(),
+                affected_services: vec!["api".to_string()],
+                blockers: Vec::new(),
+                eligible: true,
+            },
+            &json!({"eligible": true}),
+            &json!({"approved": true}),
+        );
+        assert_eq!(
+            pending_recovery_actions(std::slice::from_ref(&start)).len(),
+            1
+        );
+
+        let terminal = recovery_terminal_event(
+            "recovery.action_verified",
+            "verified",
+            &target,
+            "recovery-request-0001",
+            &["api".to_string()],
+            Vec::new(),
+        );
+        assert!(pending_recovery_actions(&[start, terminal]).is_empty());
+    }
 
     async fn spawn_mock_refiner() -> (String, tokio::task::JoinHandle<()>) {
         async fn health() -> Json<Value> {

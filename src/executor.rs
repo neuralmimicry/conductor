@@ -23,6 +23,7 @@ use crate::{
         WorkStatus,
     },
     policy::{evaluate_work_item_with_repositories, policy_evaluation_to_value},
+    recovery::deployment_dependency_blockers,
     repository::ConductorRepository,
     validation::{failure_reasons, preview_independent_validation, run_independent_validation},
 };
@@ -404,7 +405,30 @@ async fn dispatch_claimed_work_item_inner(
     initial_execution: Option<WorkExecution>,
 ) -> Result<WorkExecution> {
     let work_items = repository.list_work_items().await?;
-    let dependency_blockers = dependency_blockers(item, &work_items);
+    let services = repository.list_service_snapshots().await?;
+    let target_service = item.target_service.as_deref().and_then(|target| {
+        services
+            .iter()
+            .find(|service| service.service_key == target)
+    });
+    let mut dependency_blockers = dependency_blockers(item, &work_items);
+    if item.delivery_stage.requires_live_readiness() {
+        if let Some(target_key) = item.target_service.as_deref() {
+            dependency_blockers.extend(deployment_dependency_blockers(
+                target_key,
+                &services,
+                crate::models::now_utc(),
+                config.recovery.max_snapshot_age_seconds,
+            ));
+        } else {
+            dependency_blockers.push(
+                "live deployment has no explicit target service in the current dependency graph"
+                    .to_string(),
+            );
+        }
+    }
+    dependency_blockers.sort();
+    dependency_blockers.dedup();
     if !dependency_blockers.is_empty() {
         let message = format!(
             "execution blocked by dependency graph: {}",
@@ -452,13 +476,7 @@ async fn dispatch_claimed_work_item_inner(
         return Ok(execution);
     }
 
-    let services = repository.list_service_snapshots().await?;
-    let target_service = item.target_service.as_deref().and_then(|target| {
-        services
-            .iter()
-            .find(|service| service.service_key == target)
-    });
-    if let Some(evidence) = healthy_service_revalidation(&item, target_service) {
+    if let Some(evidence) = healthy_service_revalidation(item, target_service) {
         let mut execution = initial_execution.unwrap_or_else(|| {
             WorkExecution::new(
                 item.id,
@@ -5300,8 +5318,20 @@ mod tests {
         });
 
         repository.upsert_work_item(&item).await.expect("item");
+        let mut conductor = sample_service();
+        conductor.hosts = vec!["qc01".to_string()];
+        let mut prometheus = sample_service();
+        prometheus.service_key = "prometheus".to_string();
+        prometheus.display_name = "Prometheus".to_string();
+        prometheus.role_name = "continuum_tenant_prometheus".to_string();
+        prometheus.hosts = vec!["qc01".to_string()];
+        let mut grafana = sample_service();
+        grafana.service_key = "grafana".to_string();
+        grafana.display_name = "Grafana".to_string();
+        grafana.role_name = "continuum_tenant_grafana".to_string();
+        grafana.hosts = vec!["qc01".to_string()];
         repository
-            .replace_service_snapshots(&[sample_service()])
+            .replace_service_snapshots(&[conductor, prometheus, grafana])
             .await
             .expect("services");
 

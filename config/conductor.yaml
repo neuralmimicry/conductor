@@ -189,3 +189,16 @@ safety:
   health_check_window_seconds: 30
   health_check_interval_seconds: 5
   max_rollback_attempts: 1
+
+# Workload recovery is deliberately disabled until an exact target is reviewed
+# and Continuum preflight plus post-rollout functional checks are available.
+recovery:
+  enabled: false
+  dry_run: true
+  interval_seconds: 60
+  max_actions_per_cycle: 1
+  cooldown_seconds: 1800
+  max_snapshot_age_seconds: 300
+  rollout_timeout_seconds: 300
+  poll_interval_seconds: 5
+  targets: []

@@ -44,6 +44,9 @@ pub struct ConductorConfig {
     /// own-organisation repositories.  Keeping this separate from ordinary
     /// policy makes the rollout controls visible and independently tunable.
     pub safety: SafetyConfig,
+    /// Optional workload recovery coordinated through NMC Continuum.
+    /// Disabled by default and requires explicit per-deployment targets.
+    pub recovery: RecoveryConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -279,6 +282,27 @@ pub struct SafetyConfig {
     pub max_rollback_attempts: u8,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecoveryConfig {
+    pub enabled: bool,
+    pub dry_run: bool,
+    pub interval_seconds: u64,
+    pub max_actions_per_cycle: usize,
+    pub cooldown_seconds: u64,
+    pub max_snapshot_age_seconds: u64,
+    pub rollout_timeout_seconds: u64,
+    pub poll_interval_seconds: u64,
+    pub targets: Vec<RecoveryTargetConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecoveryTargetConfig {
+    pub service_key: String,
+    pub namespace: String,
+    pub deployment: String,
+}
+
 impl Default for ConductorConfig {
     fn default() -> Self {
         Self {
@@ -295,6 +319,7 @@ impl Default for ConductorConfig {
             execution: ExecutionConfig::default(),
             policy: PolicyConfig::default(),
             safety: SafetyConfig::default(),
+            recovery: RecoveryConfig::default(),
         }
     }
 }
@@ -571,6 +596,22 @@ impl Default for SafetyConfig {
     }
 }
 
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dry_run: true,
+            interval_seconds: 60,
+            max_actions_per_cycle: 1,
+            cooldown_seconds: 1_800,
+            max_snapshot_age_seconds: 300,
+            rollout_timeout_seconds: 300,
+            poll_interval_seconds: 5,
+            targets: Vec::new(),
+        }
+    }
+}
+
 impl ConductorConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
@@ -772,6 +813,31 @@ impl ConductorConfig {
             .health_check_interval_seconds
             .clamp(1, self.safety.health_check_window_seconds);
         self.safety.max_rollback_attempts = self.safety.max_rollback_attempts.clamp(1, 3);
+        self.recovery.interval_seconds = self.recovery.interval_seconds.clamp(15, 3_600);
+        self.recovery.max_actions_per_cycle = self.recovery.max_actions_per_cycle.clamp(1, 3);
+        self.recovery.cooldown_seconds = self.recovery.cooldown_seconds.clamp(60, 86_400);
+        self.recovery.max_snapshot_age_seconds =
+            self.recovery.max_snapshot_age_seconds.clamp(30, 900);
+        self.recovery.rollout_timeout_seconds =
+            self.recovery.rollout_timeout_seconds.clamp(15, 900);
+        self.recovery.poll_interval_seconds = self
+            .recovery
+            .poll_interval_seconds
+            .clamp(1, self.recovery.rollout_timeout_seconds);
+        let mut recovery_targets = std::collections::BTreeSet::new();
+        self.recovery.targets.retain_mut(|target| {
+            target.service_key = target.service_key.trim().to_ascii_lowercase();
+            target.namespace = target.namespace.trim().to_ascii_lowercase();
+            target.deployment = target.deployment.trim().to_ascii_lowercase();
+            !target.service_key.is_empty()
+                && !target.namespace.is_empty()
+                && !target.deployment.is_empty()
+                && recovery_targets.insert((
+                    target.service_key.clone(),
+                    target.namespace.clone(),
+                    target.deployment.clone(),
+                ))
+        });
         normalize_unique_strings(&mut self.policy.protected_services);
         for mandatory in ["conductor", "refiner", "gail", "aarnn", "aarnn_rust"] {
             if !self
