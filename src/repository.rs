@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use crate::models::{
     ConductorEvent, DiscoveryRun, FindingEvidence, FindingProvenance, FindingRecord,
     ImprovementCycle, RepositorySnapshot, ServiceMetricSample, ServiceSnapshot, TraceabilityLink,
-    WorkExecution, WorkItem, WorkItemPatch,
+    WorkExecution, WorkItem, WorkItemListFilter, WorkItemListPage, WorkItemPatch,
 };
 
 #[async_trait]
@@ -56,6 +56,10 @@ pub trait ConductorRepository: Send + Sync {
 
     async fn upsert_work_item(&self, item: &WorkItem) -> anyhow::Result<()>;
     async fn list_work_items(&self) -> anyhow::Result<Vec<WorkItem>>;
+    async fn list_work_items_page(
+        &self,
+        filter: &WorkItemListFilter,
+    ) -> anyhow::Result<WorkItemListPage>;
     async fn get_work_item(&self, id: uuid::Uuid) -> anyhow::Result<Option<WorkItem>>;
     async fn patch_work_item(
         &self,

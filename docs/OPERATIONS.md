@@ -209,7 +209,7 @@ curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
   http://127.0.0.1:8091/api/v1/services | jq '.services[] | {service_key, deployment_environment, health}'
 
 curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
-  http://127.0.0.1:8091/api/v1/work-items | jq '.work_items[] | {title, delivery_stage, rollout_strategy, validated_stages, status}'
+  'http://127.0.0.1:8091/api/v1/work-items?limit=100&offset=0' | jq '.work_items[] | {title, delivery_stage, rollout_strategy, validated_stages, status}'
 
 curl -s -H "authorization: Bearer ${CONDUCTOR_ADMIN_TOKEN}" \
   http://127.0.0.1:8091/api/v1/work-items/${WORK_ITEM_ID}/traceability | jq '.traceability | {work_item: .work_item.title, finding: .finding.finding_key, independent_validation: .independent_validation}'

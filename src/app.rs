@@ -21,7 +21,8 @@ use crate::{
     error::{ApiError, ApiResult},
     models::{
         ConfluencePageLinkRequest, JiraIssueLinkRequest, NewTraceabilityLink, NewWorkItem,
-        TraceabilitySyncRequest, WorkExecution, WorkItem, WorkItemPatch,
+        TraceabilitySyncRequest, WorkExecution, WorkItem, WorkItemListFilter, WorkItemPatch,
+        WorkStatus,
     },
     service::ConductorService,
 };
@@ -29,6 +30,15 @@ use crate::{
 #[derive(Debug, Default, Deserialize)]
 pub struct LimitQuery {
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct WorkItemsQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub status: Option<WorkStatus>,
+    pub target_service: Option<String>,
+    pub search: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -233,11 +243,61 @@ async fn get_traceability_graph(
 async fn list_work_items(
     State(service): State<ConductorService>,
     headers: HeaderMap,
+    Query(query): Query<WorkItemsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     service.authorize_read(&headers)?;
-    Ok(Json(
-        serde_json::json!({"work_items": service.work_items().await?}),
-    ))
+    let limit = query.limit.unwrap_or(100);
+    let offset = query.offset.unwrap_or(0);
+    if limit == 0 {
+        return Err(ApiError::bad_request("limit must be at least 1"));
+    }
+    if offset > 1_000_000 {
+        return Err(ApiError::bad_request("offset must not exceed 1000000"));
+    }
+    let target_service = query
+        .target_service
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if target_service
+        .as_ref()
+        .is_some_and(|value| value.len() > 128)
+    {
+        return Err(ApiError::bad_request(
+            "target_service must not exceed 128 bytes",
+        ));
+    }
+    let search = query
+        .search
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if search
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > 200)
+    {
+        return Err(ApiError::bad_request(
+            "search must not exceed 200 characters",
+        ));
+    }
+    let limit = limit.min(500);
+    let page = service
+        .repository
+        .list_work_items_page(&WorkItemListFilter {
+            status: query.status,
+            target_service,
+            search,
+            limit,
+            offset,
+        })
+        .await?;
+    Ok(Json(serde_json::json!({
+        "work_items": page.items,
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+            "total": page.total,
+            "has_more": offset.saturating_add(limit) < page.total,
+        }
+    })))
 }
 
 async fn get_work_item(
@@ -1176,6 +1236,82 @@ mod tests {
             payload.get("title").and_then(serde_json::Value::as_str),
             Some("Probe")
         );
+    }
+
+    #[tokio::test]
+    async fn work_items_endpoint_filters_and_returns_a_bounded_page() {
+        let service = test_service();
+        for (title, status, target_service) in [
+            ("Solver one", WorkStatus::Planned, Some("refiner")),
+            ("Solver two", WorkStatus::Planned, Some("refiner")),
+            ("Solver three", WorkStatus::Planned, Some("refiner")),
+            ("Other work", WorkStatus::Planned, Some("conductor")),
+            ("Completed solver", WorkStatus::Success, Some("refiner")),
+        ] {
+            let item = WorkItem::from_new(NewWorkItem {
+                dedupe_key: None,
+                title: title.to_string(),
+                summary: "Pagination test item".to_string(),
+                target_service: target_service.map(str::to_string),
+                delivery_stage: None,
+                validated_stages: vec![],
+                rollout_strategy: None,
+                status: Some(status),
+                priority: None,
+                progress_pct: None,
+                admin_override: false,
+                execution_approved: false,
+                verification_required: None,
+                tags: vec![],
+                plan: json!({}),
+                depends_on: vec![],
+                source: None,
+                scheduled_for: None,
+            });
+            service
+                .repository
+                .upsert_work_item(&item)
+                .await
+                .expect("seed work item");
+        }
+
+        let response = build_router(service)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/work-items?limit=1&offset=1&status=planned&target_service=refiner&search=solver")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(payload["pagination"]["limit"], 1);
+        assert_eq!(payload["pagination"]["offset"], 1);
+        assert_eq!(payload["pagination"]["total"], 3);
+        assert_eq!(payload["pagination"]["has_more"], true);
+        let items = payload["work_items"].as_array().expect("work item page");
+        assert_eq!(items.len(), 1);
+        assert!(items[0]["title"].as_str().unwrap().contains("Solver"));
+    }
+
+    #[tokio::test]
+    async fn work_items_endpoint_rejects_zero_limit() {
+        let response = build_router(test_service())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/work-items?limit=0")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
