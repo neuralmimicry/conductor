@@ -126,8 +126,11 @@ pub fn evaluate_work_item(
     }
 
     let action_text = format!(
-        "{} {} {}",
-        work_item.title, work_item.summary, work_item.plan
+        "{} {} {} {}",
+        work_item.title,
+        work_item.summary,
+        work_item.tags.join(" "),
+        work_item.plan
     )
     .to_ascii_lowercase();
     if let Some(keyword) = config

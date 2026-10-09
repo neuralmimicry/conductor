@@ -24,6 +24,7 @@ use crate::{
         TraceabilitySyncRequest, WorkExecution, WorkItem, WorkItemListFilter, WorkItemPatch,
         WorkStatus,
     },
+    policy::{evaluate_work_item_with_repositories, policy_evaluation_to_value},
     service::ConductorService,
 };
 
@@ -86,6 +87,10 @@ pub fn build_router(service: ConductorService) -> Router {
         .route(
             "/api/v1/work-items/{id}/executions",
             get(list_work_item_executions),
+        )
+        .route(
+            "/api/v1/work-items/{id}/policy-preview",
+            get(preview_work_item_policy),
         )
         .route(
             "/api/v1/work-items/{id}/links",
@@ -311,6 +316,33 @@ async fn get_work_item(
         .await?
         .ok_or_else(|| ApiError::not_found(format!("work item {} not found", id)))?;
     Ok(Json(item))
+}
+
+async fn preview_work_item_policy(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    service.authorize_read(&headers)?;
+    let item = service
+        .work_item(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("work item {} not found", id)))?;
+    let services = service.services().await?;
+    let repositories = service.repositories().await?;
+    let target_service = item.target_service.as_deref().and_then(|target| {
+        services
+            .iter()
+            .find(|candidate| candidate.service_key == target)
+    });
+    let evaluation =
+        evaluate_work_item_with_repositories(&service.config, &item, target_service, &repositories);
+
+    Ok(Json(json!({
+        "work_item_id": id,
+        "read_only": true,
+        "policy": policy_evaluation_to_value(&evaluation),
+    })))
 }
 
 async fn create_work_item(
@@ -644,8 +676,8 @@ mod tests {
         WorkExecution, WorkItem, now_utc,
     };
     use crate::{
-        config::ConductorConfig, integrations::build_http_client, service::ConductorService,
-        storage::memory::MemoryRepository,
+        config::ConductorConfig, integrations::build_http_client, repository::ConductorRepository,
+        service::ConductorService, storage::memory::MemoryRepository,
     };
     use serde_json::json;
 
@@ -1235,6 +1267,85 @@ mod tests {
         assert_eq!(
             payload.get("title").and_then(serde_json::Value::as_str),
             Some("Probe")
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_procurement_policy_preview_is_blocked_and_read_only() {
+        let mut config = ConductorConfig::default();
+        config.security.admin_token = Some("secret".to_string());
+        config.security.allow_dashboard_without_token = false;
+        let repository = std::sync::Arc::new(MemoryRepository::new());
+        let service = ConductorService::new(
+            config,
+            repository.clone(),
+            build_http_client(2).expect("client"),
+        );
+        let item = WorkItem::from_new(NewWorkItem {
+            dedupe_key: Some("manual-procurement:policy-preview".to_string()),
+            title: "Review supplier request".to_string(),
+            summary: "A manually reviewed purchase request".to_string(),
+            target_service: Some("refiner".to_string()),
+            delivery_stage: None,
+            validated_stages: vec![],
+            rollout_strategy: None,
+            status: Some(WorkStatus::Planned),
+            priority: None,
+            progress_pct: None,
+            admin_override: false,
+            execution_approved: false,
+            verification_required: None,
+            tags: vec!["manual-procurement".to_string()],
+            plan: json!({"action": "review supplier request"}),
+            depends_on: vec![],
+            source: None,
+            scheduled_for: None,
+        });
+        repository
+            .upsert_work_item(&item)
+            .await
+            .expect("seed manual procurement item");
+
+        let response = build_router(service)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/work-items/{}/policy-preview", item.id))
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(payload["read_only"], true);
+        assert_eq!(payload["policy"]["verdict"], "blocked");
+        assert!(
+            payload["policy"]["reasons"]
+                .as_array()
+                .expect("policy reasons")
+                .iter()
+                .any(|reason| reason.as_str().is_some_and(
+                    |value| value.contains("blocked action keyword 'manual-procurement'")
+                ))
+        );
+
+        let persisted = repository
+            .get_work_item(item.id)
+            .await
+            .expect("read persisted work item")
+            .expect("work item remains present");
+        assert!(!persisted.execution_approved);
+        assert_eq!(persisted.last_policy, json!({}));
+        assert!(
+            repository
+                .list_work_executions_for_item(item.id, 10)
+                .await
+                .expect("read executions")
+                .is_empty()
         );
     }
 

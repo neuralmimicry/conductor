@@ -273,6 +273,7 @@
         <input id="work-items-search-filter" type="search" placeholder="Search title or summary" aria-label="Search work items" />
         <button class="secondary" id="work-items-apply-filter">Apply filters</button>
       </div>
+      <div id="policy-preview" class="detail-card muted" aria-live="polite">Policy preview is read-only. Select it on a work item to evaluate the current rules without approving or executing the item.</div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Work</th><th>Status</th><th>Stage</th><th>Rollout</th><th>Priority</th><th>Progress</th><th>Schedule</th><th>Target</th><th>Execution</th><th>Admin</th></tr></thead>
@@ -324,6 +325,7 @@
 const state = {
   token: localStorage.getItem('conductor_admin_token') || '',
   selectedWorkItemId: localStorage.getItem('conductor_selected_work_item') || '',
+  policyPreview: null,
   workItemsOffset: 0,
   workItemsPageSize: 100,
   servicesCache: null,
@@ -345,6 +347,7 @@ let loadQueued = false;
 const els = {
   token: document.getElementById('token'), saveToken: document.getElementById('save-token'), clearToken: document.getElementById('clear-token'),
   authStatus: document.getElementById('auth-status'), summaryCards: document.getElementById('summary-cards'), workItems: document.getElementById('work-items'),
+  policyPreview: document.getElementById('policy-preview'),
   eventStatus: document.getElementById('event-status'), services: document.getElementById('services'), cycles: document.getElementById('cycles'), refresh: document.getElementById('refresh'),
   runDiscovery: document.getElementById('run-discovery'), runPlanning: document.getElementById('run-planning'), runExecution: document.getElementById('run-execution'),
   traceabilityDetail: document.getElementById('traceability-detail'), externalReferenceSummary: document.getElementById('external-reference-summary'),
@@ -526,7 +529,7 @@ function renderWorkItems(items, pagination = { limit: state.workItemsPageSize, o
   const statuses = ['planned', 'scheduled', 'in_operation', 'success', 'failure', 'aborted', 'on_hold'];
   const stages = ['development', 'testing', 'integration', 'integration_testing', 'uat', 'production'];
   const rolloutStrategies = ['direct', 'canary', 'red_green'];
-  els.workItems.innerHTML = items.map((item) => `<tr class="${state.selectedWorkItemId === item.id ? 'selected-row' : ''}"><td><strong>${item.title}</strong><br><div class="muted">${item.summary}</div><div>${(item.tags || []).map((tag) => `<span class="pill">${tag}</span>`).join('')}</div><div>${(item.validated_stages || []).map((stage) => `<span class="pill">${stage}</span>`).join('') || '<span class="muted">no validated stages yet</span>'}</div>${(item.depends_on || []).length ? `<div class="muted mono">depends_on: ${(item.depends_on || []).join(', ')}</div>` : ''}</td><td><select data-field="status" data-id="${item.id}">${statuses.map((status) => `<option value="${status}" ${status === item.status ? 'selected' : ''}>${status}</option>`).join('')}</select></td><td><div class="stack"><select data-field="delivery_stage" data-id="${item.id}">${stages.map((stage) => `<option value="${stage}" ${stage === item.delivery_stage ? 'selected' : ''}>${stage}</option>`).join('')}</select><div class="muted">validated ${(item.validated_stages || []).length}/${stages.length}</div></div></td><td><select data-field="rollout_strategy" data-id="${item.id}">${rolloutStrategies.map((strategy) => `<option value="${strategy}" ${strategy === item.rollout_strategy ? 'selected' : ''}>${strategy}</option>`).join('')}</select></td><td><input type="number" data-field="priority" data-id="${item.id}" value="${item.priority}" /></td><td><input type="number" data-field="progress_pct" data-id="${item.id}" min="0" max="100" value="${item.progress_pct}" /></td><td><input type="datetime-local" data-field="scheduled_for" data-id="${item.id}" value="${toDateTimeLocal(item.scheduled_for)}" /></td><td>${item.target_service || '<span class="muted">none</span>'}</td><td><div class="row-actions"><label><input type="checkbox" data-field="execution_approved" data-id="${item.id}" ${item.execution_approved ? 'checked' : ''} /> execution approved</label><label><input type="checkbox" data-field="verification_required" data-id="${item.id}" ${item.verification_required ? 'checked' : ''} /> verification required</label><input data-field="depends_on" data-id="${item.id}" value="${(item.depends_on || []).join(', ')}" placeholder="comma-separated dependency ids or dedupe keys" />${item.last_execution_id ? `<div class="muted mono">last execution: ${item.last_execution_id}</div>` : '<div class="muted">no execution yet</div>'}<button class="secondary" data-action="execute" data-id="${item.id}">Execute</button><button class="secondary" data-action="traceability" data-id="${item.id}">${state.selectedWorkItemId === item.id ? 'Selected' : 'Traceability'}</button></div></td><td><div class="row-actions"><label><input type="checkbox" data-field="admin_override" data-id="${item.id}" ${item.admin_override ? 'checked' : ''} /> admin override</label><textarea data-field="note" data-id="${item.id}" placeholder="append note"></textarea><button class="secondary" data-action="save" data-id="${item.id}">Save</button></div></td></tr>`).join('');
+  els.workItems.innerHTML = items.map((item) => `<tr class="${state.selectedWorkItemId === item.id ? 'selected-row' : ''}"><td><strong>${item.title}</strong><br><div class="muted">${item.summary}</div><div>${(item.tags || []).map((tag) => `<span class="pill">${tag}</span>`).join('')}</div><div>${(item.validated_stages || []).map((stage) => `<span class="pill">${stage}</span>`).join('') || '<span class="muted">no validated stages yet</span>'}</div>${(item.depends_on || []).length ? `<div class="muted mono">depends_on: ${(item.depends_on || []).join(', ')}</div>` : ''}</td><td><select data-field="status" data-id="${item.id}">${statuses.map((status) => `<option value="${status}" ${status === item.status ? 'selected' : ''}>${status}</option>`).join('')}</select></td><td><div class="stack"><select data-field="delivery_stage" data-id="${item.id}">${stages.map((stage) => `<option value="${stage}" ${stage === item.delivery_stage ? 'selected' : ''}>${stage}</option>`).join('')}</select><div class="muted">validated ${(item.validated_stages || []).length}/${stages.length}</div></div></td><td><select data-field="rollout_strategy" data-id="${item.id}">${rolloutStrategies.map((strategy) => `<option value="${strategy}" ${strategy === item.rollout_strategy ? 'selected' : ''}>${strategy}</option>`).join('')}</select></td><td><input type="number" data-field="priority" data-id="${item.id}" value="${item.priority}" /></td><td><input type="number" data-field="progress_pct" data-id="${item.id}" min="0" max="100" value="${item.progress_pct}" /></td><td><input type="datetime-local" data-field="scheduled_for" data-id="${item.id}" value="${toDateTimeLocal(item.scheduled_for)}" /></td><td>${item.target_service || '<span class="muted">none</span>'}</td><td><div class="row-actions"><label><input type="checkbox" data-field="execution_approved" data-id="${item.id}" ${item.execution_approved ? 'checked' : ''} /> execution approved</label><label><input type="checkbox" data-field="verification_required" data-id="${item.id}" ${item.verification_required ? 'checked' : ''} /> verification required</label><input data-field="depends_on" data-id="${item.id}" value="${(item.depends_on || []).join(', ')}" placeholder="comma-separated dependency ids or dedupe keys" />${item.last_execution_id ? `<div class="muted mono">last execution: ${item.last_execution_id}</div>` : '<div class="muted">no execution yet</div>'}<button class="secondary" data-action="policy-preview" data-id="${item.id}">Policy preview</button><button class="secondary" data-action="execute" data-id="${item.id}">Execute</button><button class="secondary" data-action="traceability" data-id="${item.id}">${state.selectedWorkItemId === item.id ? 'Selected' : 'Traceability'}</button></div></td><td><div class="row-actions"><label><input type="checkbox" data-field="admin_override" data-id="${item.id}" ${item.admin_override ? 'checked' : ''} /> admin override</label><textarea data-field="note" data-id="${item.id}" placeholder="append note"></textarea><button class="secondary" data-action="save" data-id="${item.id}">Save</button></div></td></tr>`).join('');
   const total = Number(pagination.total || 0);
   const start = total === 0 ? 0 : Number(pagination.offset || 0) + 1;
   const end = Math.min(Number(pagination.offset || 0) + items.length, total);
@@ -560,6 +563,16 @@ function renderWorkItems(items, pagination = { limit: state.workItemsPageSize, o
         await fetchJson(`/api/v1/work-items/${button.dataset.id}/execute`, { method: 'POST', body: JSON.stringify({ force_schedule: true }) });
         await load();
       } catch (error) { updateAuthBadge(error.message); }
+    });
+  });
+  els.workItems.querySelectorAll('button[data-action="policy-preview"]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      try {
+        state.policyPreview = await fetchJson(`/api/v1/work-items/${button.dataset.id}/policy-preview`);
+        renderPolicyPreview(state.policyPreview);
+      } catch (error) {
+        renderPolicyPreview(null, error.message);
+      }
     });
   });
   els.workItems.querySelectorAll('button[data-action="traceability"]').forEach((button) => {
@@ -627,6 +640,16 @@ function renderTraceability(traceability, errorMessage) {
     </div>
   `;
   setTraceabilityActionState(true);
+}
+function renderPolicyPreview(preview, errorMessage) {
+  els.policyPreview.replaceChildren();
+  const heading = document.createElement('strong');
+  heading.textContent = errorMessage ? 'Policy preview unavailable' : `Read-only policy preview · ${preview?.policy?.verdict || 'not evaluated'}`;
+  els.policyPreview.append(heading);
+  const detail = document.createElement('pre');
+  detail.className = 'mono';
+  detail.textContent = errorMessage || (preview ? JSON.stringify(preview.policy, null, 2) : 'Select Policy preview on a work item to evaluate current rules without approving or executing it.');
+  els.policyPreview.append(detail);
 }
 async function runSelectedTraceabilityAction(path, body) {
   if (!state.selectedWorkItemId) return;
