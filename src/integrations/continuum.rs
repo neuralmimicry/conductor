@@ -81,6 +81,49 @@ impl ContinuumClient {
         self.get_json("/health").await
     }
 
+    pub async fn deployment_recovery_status(
+        &self,
+        namespace: &str,
+        deployment: &str,
+    ) -> Result<Value> {
+        let mut request = self
+            .client
+            .get(format!("{}/k8s/deployment/recovery-status", self.base_url))
+            .query(&[("namespace", namespace), ("deployment", deployment)]);
+        if let Some(token) = self
+            .bearer_token
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            request = request.bearer_auth(token);
+        }
+        super::decode_json(request.send().await?).await
+    }
+
+    pub async fn restart_deployment(
+        &self,
+        namespace: &str,
+        deployment: &str,
+        request_id: &str,
+    ) -> Result<Value> {
+        let mut request = self
+            .client
+            .post(format!("{}/k8s/deployment/restart", self.base_url))
+            .json(&serde_json::json!({
+                "namespace": namespace,
+                "deployment": deployment,
+                "request_id": request_id,
+            }));
+        if let Some(token) = self
+            .bearer_token
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            request = request.bearer_auth(token);
+        }
+        super::decode_json(request.send().await?).await
+    }
+
     pub async fn tracey_agents(&self) -> Result<Value> {
         self.get_json("/tracey/agents").await
     }
@@ -252,7 +295,11 @@ fn payload_looks_like_continuum_health(payload: &Value) -> bool {
 mod tests {
     use super::*;
     use crate::{config::ExternalServiceConfig, models::ServiceHealth};
-    use axum::{Json, Router, routing::get};
+    use axum::{
+        Json, Router,
+        extract::Query,
+        routing::{get, post},
+    };
     use serde_json::json;
     use tokio::net::TcpListener;
 
@@ -305,6 +352,39 @@ mod tests {
         (format!("http://{}", addr), handle)
     }
 
+    async fn spawn_mock_recovery_api() -> (String, tokio::task::JoinHandle<()>) {
+        async fn status(
+            Query(query): Query<std::collections::HashMap<String, String>>,
+        ) -> Json<Value> {
+            Json(json!({
+                "success": true,
+                "data": {
+                    "namespace": query.get("namespace"),
+                    "deployment": query.get("deployment"),
+                    "eligible": false,
+                    "blockers": [{"code": "test_block", "detail": "safe suppression"}],
+                }
+            }))
+        }
+        async fn restart(Json(body): Json<Value>) -> Json<Value> {
+            Json(json!({"success": true, "data": body}))
+        }
+
+        let app = Router::new()
+            .route("/k8s/deployment/recovery-status", get(status))
+            .route("/k8s/deployment/restart", post(restart));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind recovery API");
+        let addr = listener.local_addr().expect("recovery API local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock recovery API");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
     #[test]
     fn candidate_base_urls_add_monitoring_prefix_for_public_edge() {
         let mut config = ExternalServiceConfig::default();
@@ -339,6 +419,36 @@ mod tests {
             .expect("select live base");
 
         assert_eq!(selected.as_deref(), Some(base_url.as_str()));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn recovery_status_is_read_only_and_restart_uses_explicit_scope_and_id() {
+        let (base_url, handle) = spawn_mock_recovery_api().await;
+        let client = ContinuumClient {
+            client: super::super::build_http_client(2).expect("http client"),
+            base_url,
+            bearer_token: Some("continuum-token".to_string()),
+        };
+
+        let status = client
+            .deployment_recovery_status("apps", "api")
+            .await
+            .expect("read-only preflight");
+        assert_eq!(status["data"]["namespace"], json!("apps"));
+        assert_eq!(status["data"]["deployment"], json!("api"));
+        assert_eq!(status["data"]["eligible"], json!(false));
+
+        let restarted = client
+            .restart_deployment("apps", "api", "recovery-request-0001")
+            .await
+            .expect("scoped restart request");
+        assert_eq!(restarted["data"]["namespace"], json!("apps"));
+        assert_eq!(restarted["data"]["deployment"], json!("api"));
+        assert_eq!(
+            restarted["data"]["request_id"],
+            json!("recovery-request-0001")
+        );
         handle.abort();
     }
 }
