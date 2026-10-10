@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
+use chrono::{DateTime, Utc};
 use futures::future;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,7 @@ use sqlx::{Connection, Row, postgres::PgConnection};
 
 use crate::{
     config::{
-        ConductorConfig, ExternalServiceConfig, PostgresIntegrationConfig,
+        ConductorConfig, ExternalServiceConfig, PostgresIntegrationConfig, RecoveryTargetConfig,
         SharedStorageIntegrationConfig,
     },
     host_resources::node_snapshots_from_api,
@@ -78,6 +79,13 @@ struct PrometheusJobSummary {
     down_targets: usize,
     healthy_targets: usize,
     last_errors: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrometheusDeploymentObservation {
+    pub desired_replicas: u32,
+    pub available_replicas: u32,
+    pub observed_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug)]
@@ -920,7 +928,7 @@ async fn probe_grafana(
                 return Err(anyhow!("invalid Grafana health payload"));
             }
 
-            let (datasources, dashboards) = tokio::join!(
+            let (datasources, dashboards, alerts) = tokio::join!(
                 get_json_with_auth(client, &base_url, "/api/datasources", external),
                 get_json_with_auth_query(
                     client,
@@ -929,9 +937,17 @@ async fn probe_grafana(
                     &[("type", "dash-db"), ("limit", "1000")],
                     external,
                 ),
+                get_json_with_auth(
+                    client,
+                    &base_url,
+                    "/api/alertmanager/grafana/api/v2/alerts",
+                    external,
+                ),
             );
             let datasource_access = grafana_access_state(&datasources);
             let dashboard_access = grafana_access_state(&dashboards);
+            let alert_access = grafana_access_state(&alerts);
+            let (firing_alert_count, firing_alerts) = summarize_grafana_firing_alerts(&alerts);
             let coverage_known =
                 datasource_access == "authorized" && dashboard_access == "authorized";
             let coverage_access_limited = [datasource_access, dashboard_access]
@@ -1004,8 +1020,8 @@ async fn probe_grafana(
             Ok(ProbeResult {
                 endpoint: Some(base_url.clone()),
                 summary: format!(
-                    "Grafana health retrieved; {} with {} datasource(s) and {} dashboard(s)",
-                    coverage_summary, datasource_count, dashboard_count
+                    "Grafana health retrieved; {} with {} datasource(s), {} dashboard(s), and {} visible firing alert(s)",
+                    coverage_summary, datasource_count, dashboard_count, firing_alert_count
                 ),
                 metrics: json!({
                     "health": health,
@@ -1016,6 +1032,9 @@ async fn probe_grafana(
                     "dashboard_access": dashboard_access,
                     "coverage_known": coverage_known,
                     "coverage_access_limited": coverage_access_limited,
+                    "alerts_access": alert_access,
+                    "firing_alert_count": firing_alert_count,
+                    "firing_alerts": firing_alerts,
                     "datasources": datasource_sample,
                     "dashboards": dashboard_sample,
                 }),
@@ -1058,6 +1077,257 @@ fn grafana_access_state(result: &Result<Value>) -> &'static str {
         }
         Err(_) => "unavailable",
     }
+}
+
+fn summarize_grafana_firing_alerts(result: &Result<Value>) -> (usize, Vec<Value>) {
+    let Some(payload) = result.as_ref().ok() else {
+        return (0, Vec::new());
+    };
+    let alerts = payload
+        .as_array()
+        .or_else(|| payload.get("alerts").and_then(Value::as_array));
+    let Some(alerts) = alerts else {
+        return (0, Vec::new());
+    };
+    let firing = alerts
+        .iter()
+        .filter_map(|alert| {
+            let state = alert
+                .get("status")
+                .and_then(|status| status.get("state").or(Some(status)))
+                .and_then(Value::as_str)
+                .or_else(|| alert.get("state").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if !matches!(state.as_str(), "active" | "firing") {
+                return None;
+            }
+            let labels = alert.get("labels").and_then(Value::as_object);
+            let selected = [
+                "alertname",
+                "namespace",
+                "deployment",
+                "service",
+                "cluster",
+                "severity",
+            ]
+            .into_iter()
+            .filter_map(|key| {
+                labels
+                    .and_then(|labels| labels.get(key))
+                    .and_then(Value::as_str)
+                    .map(|value| (key, value))
+            })
+            .map(|(key, value)| (key.to_string(), json!(value)))
+            .collect::<serde_json::Map<String, Value>>();
+            Some(Value::Object(selected))
+        })
+        .collect::<Vec<_>>();
+    let count = firing.len();
+    (count, firing.into_iter().take(50).collect())
+}
+
+/// Read the desired and available replicas for one explicitly configured
+/// Kubernetes deployment. The query is assembled from validated labels (never
+/// arbitrary PromQL), and ambiguous, missing, stale, or future samples fail
+/// closed.
+pub async fn query_recovery_deployment_metrics(
+    client: &Client,
+    config: &ConductorConfig,
+    prometheus_service: Option<&ServiceSnapshot>,
+    target: &RecoveryTargetConfig,
+) -> Result<PrometheusDeploymentObservation> {
+    let external = &config.integrations.prometheus;
+    if !external.enabled {
+        return Err(anyhow!("Prometheus integration is disabled"));
+    }
+    let candidates = if let Some(service) = prometheus_service {
+        base_url_candidates(service, external)
+    } else {
+        external
+            .base_url
+            .as_deref()
+            .map(|value| vec![value.trim_end_matches('/').to_string()])
+            .unwrap_or_default()
+    };
+    if candidates.is_empty() {
+        return Err(anyhow!(
+            "no Prometheus base URL available for recovery metrics"
+        ));
+    }
+
+    let selector = prometheus_recovery_selector(target)?;
+    let desired_query = format!("kube_deployment_spec_replicas{selector}");
+    let available_query = format!("kube_deployment_status_replicas_available{selector}");
+    let desired_params = [("query", desired_query.as_str())];
+    let available_params = [("query", available_query.as_str())];
+    let mut attempts = Vec::new();
+    for base_url in candidates {
+        let (desired_response, available_response) = tokio::join!(
+            get_json_with_auth_query(
+                client,
+                &base_url,
+                "/api/v1/query",
+                &desired_params,
+                external,
+            ),
+            get_json_with_auth_query(
+                client,
+                &base_url,
+                "/api/v1/query",
+                &available_params,
+                external,
+            ),
+        );
+        let result = (|| -> Result<PrometheusDeploymentObservation> {
+            let desired = exact_prometheus_scalar(
+                &desired_response?,
+                "/api/v1/query desired replicas",
+                target,
+            )?;
+            let available = exact_prometheus_scalar(
+                &available_response?,
+                "/api/v1/query available replicas",
+                target,
+            )?;
+            let now = Utc::now();
+            let maximum_age =
+                chrono::Duration::seconds(config.recovery.max_metric_age_seconds as i64);
+            for (_, timestamp) in [&desired, &available] {
+                if *timestamp > now + chrono::Duration::seconds(5)
+                    || now.signed_duration_since(*timestamp) > maximum_age
+                {
+                    return Err(anyhow!(
+                        "Prometheus recovery metric is stale or future-dated"
+                    ));
+                }
+            }
+            if (desired.1 - available.1).num_seconds().unsigned_abs() > 30 {
+                return Err(anyhow!(
+                    "Prometheus replica metrics are not from a coherent sample window"
+                ));
+            }
+            if desired.0 < 1.0
+                || desired.0.fract() != 0.0
+                || available.0 < 0.0
+                || available.0.fract() != 0.0
+                || desired.0 > u32::MAX as f64
+                || available.0 > u32::MAX as f64
+            {
+                return Err(anyhow!(
+                    "Prometheus replica metrics are outside valid bounds"
+                ));
+            }
+            Ok(PrometheusDeploymentObservation {
+                desired_replicas: desired.0 as u32,
+                available_replicas: available.0 as u32,
+                observed_at: std::cmp::min(desired.1, available.1),
+            })
+        })();
+        match result {
+            Ok(observation) => return Ok(observation),
+            Err(error) => attempts.push(format!("{base_url}: {error}")),
+        }
+    }
+    Err(anyhow!(
+        "could not establish unambiguous fresh Prometheus recovery evidence ({})",
+        attempts.join("; ")
+    ))
+}
+
+fn prometheus_recovery_selector(target: &RecoveryTargetConfig) -> Result<String> {
+    if !target.prometheus_labels.iter().any(|(key, value)| {
+        matches!(
+            key.as_str(),
+            "cluster" | "cluster_id" | "cluster_name" | "kubernetes_cluster"
+        ) && value == &target.cluster_id
+    }) {
+        return Err(anyhow!(
+            "Prometheus recovery selector must identify the configured Continuum cluster"
+        ));
+    }
+    let mut labels = BTreeMap::new();
+    labels.insert("deployment".to_string(), target.deployment.as_str());
+    labels.insert("namespace".to_string(), target.namespace.as_str());
+    for (key, value) in &target.prometheus_labels {
+        if key == "namespace" || key == "deployment" || key == "__name__" {
+            return Err(anyhow!(
+                "Prometheus recovery labels cannot override reserved selectors"
+            ));
+        }
+        labels.insert(key.clone(), value.as_str());
+    }
+    let formatted = labels
+        .into_iter()
+        .map(|(key, value)| format!("{key}=\"{}\"", escape_prometheus_label_value(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!("{{{formatted}}}"))
+}
+
+fn escape_prometheus_label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn exact_prometheus_scalar(
+    payload: &Value,
+    path: &str,
+    target: &RecoveryTargetConfig,
+) -> Result<(f64, DateTime<Utc>)> {
+    let data = prometheus_payload_data(payload, path)?;
+    if data.get("resultType").and_then(Value::as_str) != Some("vector") {
+        return Err(anyhow!(
+            "Prometheus recovery result is not an instant vector"
+        ));
+    }
+    let results = data
+        .get("result")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Prometheus recovery result has no series"))?;
+    if results.len() != 1 {
+        return Err(anyhow!(
+            "Prometheus recovery result is missing or ambiguous"
+        ));
+    }
+    let series = &results[0];
+    let labels = series
+        .get("metric")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("Prometheus recovery series is missing labels"))?;
+    if labels.get("namespace").and_then(Value::as_str) != Some(target.namespace.as_str())
+        || labels.get("deployment").and_then(Value::as_str) != Some(target.deployment.as_str())
+        || target
+            .prometheus_labels
+            .iter()
+            .any(|(key, value)| labels.get(key).and_then(Value::as_str) != Some(value.as_str()))
+    {
+        return Err(anyhow!(
+            "Prometheus recovery series labels do not match the allowlisted target"
+        ));
+    }
+    let pair = series
+        .get("value")
+        .and_then(Value::as_array)
+        .filter(|value| value.len() == 2)
+        .ok_or_else(|| anyhow!("Prometheus recovery series has no scalar sample"))?;
+    let timestamp = pair[0]
+        .as_f64()
+        .or_else(|| pair[0].as_str().and_then(|value| value.parse::<f64>().ok()))
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or_else(|| anyhow!("Prometheus recovery series has an invalid timestamp"))?;
+    let value = pair[1]
+        .as_f64()
+        .or_else(|| pair[1].as_str().and_then(|value| value.parse::<f64>().ok()))
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| anyhow!("Prometheus recovery series has an invalid value"))?;
+    let whole_seconds = timestamp.floor() as i64;
+    let nanos = ((timestamp.fract() * 1_000_000_000.0).round() as u32).min(999_999_999);
+    let observed_at = DateTime::from_timestamp(whole_seconds, nanos)
+        .ok_or_else(|| anyhow!("Prometheus recovery timestamp is out of range"))?;
+    Ok((value, observed_at))
 }
 
 async fn probe_prometheus(
@@ -2041,6 +2311,63 @@ mod tests {
         (format!("http://{}", addr), handle)
     }
 
+    async fn spawn_mock_recovery_prometheus() -> (String, tokio::task::JoinHandle<()>) {
+        async fn query(
+            headers: HeaderMap,
+            Query(params): Query<BTreeMap<String, String>>,
+        ) -> Response {
+            if headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                != Some("Bearer recovery-secret")
+            {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"error": "unauthorized"})),
+                )
+                    .into_response();
+            }
+            let query = params.get("query").cloned().unwrap_or_default();
+            if !query.contains("namespace=\"gail\"")
+                || !query.contains("deployment=\"gail\"")
+                || !query.contains("cluster=\"sm00\"")
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "unexpected selector"})),
+                )
+                    .into_response();
+            }
+            let value = if query.starts_with("kube_deployment_spec_replicas") {
+                "3"
+            } else {
+                "2"
+            };
+            Json(json!({
+                "status": "success",
+                "data": {
+                    "resultType": "vector",
+                    "result": [{
+                        "metric": {"namespace": "gail", "deployment": "gail", "cluster": "sm00"},
+                        "value": [chrono::Utc::now().timestamp().to_string(), value]
+                    }]
+                }
+            }))
+            .into_response()
+        }
+        let app = Router::new().route("/api/v1/query", get(query));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind prometheus mock");
+        let addr = listener.local_addr().expect("prometheus mock addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve prometheus mock");
+        });
+        (format!("http://{}", addr), handle)
+    }
+
     fn sample_refiner_service(base_url: String) -> ServiceSnapshot {
         ServiceSnapshot {
             service_key: "refiner".to_string(),
@@ -2168,6 +2495,59 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn recovery_metrics_require_authenticated_exact_fresh_target_series() {
+        let (base_url, handle) = spawn_mock_recovery_prometheus().await;
+        let mut config = ConductorConfig::default();
+        config.integrations.prometheus.enabled = true;
+        config.integrations.prometheus.base_url = Some(base_url);
+        config.integrations.prometheus.bearer_token = Some("recovery-secret".to_string());
+        config.recovery.max_metric_age_seconds = 90;
+        let target = RecoveryTargetConfig {
+            service_key: "gail".to_string(),
+            cluster_id: "sm00".to_string(),
+            namespace: "gail".to_string(),
+            deployment: "gail".to_string(),
+            prometheus_labels: BTreeMap::from([("cluster".to_string(), "sm00".to_string())]),
+        };
+
+        let observation = query_recovery_deployment_metrics(
+            &build_http_client(5).expect("client"),
+            &config,
+            None,
+            &target,
+        )
+        .await
+        .expect("fresh recovery observation");
+        assert_eq!(observation.desired_replicas, 3);
+        assert_eq!(observation.available_replicas, 2);
+
+        handle.abort();
+    }
+
+    #[test]
+    fn recovery_metric_parser_rejects_ambiguous_series() {
+        let target = RecoveryTargetConfig {
+            service_key: "gail".to_string(),
+            cluster_id: "spirit".to_string(),
+            namespace: "gail".to_string(),
+            deployment: "gail".to_string(),
+            prometheus_labels: BTreeMap::new(),
+        };
+        let payload = json!({
+            "status": "success",
+            "data": {
+                "resultType": "vector",
+                "result": [
+                    {"metric": {"namespace": "gail", "deployment": "gail"}, "value": [chrono::Utc::now().timestamp(), "2"]},
+                    {"metric": {"namespace": "gail", "deployment": "gail", "cluster": "other"}, "value": [chrono::Utc::now().timestamp(), "2"]}
+                ]
+            }
+        });
+
+        assert!(exact_prometheus_scalar(&payload, "test", &target).is_err());
     }
 
     #[tokio::test]

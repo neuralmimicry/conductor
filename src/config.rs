@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -291,6 +292,14 @@ pub struct RecoveryConfig {
     pub max_actions_per_cycle: usize,
     pub cooldown_seconds: u64,
     pub max_snapshot_age_seconds: u64,
+    /// Maximum age for the two directly queried Prometheus replica samples.
+    pub max_metric_age_seconds: u64,
+    /// Require repeated under-replication observations across this window.
+    pub minimum_bad_samples: usize,
+    pub minimum_observation_window_seconds: u64,
+    pub max_actions_per_target_24h: usize,
+    pub max_actions_global_per_hour: usize,
+    pub minimum_gail_confidence: f64,
     pub rollout_timeout_seconds: u64,
     pub poll_interval_seconds: u64,
     pub targets: Vec<RecoveryTargetConfig>,
@@ -304,6 +313,9 @@ pub struct RecoveryTargetConfig {
     pub cluster_id: String,
     pub namespace: String,
     pub deployment: String,
+    /// Exact extra Prometheus labels, such as `cluster`, for this workload.
+    #[serde(default)]
+    pub prometheus_labels: BTreeMap<String, String>,
 }
 
 impl Default for ConductorConfig {
@@ -607,8 +619,14 @@ impl Default for RecoveryConfig {
             dry_run: true,
             interval_seconds: 60,
             max_actions_per_cycle: 1,
-            cooldown_seconds: 1_800,
+            cooldown_seconds: 3_600,
             max_snapshot_age_seconds: 300,
+            max_metric_age_seconds: 90,
+            minimum_bad_samples: 3,
+            minimum_observation_window_seconds: 300,
+            max_actions_per_target_24h: 1,
+            max_actions_global_per_hour: 2,
+            minimum_gail_confidence: 0.85,
             rollout_timeout_seconds: 300,
             poll_interval_seconds: 5,
             targets: Vec::new(),
@@ -822,6 +840,26 @@ impl ConductorConfig {
         self.recovery.cooldown_seconds = self.recovery.cooldown_seconds.clamp(60, 86_400);
         self.recovery.max_snapshot_age_seconds =
             self.recovery.max_snapshot_age_seconds.clamp(30, 900);
+        self.recovery.max_metric_age_seconds = self.recovery.max_metric_age_seconds.clamp(15, 900);
+        self.recovery.minimum_bad_samples = self.recovery.minimum_bad_samples.clamp(2, 12);
+        self.recovery.minimum_observation_window_seconds = self
+            .recovery
+            .minimum_observation_window_seconds
+            .clamp(30, 3_600);
+        self.recovery.max_actions_per_target_24h =
+            self.recovery.max_actions_per_target_24h.clamp(1, 3);
+        self.recovery.max_actions_global_per_hour =
+            self.recovery.max_actions_global_per_hour.clamp(1, 10);
+        if !self.recovery.minimum_gail_confidence.is_finite() {
+            self.recovery.minimum_gail_confidence = 0.85;
+        }
+        self.recovery.minimum_gail_confidence =
+            self.recovery.minimum_gail_confidence.clamp(0.5, 1.0);
+        if self.recovery.targets.len() > 64 {
+            return Err(anyhow!(
+                "recovery.targets may contain at most 64 deployments"
+            ));
+        }
         self.recovery.rollout_timeout_seconds =
             self.recovery.rollout_timeout_seconds.clamp(15, 900);
         self.recovery.poll_interval_seconds = self
@@ -850,6 +888,35 @@ impl ConductorConfig {
             )) {
                 return Err(anyhow!(
                     "recovery targets must not repeat the same cluster_id, namespace and deployment"
+                ));
+            }
+            if target.prometheus_labels.len() > 16 {
+                return Err(anyhow!(
+                    "recovery target may have at most 16 Prometheus label selectors"
+                ));
+            }
+            for (key, value) in &target.prometheus_labels {
+                if !valid_prometheus_label_name(key)
+                    || key == "namespace"
+                    || key == "deployment"
+                    || key == "__name__"
+                    || value.is_empty()
+                    || value.len() > 128
+                    || !value.chars().all(|ch| ch.is_ascii_graphic() || ch == ' ')
+                {
+                    return Err(anyhow!(
+                        "recovery target has an invalid Prometheus label selector"
+                    ));
+                }
+            }
+            if !target.prometheus_labels.iter().any(|(key, value)| {
+                matches!(
+                    key.as_str(),
+                    "cluster" | "cluster_id" | "cluster_name" | "kubernetes_cluster"
+                ) && value == &target.cluster_id
+            }) {
+                return Err(anyhow!(
+                    "recovery target Prometheus labels must identify its Continuum cluster"
                 ));
             }
         }
@@ -916,6 +983,16 @@ fn valid_kubernetes_dns_label(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn valid_prometheus_label_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_')
+        && !value.starts_with("__")
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn normalize_external_service(config: &mut ExternalServiceConfig) {
@@ -1010,6 +1087,7 @@ mod recovery_config_tests {
             cluster_id: String::new(),
             namespace: "apps".to_string(),
             deployment: "api".to_string(),
+            prometheus_labels: BTreeMap::new(),
         });
         assert!(missing_cluster.normalize().is_err());
 
@@ -1019,10 +1097,37 @@ mod recovery_config_tests {
             cluster_id: "Spirit".to_string(),
             namespace: "Apps".to_string(),
             deployment: "API".to_string(),
+            prometheus_labels: BTreeMap::from([("cluster".to_string(), "spirit".to_string())]),
         });
         valid.normalize().expect("valid recovery target");
         assert_eq!(valid.recovery.targets[0].cluster_id, "spirit");
         assert_eq!(valid.recovery.targets[0].namespace, "apps");
         assert_eq!(valid.recovery.targets[0].deployment, "api");
+    }
+
+    #[test]
+    fn recovery_prometheus_labels_are_bounded_and_cannot_override_target_scope() {
+        let mut valid = ConductorConfig::default();
+        valid.recovery.targets.push(RecoveryTargetConfig {
+            service_key: "api".to_string(),
+            cluster_id: "spirit".to_string(),
+            namespace: "apps".to_string(),
+            deployment: "api".to_string(),
+            prometheus_labels: BTreeMap::from([("cluster".to_string(), "spirit".to_string())]),
+        });
+        valid.normalize().expect("valid Prometheus label selector");
+
+        let mut reserved = ConductorConfig::default();
+        reserved.recovery.targets.push(RecoveryTargetConfig {
+            service_key: "api".to_string(),
+            cluster_id: "spirit".to_string(),
+            namespace: "apps".to_string(),
+            deployment: "api".to_string(),
+            prometheus_labels: BTreeMap::from([(
+                "namespace".to_string(),
+                "other-namespace".to_string(),
+            )]),
+        });
+        assert!(reserved.normalize().is_err());
     }
 }

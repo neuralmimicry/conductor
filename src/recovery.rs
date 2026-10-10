@@ -348,6 +348,7 @@ mod tests {
             cluster_id: "spirit".to_string(),
             namespace: "apps".to_string(),
             deployment: "api".to_string(),
+            prometheus_labels: BTreeMap::new(),
         }
     }
 

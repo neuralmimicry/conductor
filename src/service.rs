@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -29,7 +29,7 @@ use crate::{
     host_resources::reconcile_service_host_resources,
     integrations::{
         atlassian::AtlassianClients, continuum::ContinuumClient, probe_service,
-        refiner::RefinerClient, tracey::TraceyClient,
+        query_recovery_deployment_metrics, refiner::RefinerClient, tracey::TraceyClient,
     },
     metrics::{
         record_approval_cycle, record_claimed_work_items, record_discovery_cycle,
@@ -40,10 +40,10 @@ use crate::{
         ConductorEvent, ConfluencePageLinkRequest, DashboardSummary, DeliveryStage, DiscoveryRun,
         DoraMetricsSummary, ExternalLinkOperationResult, FindingEvidence, FindingProvenance,
         FindingRecord, ImprovementCycle, JiraIssueLinkRequest, NewTraceabilityLink,
-        RepositorySnapshot, ServiceSnapshot, TraceabilityGraph, TraceabilityGraphEdge,
-        TraceabilityGraphNode, TraceabilityLink, TraceabilitySyncRequest, TraceabilitySyncResult,
-        WorkExecution, WorkItem, WorkItemTraceability, WorkStatus, now_utc, topology_from_services,
-        unique_strings,
+        RepositorySnapshot, ServiceMetricSample, ServiceSnapshot, TraceabilityGraph,
+        TraceabilityGraphEdge, TraceabilityGraphNode, TraceabilityLink, TraceabilitySyncRequest,
+        TraceabilitySyncResult, WorkExecution, WorkItem, WorkItemTraceability, WorkStatus, now_utc,
+        topology_from_services, unique_strings,
     },
     planner::run_planning_cycle,
     policy::{
@@ -207,6 +207,17 @@ impl ConductorService {
         }
 
         let mut services = self.repository.list_service_snapshots().await?;
+        let discovery_run_id = self
+            .repository
+            .list_discovery_runs(1)
+            .await?
+            .into_iter()
+            .next()
+            .map(|run| run.id);
+        let Some(discovery_run_id) = discovery_run_id else {
+            tracing::warn!("recovery is disabled until a completed discovery run exists");
+            return Ok(0);
+        };
         let continuum_service = services
             .iter()
             .find(|service| service.service_key == "continuum");
@@ -214,7 +225,13 @@ impl ConductorService {
             ContinuumClient::from_sources(&self.config.integrations.continuum, continuum_service)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Continuum recovery integration is disabled"))?;
-        let events = self.repository.list_conductor_events(1_000).await?;
+        let events = self.repository.list_conductor_events(5_000).await?;
+        let event_history_complete = events.len() < 5_000;
+        if !event_history_complete {
+            tracing::warn!(
+                "recovery will reconcile pending actions but schedule no new actions because event history reached its safety limit"
+            );
+        }
         let pending = pending_recovery_actions(&events);
         let resumed_requests = events
             .iter()
@@ -360,6 +377,10 @@ impl ConductorService {
             }
         }
 
+        if !event_history_complete {
+            return Ok(actions);
+        }
+
         for target in &policy.targets {
             if actions >= policy.max_actions_per_cycle {
                 break;
@@ -371,11 +392,76 @@ impl ConductorService {
             if recovery_cooldown_active(&events, target, policy.cooldown_seconds) {
                 continue;
             }
+            let now = now_utc();
+            let target_id = recovery_target_id(target);
+            let global_actions_last_hour = recovery_action_count(&events, None, now, 3_600);
+            let target_actions_last_day =
+                recovery_action_count(&events, Some(&target_id), now, 86_400);
+            if global_actions_last_hour >= policy.max_actions_global_per_hour
+                || target_actions_last_day >= policy.max_actions_per_target_24h
+            {
+                continue;
+            }
 
             let assessment = self
                 .live_recovery_assessment(target, &services, policy.max_snapshot_age_seconds)
                 .await;
             if !assessment.eligible {
+                continue;
+            }
+            let Some(prometheus_service) = services
+                .iter()
+                .find(|service| service.service_key == "prometheus")
+            else {
+                continue;
+            };
+            let observation = match query_recovery_deployment_metrics(
+                &self.http,
+                &self.config,
+                Some(prometheus_service),
+                target,
+            )
+            .await
+            {
+                Ok(observation) => observation,
+                Err(error) => {
+                    tracing::warn!(%error, target = %target_id, "direct Prometheus recovery evidence was unavailable");
+                    continue;
+                }
+            };
+            let unhealthy = observation.available_replicas < observation.desired_replicas;
+            let replica_observation = serde_json::json!({
+                "desired_replicas": observation.desired_replicas,
+                "available_replicas": observation.available_replicas,
+                "prometheus_observed_at": observation.observed_at,
+                "unhealthy": unhealthy,
+            });
+            let sample_key = format!("recovery-target:{target_id}");
+            let sample = ServiceMetricSample {
+                id: Uuid::new_v4(),
+                discovery_run_id,
+                service_key: sample_key.clone(),
+                metric_source: "prometheus_recovery".to_string(),
+                metrics: serde_json::json!({
+                    "target_id": target_id.clone(),
+                    "desired_replicas": replica_observation["desired_replicas"],
+                    "available_replicas": replica_observation["available_replicas"],
+                    "prometheus_observed_at": replica_observation["prometheus_observed_at"],
+                    "unhealthy": replica_observation["unhealthy"],
+                }),
+                sampled_at: now_utc(),
+            };
+            self.repository
+                .insert_service_metric_samples(&[sample])
+                .await?;
+            let samples = self
+                .repository
+                .list_service_metric_samples(
+                    Some(&sample_key),
+                    recovery_signal_history_limit(policy),
+                )
+                .await?;
+            if !confirmed_recovery_signal(&samples, policy, now_utc()) {
                 continue;
             }
             let status = match continuum
@@ -411,6 +497,7 @@ impl ConductorService {
                             "deployment": target.deployment,
                             "affected_services": assessment.affected_services,
                             "continuum_preflight": data,
+                            "prometheus_replica_observation": replica_observation,
                         }),
                     );
                     event.status = Some("dry_run".to_string());
@@ -426,7 +513,13 @@ impl ConductorService {
                 continue;
             };
             let Some(gail_advice) = self
-                .request_recovery_advice(target, target_snapshot, &assessment, data)
+                .request_recovery_advice(
+                    target,
+                    target_snapshot,
+                    &assessment,
+                    &replica_observation,
+                    data,
+                )
                 .await
             else {
                 // Gail may veto or be unavailable, but can never waive local
@@ -448,8 +541,9 @@ impl ConductorService {
             };
 
             let request_id = recovery_request_id(target, policy.cooldown_seconds);
-            let start_event =
+            let mut start_event =
                 recovery_started_event(target, &request_id, &assessment, data, &gail_advice);
+            start_event.payload["prometheus_replica_observation"] = replica_observation;
             // Durable intent must succeed before the external mutation.
             self.persist_recovery_event(start_event).await?;
             match continuum
@@ -539,6 +633,7 @@ impl ConductorService {
         target: &crate::config::RecoveryTargetConfig,
         target_snapshot: &ServiceSnapshot,
         assessment: &RecoveryAssessment,
+        replica_observation: &Value,
         continuum_preflight: &Value,
     ) -> Option<Value> {
         let gail_service = self
@@ -580,6 +675,7 @@ impl ConductorService {
                     "deployment": target.deployment,
                 },
                 "affected_services": assessment.affected_services,
+                "prometheus_replica_observation": replica_observation,
                 "continuum_preflight": continuum_preflight,
                 "rules": [
                     "This is advisory only; local fail-closed gates remain authoritative.",
@@ -614,7 +710,12 @@ impl ConductorService {
             }
         };
         if !decision.approved
-            || decision.confidence < self.config.policy.ai_approval_min_confidence
+            || decision.confidence
+                < self
+                    .config
+                    .policy
+                    .ai_approval_min_confidence
+                    .max(self.config.recovery.minimum_gail_confidence)
             || !decision.required_actions.is_empty()
         {
             tracing::info!(
@@ -3484,6 +3585,105 @@ fn recovery_cooldown_active(
     })
 }
 
+fn recovery_action_count(
+    events: &[ConductorEvent],
+    target_id: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+    window_seconds: u64,
+) -> usize {
+    let mut requests = BTreeSet::new();
+    for event in events
+        .iter()
+        .filter(|event| event.event_type == "recovery.action_started")
+    {
+        let age = now.signed_duration_since(event.created_at).num_seconds();
+        if age < 0 || age >= window_seconds.min(i64::MAX as u64) as i64 {
+            continue;
+        }
+        if target_id.is_some_and(|expected| {
+            recovery_target_id_from_payload(&event.payload).as_deref() != Some(expected)
+        }) {
+            continue;
+        }
+        let request_id = event
+            .payload
+            .get("request_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| event.id.to_string());
+        requests.insert(request_id);
+    }
+    requests.len()
+}
+
+fn recovery_signal_sample_limit(config: &crate::config::RecoveryConfig) -> usize {
+    let interval = config.interval_seconds.max(15);
+    let window_samples = config
+        .minimum_observation_window_seconds
+        .saturating_add(interval - 1)
+        / interval
+        + 1;
+    config
+        .minimum_bad_samples
+        .max(window_samples as usize)
+        .clamp(1, 256)
+}
+
+fn recovery_signal_history_limit(config: &crate::config::RecoveryConfig) -> usize {
+    recovery_signal_sample_limit(config)
+        .saturating_mul(4)
+        .clamp(1, 1_024)
+}
+
+fn confirmed_recovery_signal(
+    samples: &[ServiceMetricSample],
+    config: &crate::config::RecoveryConfig,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let mut seen = BTreeSet::new();
+    let mut recent = samples
+        .iter()
+        .filter(|sample| sample.metric_source == "prometheus_recovery")
+        .filter_map(|sample| {
+            let observed_at = sample
+                .metrics
+                .get("prometheus_observed_at")
+                .and_then(Value::as_str)
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&chrono::Utc))?;
+            if !seen.insert(observed_at) {
+                return None;
+            }
+            let unhealthy = sample.metrics.get("unhealthy").and_then(Value::as_bool)?;
+            Some((observed_at, unhealthy))
+        })
+        .collect::<Vec<_>>();
+    recent.sort_by(|left, right| right.0.cmp(&left.0));
+    let required_samples = config
+        .minimum_bad_samples
+        .max(recovery_signal_sample_limit(config));
+    if recent.len() < required_samples {
+        return false;
+    }
+    recent.truncate(required_samples);
+    if recent.iter().any(|(_, unhealthy)| !unhealthy) {
+        return false;
+    }
+
+    let newest = recent[0].0;
+    let oldest = recent[recent.len() - 1].0;
+    let newest_age = now.signed_duration_since(newest).num_seconds();
+    if newest_age < 0 || newest_age > config.max_metric_age_seconds as i64 {
+        return false;
+    }
+    let allowed_gap = ChronoDuration::seconds((config.interval_seconds.max(15) * 2) as i64);
+    newest.signed_duration_since(oldest).num_seconds()
+        >= config.minimum_observation_window_seconds as i64
+        && recent.windows(2).all(|pair| {
+            pair[0].0.signed_duration_since(pair[1].0).num_seconds() <= allowed_gap.num_seconds()
+        })
+}
+
 fn recovery_dry_run_recent(
     events: &[ConductorEvent],
     target: &crate::config::RecoveryTargetConfig,
@@ -6156,6 +6356,7 @@ mod tests {
             cluster_id: "spirit".to_string(),
             namespace: "apps".to_string(),
             deployment: "api".to_string(),
+            prometheus_labels: BTreeMap::new(),
         };
         let request_id = recovery_request_id(&target, 1_800);
         assert_eq!(request_id.len(), 41);
@@ -6174,6 +6375,100 @@ mod tests {
         );
     }
 
+    fn recovery_metric_sample(
+        observed_at: chrono::DateTime<chrono::Utc>,
+        unhealthy: bool,
+    ) -> ServiceMetricSample {
+        ServiceMetricSample {
+            id: Uuid::new_v4(),
+            discovery_run_id: Uuid::new_v4(),
+            service_key: "recovery-target:api:spirit:apps/api".to_string(),
+            metric_source: "prometheus_recovery".to_string(),
+            metrics: json!({
+                "prometheus_observed_at": observed_at,
+                "unhealthy": unhealthy,
+            }),
+            sampled_at: observed_at,
+        }
+    }
+
+    #[test]
+    fn recovery_requires_distinct_bad_samples_across_the_configured_window() {
+        let config = ConductorConfig::default().recovery;
+        let now = now_utc();
+        let three_samples = vec![
+            recovery_metric_sample(now - ChronoDuration::seconds(150), true),
+            recovery_metric_sample(now - ChronoDuration::seconds(90), true),
+            recovery_metric_sample(now - ChronoDuration::seconds(30), true),
+        ];
+        assert!(!confirmed_recovery_signal(&three_samples, &config, now));
+
+        let six_samples = (0..6)
+            .map(|index| {
+                recovery_metric_sample(now - ChronoDuration::seconds(330 - index * 60), true)
+            })
+            .collect::<Vec<_>>();
+        assert!(confirmed_recovery_signal(&six_samples, &config, now));
+
+        let mut duplicate_observation = six_samples[..5].to_vec();
+        duplicate_observation.push(recovery_metric_sample(
+            now - ChronoDuration::seconds(90),
+            true,
+        ));
+        assert!(!confirmed_recovery_signal(
+            &duplicate_observation,
+            &config,
+            now
+        ));
+
+        let mut reset_by_healthy_sample = six_samples;
+        reset_by_healthy_sample[5].metrics["unhealthy"] = json!(false);
+        assert!(!confirmed_recovery_signal(
+            &reset_by_healthy_sample,
+            &config,
+            now
+        ));
+    }
+
+    #[test]
+    fn recovery_rate_limits_count_unique_durable_requests_by_scope() {
+        let now = now_utc();
+        let mut first = ConductorEvent::new(
+            "recovery.action_started",
+            "started",
+            json!({
+                "service_key": "api",
+                "cluster_id": "spirit",
+                "namespace": "apps",
+                "deployment": "api",
+                "request_id": "recovery-1",
+            }),
+        );
+        first.created_at = now - ChronoDuration::minutes(10);
+        let mut duplicate = first.clone();
+        duplicate.id = Uuid::new_v4();
+        duplicate.created_at = now - ChronoDuration::minutes(9);
+        let mut other = ConductorEvent::new(
+            "recovery.action_started",
+            "started",
+            json!({
+                "service_key": "worker",
+                "cluster_id": "sm00",
+                "namespace": "apps",
+                "deployment": "worker",
+                "request_id": "recovery-2",
+            }),
+        );
+        other.created_at = now - ChronoDuration::minutes(8);
+        let events = [first, duplicate, other];
+
+        assert_eq!(recovery_action_count(&events, None, now, 3_600), 2);
+        assert_eq!(
+            recovery_action_count(&events, Some("api:spirit:apps/api"), now, 86_400),
+            1
+        );
+    }
+
     #[test]
     fn recovery_pending_intent_closes_only_on_a_terminal_event() {
         let target = crate::config::RecoveryTargetConfig {
@@ -6181,6 +6476,7 @@ mod tests {
             cluster_id: "spirit".to_string(),
             namespace: "apps".to_string(),
             deployment: "api".to_string(),
+            prometheus_labels: BTreeMap::new(),
         };
         let start = recovery_started_event(
             &target,
