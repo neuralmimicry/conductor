@@ -1097,7 +1097,7 @@ mod recovery_config_tests {
             cluster_id: "Spirit".to_string(),
             namespace: "Apps".to_string(),
             deployment: "API".to_string(),
-            prometheus_labels: BTreeMap::new(),
+            prometheus_labels: BTreeMap::from([("cluster".to_string(), "spirit".to_string())]),
         });
         valid.normalize().expect("valid recovery target");
         assert_eq!(valid.recovery.targets[0].cluster_id, "spirit");
