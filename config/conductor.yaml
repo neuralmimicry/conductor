@@ -202,4 +202,7 @@ recovery:
   max_snapshot_age_seconds: 300
   rollout_timeout_seconds: 300
   poll_interval_seconds: 5
+  # Every explicit target must include service_key, cluster_id, namespace and
+  # deployment. cluster_id must match the target Kubernetes client configured
+  # in Continuum; the empty target list keeps recovery disabled.
   targets: []

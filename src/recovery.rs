@@ -345,6 +345,7 @@ mod tests {
     fn target() -> RecoveryTargetConfig {
         RecoveryTargetConfig {
             service_key: "api".to_string(),
+            cluster_id: "spirit".to_string(),
             namespace: "apps".to_string(),
             deployment: "api".to_string(),
         }

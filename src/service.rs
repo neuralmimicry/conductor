@@ -245,7 +245,11 @@ impl ConductorService {
                 continue;
             };
             let status = match continuum
-                .deployment_recovery_status(&target.namespace, &target.deployment)
+                .deployment_recovery_status(
+                    &target.cluster_id,
+                    &target.namespace,
+                    &target.deployment,
+                )
                 .await
             {
                 Ok(status) => status,
@@ -333,6 +337,7 @@ impl ConductorService {
                     "Resuming one durable recovery request with its original idempotency key.",
                     serde_json::json!({
                         "service_key": target.service_key,
+                        "cluster_id": target.cluster_id,
                         "namespace": target.namespace,
                         "deployment": target.deployment,
                         "request_id": request_id,
@@ -341,7 +346,12 @@ impl ConductorService {
                 resume_event.status = Some("single_resume_attempt".to_string());
                 self.persist_recovery_event(resume_event).await?;
                 if let Err(error) = continuum
-                    .restart_deployment(&target.namespace, &target.deployment, request_id)
+                    .restart_deployment(
+                        &target.cluster_id,
+                        &target.namespace,
+                        &target.deployment,
+                        request_id,
+                    )
                     .await
                 {
                     tracing::warn!(%error, service = %target.service_key, "pending recovery request could not be resumed");
@@ -369,7 +379,11 @@ impl ConductorService {
                 continue;
             }
             let status = match continuum
-                .deployment_recovery_status(&target.namespace, &target.deployment)
+                .deployment_recovery_status(
+                    &target.cluster_id,
+                    &target.namespace,
+                    &target.deployment,
+                )
                 .await
             {
                 Ok(status) => status,
@@ -392,6 +406,7 @@ impl ConductorService {
                         "Structured recovery preflight passed; dry-run mode suppressed mutation.",
                         serde_json::json!({
                             "service_key": target.service_key,
+                            "cluster_id": target.cluster_id,
                             "namespace": target.namespace,
                             "deployment": target.deployment,
                             "affected_services": assessment.affected_services,
@@ -421,6 +436,7 @@ impl ConductorService {
                     "Gail did not provide a sufficiently confident approval; no mutation was attempted.",
                     serde_json::json!({
                         "service_key": target.service_key,
+                        "cluster_id": target.cluster_id,
                         "namespace": target.namespace,
                         "deployment": target.deployment,
                         "affected_services": assessment.affected_services,
@@ -437,7 +453,12 @@ impl ConductorService {
             // Durable intent must succeed before the external mutation.
             self.persist_recovery_event(start_event).await?;
             match continuum
-                .restart_deployment(&target.namespace, &target.deployment, &request_id)
+                .restart_deployment(
+                    &target.cluster_id,
+                    &target.namespace,
+                    &target.deployment,
+                    &request_id,
+                )
                 .await
             {
                 Ok(response)
@@ -537,8 +558,8 @@ impl ConductorService {
             dedupe_key: Some(format!("recovery-advisory:{}", recovery_target_id(target))),
             title: format!("Review scoped recovery for {}", target.service_key),
             summary: format!(
-                "Assess whether a single workload restart is reasonable for {}/{}, given the dependency graph, Prometheus down-target evidence, fresh health probes and Continuum host/deployment preflight. Approve only when the evidence supports this bounded action.",
-                target.namespace, target.deployment
+                "Assess whether a single workload restart is reasonable for cluster `{}` workload {}/{}, given the dependency graph, Prometheus down-target evidence, fresh health probes and Continuum host/deployment preflight. Approve only when the evidence supports this bounded action.",
+                target.cluster_id, target.namespace, target.deployment
             ),
             target_service: Some(target.service_key.clone()),
             delivery_stage: Some(crate::models::DeliveryStage::Development),
@@ -554,6 +575,7 @@ impl ConductorService {
             plan: serde_json::json!({
                 "recovery_target": {
                     "service_key": target.service_key,
+                    "cluster_id": target.cluster_id,
                     "namespace": target.namespace,
                     "deployment": target.deployment,
                 },
@@ -3394,15 +3416,16 @@ fn traceability_graph_node_id(kind: &str, key: &str) -> String {
 
 fn recovery_target_id(target: &crate::config::RecoveryTargetConfig) -> String {
     format!(
-        "{}:{}/{}",
-        target.service_key, target.namespace, target.deployment
+        "{}:{}:{}/{}",
+        target.service_key, target.cluster_id, target.namespace, target.deployment
     )
 }
 
 fn recovery_target_id_from_payload(payload: &Value) -> Option<String> {
     Some(format!(
-        "{}:{}/{}",
+        "{}:{}:{}/{}",
         payload.get("service_key")?.as_str()?,
+        payload.get("cluster_id")?.as_str()?,
         payload.get("namespace")?.as_str()?,
         payload.get("deployment")?.as_str()?
     ))
@@ -3523,6 +3546,7 @@ fn recovery_started_event(
         "Dependency and live infrastructure gates passed; a workload-only recovery was submitted to Continuum.",
         json!({
             "service_key": target.service_key,
+            "cluster_id": target.cluster_id,
             "namespace": target.namespace,
             "deployment": target.deployment,
             "request_id": request_id,
@@ -3548,6 +3572,7 @@ fn recovery_terminal_event(
         message,
         json!({
             "service_key": target.service_key,
+            "cluster_id": target.cluster_id,
             "namespace": target.namespace,
             "deployment": target.deployment,
             "request_id": request_id,
@@ -6128,6 +6153,7 @@ mod tests {
 
         let target = crate::config::RecoveryTargetConfig {
             service_key: "api".to_string(),
+            cluster_id: "spirit".to_string(),
             namespace: "apps".to_string(),
             deployment: "api".to_string(),
         };
@@ -6139,12 +6165,20 @@ mod tests {
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric() || character == '-')
         );
+        let mut other_cluster = target.clone();
+        other_cluster.cluster_id = "qc01".to_string();
+        assert_ne!(
+            recovery_target_id(&target),
+            recovery_target_id(&other_cluster),
+            "recovery idempotency scope must include the Continuum cluster"
+        );
     }
 
     #[test]
     fn recovery_pending_intent_closes_only_on_a_terminal_event() {
         let target = crate::config::RecoveryTargetConfig {
             service_key: "api".to_string(),
+            cluster_id: "spirit".to_string(),
             namespace: "apps".to_string(),
             deployment: "api".to_string(),
         };
