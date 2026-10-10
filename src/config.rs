@@ -299,6 +299,9 @@ pub struct RecoveryConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecoveryTargetConfig {
     pub service_key: String,
+    /// Stable identity of the Kubernetes cluster configured in Continuum.
+    #[serde(default)]
+    pub cluster_id: String,
     pub namespace: String,
     pub deployment: String,
 }
@@ -826,19 +829,30 @@ impl ConductorConfig {
             .poll_interval_seconds
             .clamp(1, self.recovery.rollout_timeout_seconds);
         let mut recovery_targets = std::collections::BTreeSet::new();
-        self.recovery.targets.retain_mut(|target| {
+        for target in &mut self.recovery.targets {
             target.service_key = target.service_key.trim().to_ascii_lowercase();
+            target.cluster_id = target.cluster_id.trim().to_ascii_lowercase();
             target.namespace = target.namespace.trim().to_ascii_lowercase();
             target.deployment = target.deployment.trim().to_ascii_lowercase();
-            !target.service_key.is_empty()
-                && !target.namespace.is_empty()
-                && !target.deployment.is_empty()
-                && recovery_targets.insert((
-                    target.service_key.clone(),
-                    target.namespace.clone(),
-                    target.deployment.clone(),
-                ))
-        });
+            if target.service_key.is_empty()
+                || !valid_kubernetes_dns_label(&target.cluster_id)
+                || !valid_kubernetes_dns_label(&target.namespace)
+                || !valid_kubernetes_dns_label(&target.deployment)
+            {
+                return Err(anyhow!(
+                    "recovery targets require a service_key and valid Continuum cluster_id, namespace and deployment DNS labels"
+                ));
+            }
+            if !recovery_targets.insert((
+                target.cluster_id.clone(),
+                target.namespace.clone(),
+                target.deployment.clone(),
+            )) {
+                return Err(anyhow!(
+                    "recovery targets must not repeat the same cluster_id, namespace and deployment"
+                ));
+            }
+        }
         normalize_unique_strings(&mut self.policy.protected_services);
         for mandatory in ["conductor", "refiner", "gail", "aarnn", "aarnn_rust"] {
             if !self
@@ -886,6 +900,22 @@ fn interpolate_env(input: &str) -> String {
             std::env::var(&caps[1]).unwrap_or_default()
         })
         .into_owned()
+}
+
+fn valid_kubernetes_dns_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn normalize_external_service(config: &mut ExternalServiceConfig) {
@@ -966,4 +996,33 @@ fn normalize_paths(values: &mut Vec<PathBuf>) {
         .filter(|value| !value.as_os_str().is_empty())
         .filter(|value| seen.insert(value.display().to_string()))
         .collect();
+}
+
+#[cfg(test)]
+mod recovery_config_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_targets_require_a_valid_explicit_continuum_cluster() {
+        let mut missing_cluster = ConductorConfig::default();
+        missing_cluster.recovery.targets.push(RecoveryTargetConfig {
+            service_key: "api".to_string(),
+            cluster_id: String::new(),
+            namespace: "apps".to_string(),
+            deployment: "api".to_string(),
+        });
+        assert!(missing_cluster.normalize().is_err());
+
+        let mut valid = ConductorConfig::default();
+        valid.recovery.targets.push(RecoveryTargetConfig {
+            service_key: "API".to_string(),
+            cluster_id: "Spirit".to_string(),
+            namespace: "Apps".to_string(),
+            deployment: "API".to_string(),
+        });
+        valid.normalize().expect("valid recovery target");
+        assert_eq!(valid.recovery.targets[0].cluster_id, "spirit");
+        assert_eq!(valid.recovery.targets[0].namespace, "apps");
+        assert_eq!(valid.recovery.targets[0].deployment, "api");
+    }
 }

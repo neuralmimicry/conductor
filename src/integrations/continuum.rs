@@ -83,13 +83,18 @@ impl ContinuumClient {
 
     pub async fn deployment_recovery_status(
         &self,
+        cluster_id: &str,
         namespace: &str,
         deployment: &str,
     ) -> Result<Value> {
         let mut request = self
             .client
             .get(format!("{}/k8s/deployment/recovery-status", self.base_url))
-            .query(&[("namespace", namespace), ("deployment", deployment)]);
+            .query(&[
+                ("cluster_id", cluster_id),
+                ("namespace", namespace),
+                ("deployment", deployment),
+            ]);
         if let Some(token) = self
             .bearer_token
             .as_deref()
@@ -102,6 +107,7 @@ impl ContinuumClient {
 
     pub async fn restart_deployment(
         &self,
+        cluster_id: &str,
         namespace: &str,
         deployment: &str,
         request_id: &str,
@@ -110,6 +116,7 @@ impl ContinuumClient {
             .client
             .post(format!("{}/k8s/deployment/restart", self.base_url))
             .json(&serde_json::json!({
+                "cluster_id": cluster_id,
                 "namespace": namespace,
                 "deployment": deployment,
                 "request_id": request_id,
@@ -359,6 +366,7 @@ mod tests {
             Json(json!({
                 "success": true,
                 "data": {
+                    "cluster_id": query.get("cluster_id"),
                     "namespace": query.get("namespace"),
                     "deployment": query.get("deployment"),
                     "eligible": false,
@@ -432,17 +440,19 @@ mod tests {
         };
 
         let status = client
-            .deployment_recovery_status("apps", "api")
+            .deployment_recovery_status("spirit", "apps", "api")
             .await
             .expect("read-only preflight");
+        assert_eq!(status["data"]["cluster_id"], json!("spirit"));
         assert_eq!(status["data"]["namespace"], json!("apps"));
         assert_eq!(status["data"]["deployment"], json!("api"));
         assert_eq!(status["data"]["eligible"], json!(false));
 
         let restarted = client
-            .restart_deployment("apps", "api", "recovery-request-0001")
+            .restart_deployment("spirit", "apps", "api", "recovery-request-0001")
             .await
             .expect("scoped restart request");
+        assert_eq!(restarted["data"]["cluster_id"], json!("spirit"));
         assert_eq!(restarted["data"]["namespace"], json!("apps"));
         assert_eq!(restarted["data"]["deployment"], json!("api"));
         assert_eq!(
