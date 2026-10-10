@@ -198,11 +198,21 @@ recovery:
   dry_run: true
   interval_seconds: 60
   max_actions_per_cycle: 1
-  cooldown_seconds: 1800
+  cooldown_seconds: 3600
   max_snapshot_age_seconds: 300
+  max_metric_age_seconds: 90
+  # Distinct under-replication samples must span this window before approval.
+  minimum_bad_samples: 3
+  minimum_observation_window_seconds: 300
+  # Additional hard caps apply even when more than one recovery target is set.
+  max_actions_per_target_24h: 1
+  max_actions_global_per_hour: 2
+  minimum_gail_confidence: 0.85
   rollout_timeout_seconds: 300
   poll_interval_seconds: 5
   # Every explicit target must include service_key, cluster_id, namespace and
   # deployment. cluster_id must match the target Kubernetes client configured
-  # in Continuum; the empty target list keeps recovery disabled.
+  # in Continuum, and prometheus_labels must include the same id under an
+  # explicit cluster label. Add further exact labels when required to make
+  # replica series unambiguous; an empty target list keeps recovery disabled.
   targets: []
