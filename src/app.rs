@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::{convert::Infallible, time::Duration};
 
 use axum::{
@@ -20,7 +21,9 @@ use crate::{
     dashboard::render_dashboard,
     error::{ApiError, ApiResult},
     models::{
-        ConfluencePageLinkRequest, JiraIssueLinkRequest, NewTraceabilityLink, NewWorkItem,
+        ConductorEvent, ConfluencePageLinkRequest, DeliveryStage, JiraIssueLinkRequest,
+        NewResearchProject, NewTraceabilityLink, NewWorkItem, PublicResearchProject,
+        ResearchProject, ResearchProjectPatch, ResearchProjectStatus, ResearchVisibility,
         TraceabilitySyncRequest, WorkExecution, WorkItem, WorkItemListFilter, WorkItemPatch,
         WorkStatus,
     },
@@ -113,6 +116,22 @@ pub fn build_router(service: ConductorService) -> Router {
             get(get_work_item_traceability),
         )
         .route("/api/v1/work-items/{id}/execute", post(execute_work_item))
+        .route(
+            "/api/v1/research-projects",
+            get(list_research_projects).post(create_research_project),
+        )
+        .route(
+            "/api/v1/research-projects/{id}",
+            get(get_research_project).patch(update_research_project),
+        )
+        .route(
+            "/api/v1/research-projects/{id}/queue-research",
+            post(queue_research_project),
+        )
+        .route(
+            "/api/v1/public/research-projects",
+            get(public_research_projects),
+        )
         .route("/api/v1/cycles", get(list_cycles))
         .route("/api/v1/discovery/runs", get(list_discovery_runs))
         .route("/api/v1/discovery/run", post(trigger_discovery))
@@ -357,6 +376,716 @@ async fn create_work_item(
     let item = WorkItem::from_new(request);
     service.repository.upsert_work_item(&item).await?;
     Ok(Json(item))
+}
+
+async fn list_research_projects(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Project briefs, resource bounds, budgets, review notes and sandbox
+    // metadata are operationally sensitive even when general dashboard reads
+    // are configured as public.
+    service.require_configured_admin(&headers)?;
+    let projects = service.repository.list_research_projects().await?;
+    let projects = futures::future::try_join_all(
+        projects
+            .into_iter()
+            .map(|project| refresh_research_project_progress(&service, project)),
+    )
+    .await?;
+    Ok(Json(json!({"projects": projects})))
+}
+
+async fn get_research_project(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ResearchProject>> {
+    service.require_configured_admin(&headers)?;
+    let project = service
+        .repository
+        .get_research_project(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("research project {id} not found")))?;
+    let project = refresh_research_project_progress(&service, project).await?;
+    Ok(Json(project))
+}
+
+/// Reconcile the visible project state with its newest Refiner work item.
+/// Successful Refiner work is held at review rather than marked complete:
+/// Conductor requires a human to assess the deliverables and publication gates.
+async fn refresh_research_project_progress(
+    service: &ConductorService,
+    mut project: ResearchProject,
+) -> ApiResult<ResearchProject> {
+    if matches!(
+        project.status,
+        ResearchProjectStatus::Published
+            | ResearchProjectStatus::Withdrawn
+            | ResearchProjectStatus::Paused
+            | ResearchProjectStatus::Completed
+    ) {
+        return Ok(project);
+    }
+
+    let mut latest = None;
+    for work_item_id in &project.solver_work_item_ids {
+        if let Some(item) = service.repository.get_work_item(*work_item_id).await?
+            && latest
+                .as_ref()
+                .is_none_or(|current: &WorkItem| item.updated_at > current.updated_at)
+        {
+            latest = Some(item);
+        }
+    }
+    let Some(item) = latest else {
+        return Ok(project);
+    };
+
+    let (status, next_action, progress) = match item.status {
+        WorkStatus::Planned | WorkStatus::Scheduled => (
+            ResearchProjectStatus::Planning,
+            "Review and approve the Refiner work item in the standard delivery queue.",
+            item.progress_pct,
+        ),
+        WorkStatus::InOperation => (
+            ResearchProjectStatus::Active,
+            "Monitor the Refiner research run and review its evidence when it completes.",
+            item.progress_pct,
+        ),
+        WorkStatus::Success => (
+            ResearchProjectStatus::Review,
+            "Review Refiner outputs, citations, methods, limitations and artifact provenance before accepting the project.",
+            90,
+        ),
+        WorkStatus::Failure | WorkStatus::Aborted => (
+            ResearchProjectStatus::Blocked,
+            "Review the Refiner job logs, identify the cause and record a corrective action before retrying.",
+            item.progress_pct,
+        ),
+        WorkStatus::OnHold => (
+            ResearchProjectStatus::Blocked,
+            "Resolve the Refiner work-item hold reason before resuming this research work.",
+            item.progress_pct,
+        ),
+    };
+    let progress = progress.clamp(0, 90);
+    let next_action = next_action.to_string();
+    if project.status != status
+        || project.progress_pct < progress
+        || project.next_action.as_deref() != Some(next_action.as_str())
+    {
+        project.status = status;
+        project.progress_pct = project.progress_pct.max(progress);
+        project.next_action = Some(next_action);
+        project.updated_at = crate::models::now_utc();
+        service.repository.upsert_research_project(&project).await?;
+    }
+    Ok(project)
+}
+
+async fn create_research_project(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+    Json(mut request): Json<NewResearchProject>,
+) -> ApiResult<Json<ResearchProject>> {
+    service.require_configured_admin(&headers)?;
+    validate_project_text(&request.title, "title", 160)?;
+    validate_project_text(&request.summary, "summary", 4_000)?;
+    validate_project_text(&request.intent, "intent", 20_000)?;
+    if request.owner.trim().is_empty() {
+        request.owner = "Conductor".to_string();
+    }
+    validate_project_text(&request.owner, "owner", 160)?;
+    request.domain = normalise_research_domain(&request.domain)?;
+    if request
+        .budget_limit_usdt
+        .as_deref()
+        .is_some_and(|value| !valid_nonnegative_decimal(value))
+    {
+        return Err(ApiError::bad_request(
+            "budget_limit_usdt must be a non-negative decimal string",
+        ));
+    }
+    if !request.resource_limits.is_null() && !request.resource_limits.is_object() {
+        return Err(ApiError::bad_request(
+            "resource_limits must be a JSON object",
+        ));
+    }
+    if request.resource_limits.is_null() {
+        request.resource_limits = json!({});
+    }
+
+    let id = Uuid::new_v4();
+    let base_slug = slugify(&request.title);
+    let slug = format!("{}-{}", base_slug, &id.to_string()[..8]);
+    let project = ResearchProject::from_new(request, slug);
+    service.repository.upsert_research_project(&project).await?;
+    service.publish_event(ConductorEvent::new(
+        "research.project.created",
+        "A private research project was created for review and planning.",
+        json!({"project_id": project.id, "slug": project.slug, "domain": project.domain}),
+    ));
+    Ok(Json(project))
+}
+
+async fn update_research_project(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(patch): Json<ResearchProjectPatch>,
+) -> ApiResult<Json<ResearchProject>> {
+    service.require_configured_admin(&headers)?;
+    let mut project = service
+        .repository
+        .get_research_project(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("research project {id} not found")))?;
+
+    if let Some(value) = patch.summary {
+        validate_project_text(&value, "summary", 4_000)?;
+        project.summary = value.trim().to_string();
+    }
+    if let Some(value) = patch.intent {
+        validate_project_text(&value, "intent", 20_000)?;
+        project.intent = value.trim().to_string();
+    }
+    if let Some(value) = patch.owner {
+        validate_project_text(&value, "owner", 160)?;
+        project.owner = value.trim().to_string();
+    }
+    if let Some(value) = patch.status {
+        project.status = value;
+    }
+    if let Some(value) = patch.visibility {
+        project.visibility = value;
+    }
+    if let Some(value) = patch.progress_pct {
+        if !(0..=100).contains(&value) {
+            return Err(ApiError::bad_request(
+                "progress_pct must be between 0 and 100",
+            ));
+        }
+        project.progress_pct = value;
+    }
+    if let Some(value) = patch.next_action {
+        if value.len() > 1_000 {
+            return Err(ApiError::bad_request("next_action exceeds 1000 characters"));
+        }
+        project.next_action = (!value.trim().is_empty()).then(|| value.trim().to_string());
+    }
+    if let Some(value) = patch.budget_limit_usdt {
+        if !valid_nonnegative_decimal(&value) {
+            return Err(ApiError::bad_request(
+                "budget_limit_usdt must be a non-negative decimal string",
+            ));
+        }
+        project.budget_limit_usdt = Some(value);
+    }
+    if let Some(value) = patch.budget_spent_usdt {
+        if !valid_nonnegative_decimal(&value) {
+            return Err(ApiError::bad_request(
+                "budget_spent_usdt must be a non-negative decimal string",
+            ));
+        }
+        project.budget_spent_usdt = Some(value);
+    }
+    if let Some(spent) = project.budget_spent_usdt.as_deref() {
+        let Some(limit) = project.budget_limit_usdt.as_deref() else {
+            return Err(ApiError::bad_request(
+                "set an explicit budget_limit_usdt before recording project spend",
+            ));
+        };
+        if decimal_exceeds(spent, limit) {
+            return Err(ApiError::bad_request(
+                "budget_spent_usdt cannot exceed budget_limit_usdt",
+            ));
+        }
+    }
+    if let Some(value) = patch.resource_limits {
+        if !value.is_object() {
+            return Err(ApiError::bad_request(
+                "resource_limits must be a JSON object",
+            ));
+        }
+        project.resource_limits = value;
+    }
+    if let Some(value) = patch.milestones {
+        if value.len() > 200 {
+            return Err(ApiError::bad_request(
+                "a project may have at most 200 milestones",
+            ));
+        }
+        project.milestones = value;
+    }
+    if let Some(value) = patch.evidence_urls {
+        if value.len() > 500 || value.iter().any(|url| url.len() > 2_048) {
+            return Err(ApiError::bad_request(
+                "project evidence exceeds its size limit",
+            ));
+        }
+        project.evidence_urls = value;
+    }
+    if let Some(value) = patch.fact_evidence {
+        validate_research_fact_evidence(&value)?;
+        project.fact_evidence = value;
+    }
+    if let Some(value) = patch.artifacts {
+        validate_research_artifacts(&value)?;
+        project.artifacts = value;
+    }
+    if let Some(value) = patch.review_gates {
+        project.review_gates = value;
+    }
+    if let Some(value) = patch.sandbox {
+        validate_research_sandbox(&value)?;
+        project.sandbox = value;
+    }
+
+    if project.status == ResearchProjectStatus::Completed {
+        let mut latest_refiner_work: Option<WorkItem> = None;
+        for work_item_id in &project.solver_work_item_ids {
+            if let Some(item) = service.repository.get_work_item(*work_item_id).await?
+                && latest_refiner_work
+                    .as_ref()
+                    .is_none_or(|latest| item.updated_at > latest.updated_at)
+            {
+                latest_refiner_work = Some(item);
+            }
+        }
+        if !latest_refiner_work.is_some_and(|item| item.status == WorkStatus::Success)
+            || project.progress_pct != 100
+            || !project.fact_evidence_ready()
+            || !project.review_gates.publication_ready()
+            || !project.artifacts.iter().any(|artifact| artifact.reviewed)
+        {
+            return Err(ApiError::bad_request(
+                "completion requires successful Refiner work, 100% progress, reviewed output artefacts, a complete two-source-per-claim ledger and all independent review decisions",
+            ));
+        }
+    }
+
+    if project.status == ResearchProjectStatus::Published {
+        project.visibility = ResearchVisibility::Public;
+        if !project.public_page_ready()
+            || !project.artifacts.iter().any(|artifact| {
+                artifact.access == crate::models::ResearchArtifactAccess::Public
+                    && artifact.reviewed
+                    && artifact
+                        .license
+                        .as_deref()
+                        .is_some_and(|license| !license.trim().is_empty())
+            })
+        {
+            return Err(ApiError::bad_request(
+                "publication requires every review gate, claim-by-claim evidence from at least two independent online sources, and at least one reviewed, licensed public artifact with an HTTPS URL",
+            ));
+        }
+        if project.published_at.is_none() {
+            project.published_at = Some(crate::models::now_utc());
+        }
+    } else {
+        project.published_at = None;
+    }
+
+    project.updated_at = crate::models::now_utc();
+    service.repository.upsert_research_project(&project).await?;
+    service.publish_event(ConductorEvent::new(
+        "research.project.updated",
+        "Research project metadata or review state changed.",
+        json!({
+            "project_id": project.id,
+            "slug": project.slug,
+            "status": project.status.as_str(),
+            "visibility": project.visibility.as_str(),
+            "progress_pct": project.progress_pct,
+        }),
+    ));
+    Ok(Json(project))
+}
+
+async fn queue_research_project(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    service.require_configured_admin(&headers)?;
+    let mut project = service
+        .repository
+        .get_research_project(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("research project {id} not found")))?;
+    if matches!(
+        project.status,
+        ResearchProjectStatus::Published
+            | ResearchProjectStatus::Completed
+            | ResearchProjectStatus::Paused
+            | ResearchProjectStatus::Withdrawn
+    ) {
+        return Err(ApiError::bad_request(
+            "paused, completed, published or withdrawn projects cannot start another research task",
+        ));
+    }
+    if project.budget_limit_usdt.is_none() {
+        return Err(ApiError::bad_request(
+            "set an explicit USDT budget ceiling before queueing research; use 0 for a no-spend task",
+        ));
+    }
+    if !project
+        .resource_limits
+        .as_object()
+        .is_some_and(|limits| !limits.is_empty())
+    {
+        return Err(ApiError::bad_request(
+            "set explicit resource limits before queueing research",
+        ));
+    }
+    for work_item_id in &project.solver_work_item_ids {
+        if let Some(item) = service.repository.get_work_item(*work_item_id).await?
+            && matches!(
+                item.status,
+                WorkStatus::Planned | WorkStatus::Scheduled | WorkStatus::InOperation
+            )
+        {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "this project already has a non-terminal Refiner work item",
+            ));
+        }
+    }
+
+    let item = WorkItem::from_new(NewWorkItem {
+        dedupe_key: Some(format!(
+            "research-project:{}:{}",
+            project.id,
+            Uuid::new_v4()
+        )),
+        title: format!("Research: {}", project.title),
+        summary: format!(
+            "Evidence-led {} research project. {}",
+            project.domain, project.summary
+        ),
+        target_service: Some("refiner".to_string()),
+        delivery_stage: Some(DeliveryStage::Development),
+        validated_stages: Vec::new(),
+        rollout_strategy: None,
+        status: Some(WorkStatus::Planned),
+        priority: Some(50),
+        progress_pct: Some(0),
+        admin_override: false,
+        execution_approved: false,
+        verification_required: Some(true),
+        tags: vec![
+            "research".to_string(),
+            "pure_research".to_string(),
+            format!("domain:{}", project.domain),
+        ],
+        plan: json!({
+            "research_project_id": project.id,
+            "research_domain": project.domain,
+            "research_brief": project.intent,
+            "workflow": "project_solver",
+            "research_requirements": {
+                "source_citations_required": true,
+                "minimum_independent_online_sources_per_factual_claim": 2,
+                "citation_required_for_each_factual_claim": true,
+                "record_claim_by_claim_source_matrix": true,
+                "distinct_publishers_and_urls_required_per_claim": true,
+                "if_two_independent_online_sources_cannot_be_verified": "mark the claim unverified and block completion; do not invent evidence",
+                "methods_and_limitations_required": true,
+                "do_not_modify_repositories": true,
+                "do_not_access_production_systems": true,
+                "outputs": ["research report", "claim-by-claim citation matrix", "sources", "methods", "limitations", "next steps"]
+            },
+            "ordered_steps": [
+                "Clarify the research question, scope, assumptions, and success criteria.",
+                "Use Refiner research functions to gather and cite reliable sources; distinguish primary evidence from interpretation.",
+                "Analyse the evidence, document uncertainty and limitations, and check for contradictory findings.",
+                "Produce an accessible report and a reproducible list of sources and methods for human review."
+            ]
+        }),
+        depends_on: Vec::new(),
+        source: Some("conductor_research_project".to_string()),
+        scheduled_for: None,
+    });
+    service.repository.upsert_work_item(&item).await?;
+    project.status = ResearchProjectStatus::Planning;
+    project.progress_pct = project.progress_pct.max(5);
+    project.next_action = Some(
+        "Review and approve the Refiner work item in the standard Conductor delivery queue."
+            .to_string(),
+    );
+    project.solver_work_item_ids.push(item.id);
+    project.updated_at = crate::models::now_utc();
+    service.repository.upsert_research_project(&project).await?;
+    let mut event = ConductorEvent::new(
+        "research.project.refiner_queued",
+        "A Refiner research work item was created and awaits the standard approval gates.",
+        json!({"project_id": project.id, "work_item_id": item.id, "workflow": "project_solver"}),
+    );
+    event.work_item_id = Some(item.id);
+    service.publish_event(event);
+    Ok(Json(json!({"project": project, "work_item": item})))
+}
+
+async fn public_research_projects(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+) -> ApiResult<(HeaderMap, Json<serde_json::Value>)> {
+    let projects = service
+        .repository
+        .list_research_projects()
+        .await?
+        .into_iter()
+        .filter(ResearchProject::public_page_ready)
+        .map(|project| PublicResearchProject::from(&project))
+        .collect::<Vec<_>>();
+    let mut response_headers = HeaderMap::new();
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if ["https://neuralmimicry.ai", "https://www.neuralmimicry.ai"].contains(&origin) {
+        response_headers.insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            axum::http::HeaderValue::from_str(origin)
+                .map_err(|error| ApiError::internal(error.to_string()))?,
+        );
+        response_headers.insert(header::VARY, axum::http::HeaderValue::from_static("Origin"));
+    }
+    Ok((response_headers, Json(json!({"projects": projects}))))
+}
+
+fn validate_project_text(value: &str, field: &str, max_len: usize) -> ApiResult<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::bad_request(format!("{field} must not be empty")));
+    }
+    if trimmed.len() > max_len {
+        return Err(ApiError::bad_request(format!(
+            "{field} exceeds {max_len} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn normalise_research_domain(value: &str) -> ApiResult<String> {
+    let domain = value.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+    const DOMAINS: &[&str] = &[
+        "science",
+        "mathematics",
+        "humanities",
+        "education",
+        "languages",
+        "law_ethics",
+        "arts",
+        "cross_disciplinary",
+    ];
+    if !DOMAINS.contains(&domain.as_str()) {
+        return Err(ApiError::bad_request(
+            "domain must be one of science, mathematics, humanities, education, languages, law_ethics, arts, or cross_disciplinary",
+        ));
+    }
+    Ok(domain)
+}
+
+fn valid_nonnegative_decimal(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 38 {
+        return false;
+    }
+    let mut parts = value.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fraction = parts.next();
+    !whole.is_empty()
+        && whole.len() <= 29
+        && whole.bytes().all(|byte| byte.is_ascii_digit())
+        && fraction.is_none_or(|digits| {
+            !digits.is_empty()
+                && digits.len() <= 8
+                && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        && parts.next().is_none()
+}
+
+fn decimal_exceeds(value: &str, limit: &str) -> bool {
+    fn units(value: &str) -> Option<i128> {
+        if !valid_nonnegative_decimal(value) {
+            return None;
+        }
+        let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+        let whole: i128 = whole.parse().ok()?;
+        let fraction = format!("{fraction:0<8}");
+        let fraction: i128 = fraction.parse().ok()?;
+        whole.checked_mul(100_000_000)?.checked_add(fraction)
+    }
+    matches!((units(value), units(limit)), (Some(value), Some(limit)) if value > limit)
+}
+
+fn slugify(value: &str) -> String {
+    let mut slug = String::new();
+    let mut separator = false;
+    for character in value.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            if separator && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.push(character);
+            separator = false;
+        } else {
+            separator = true;
+        }
+        if slug.len() >= 56 {
+            break;
+        }
+    }
+    if slug.is_empty() {
+        "research-project".to_string()
+    } else {
+        slug.trim_end_matches('-').to_string()
+    }
+}
+
+fn validate_research_artifacts(artifacts: &[crate::models::ResearchArtifact]) -> ApiResult<()> {
+    if artifacts.len() > 100 {
+        return Err(ApiError::bad_request(
+            "a project may have at most 100 artifacts",
+        ));
+    }
+    for artifact in artifacts {
+        validate_project_text(&artifact.title, "artifact title", 240)?;
+        validate_project_text(&artifact.media_type, "artifact media_type", 120)?;
+        validate_project_text(&artifact.provenance, "artifact provenance", 4_000)?;
+        let parsed_url = reqwest::Url::parse(&artifact.url).ok();
+        if artifact.url.len() > 2_048
+            || !parsed_url.as_ref().is_some_and(|url| {
+                url.scheme() == "https" && url.host_str().is_some_and(|host| !host.is_empty())
+            })
+        {
+            return Err(ApiError::bad_request(
+                "artifact URLs must use HTTPS and be at most 2048 characters",
+            ));
+        }
+        if artifact.access == crate::models::ResearchArtifactAccess::Public
+            && parsed_url.as_ref().is_some_and(|url| {
+                !url.username().is_empty()
+                    || url.password().is_some()
+                    || url.query().is_some()
+                    || url.fragment().is_some()
+            })
+        {
+            return Err(ApiError::bad_request(
+                "public artifact URLs cannot contain credentials, query strings, or fragments",
+            ));
+        }
+        if artifact.sha256.as_deref().is_some_and(|digest| {
+            digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Err(ApiError::bad_request(
+                "artifact sha256 must contain 64 hexadecimal characters",
+            ));
+        }
+        if artifact
+            .license
+            .as_deref()
+            .is_some_and(|license| license.len() > 240)
+        {
+            return Err(ApiError::bad_request(
+                "artifact license exceeds 240 characters",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_research_fact_evidence(facts: &[crate::models::ResearchFactEvidence]) -> ApiResult<()> {
+    if facts.len() > 1_000 {
+        return Err(ApiError::bad_request(
+            "a project may record at most 1000 factual claims",
+        ));
+    }
+    for fact in facts {
+        validate_project_text(&fact.claim, "factual claim", 5_000)?;
+        if !(2..=20).contains(&fact.citations.len()) {
+            return Err(ApiError::bad_request(
+                "each factual claim must cite between 2 and 20 independent online sources",
+            ));
+        }
+        let mut publishers = BTreeSet::new();
+        let mut urls = BTreeSet::new();
+        for citation in &fact.citations {
+            validate_project_text(&citation.title, "citation title", 500)?;
+            validate_project_text(&citation.publisher, "citation publisher", 240)?;
+            let url = reqwest::Url::parse(&citation.url).ok();
+            if citation.url.len() > 2_048
+                || !url.as_ref().is_some_and(|url| {
+                    url.scheme() == "https"
+                        && url.host_str().is_some_and(|host| !host.is_empty())
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                })
+            {
+                return Err(ApiError::bad_request(
+                    "research citations must use valid HTTPS URLs without embedded credentials",
+                ));
+            }
+            if citation.accessed_at > crate::models::now_utc() {
+                return Err(ApiError::bad_request(
+                    "citation accessed_at must not be in the future",
+                ));
+            }
+            let normalised_url = url
+                .as_ref()
+                .map(|url| url.as_str().to_ascii_lowercase())
+                .unwrap_or_default();
+            if !publishers.insert(citation.publisher.trim().to_ascii_lowercase())
+                || !urls.insert(normalised_url)
+            {
+                return Err(ApiError::bad_request(
+                    "each factual claim requires distinct source publishers and URLs",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_research_sandbox(sandbox: &crate::models::ResearchSandbox) -> ApiResult<()> {
+    const STATUSES: &[&str] = &[
+        "not_requested",
+        "requested",
+        "provisioning",
+        "active",
+        "tearing_down",
+        "complete",
+        "failed",
+        "cleanup_required",
+    ];
+    if !STATUSES.contains(&sandbox.status.as_str()) {
+        return Err(ApiError::bad_request("sandbox status is not supported"));
+    }
+    if sandbox
+        .deployment_id
+        .as_deref()
+        .is_some_and(|id| id.len() > 160)
+    {
+        return Err(ApiError::bad_request(
+            "sandbox deployment_id exceeds 160 characters",
+        ));
+    }
+    if !sandbox.resource_manifest.is_null() && !sandbox.resource_manifest.is_object() {
+        return Err(ApiError::bad_request(
+            "sandbox resource_manifest must be a JSON object",
+        ));
+    }
+    if sandbox.retained_data.len() > 100
+        || sandbox.retained_data.iter().any(|path| path.len() > 500)
+    {
+        return Err(ApiError::bad_request(
+            "sandbox retained_data exceeds its size limit",
+        ));
+    }
+    Ok(())
 }
 
 async fn update_work_item(
@@ -1078,6 +1807,483 @@ mod tests {
         assert!(html.contains("NeuralMimicry"));
         assert!(html.contains("/assets/neuralmimicryicon512.png"));
         assert!(html.contains(&format!("Conductor v{}", env!("CARGO_PKG_VERSION"))));
+    }
+
+    #[tokio::test]
+    async fn private_research_project_reads_require_admin_even_when_dashboard_reads_are_public() {
+        let mut config = ConductorConfig::default();
+        config.security.admin_token = Some("secret".to_string());
+        config.security.allow_dashboard_without_token = true;
+        let repo = Arc::new(MemoryRepository::new());
+        let app = build_router(ConductorService::new(
+            config,
+            repo,
+            build_http_client(2).expect("client"),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/research-projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn private_research_routes_fail_closed_when_admin_token_is_unconfigured() {
+        let mut config = ConductorConfig::default();
+        config.security.allow_dashboard_without_token = true;
+        let repo = Arc::new(MemoryRepository::new());
+        let app = build_router(ConductorService::new(
+            config,
+            repo,
+            build_http_client(2).expect("client"),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/research-projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn research_queue_creates_reviewable_refiner_work_without_auto_approval() {
+        let mut config = ConductorConfig::default();
+        config.security.admin_token = Some("secret".to_string());
+        let repo = Arc::new(MemoryRepository::new());
+        let app = build_router(ConductorService::new(
+            config,
+            repo.clone(),
+            build_http_client(2).expect("client"),
+        ));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/research-projects")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "title": "Accessible science lessons",
+                            "summary": "Evidence-led research into accessible lesson formats.",
+                            "intent": "Compare learning outcomes and accessibility across formats.",
+                            "domain": "education",
+                            "owner": "Conductor",
+                            "budget_limit_usdt": "0",
+                            "resource_limits": {"network": "research-only", "max_cost_usdt": "0"}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("create response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("create body");
+        let created: ResearchProject = serde_json::from_slice(&body).expect("created project");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/research-projects/{}/queue-research",
+                        created.id
+                    ))
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("queue response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("queue body");
+        let queued: serde_json::Value = serde_json::from_slice(&body).expect("queued payload");
+        assert_eq!(queued["work_item"]["target_service"], "refiner");
+        assert_eq!(queued["work_item"]["source"], "conductor_research_project");
+        assert_eq!(queued["work_item"]["execution_approved"], false);
+        assert_eq!(queued["work_item"]["verification_required"], true);
+        assert_eq!(queued["work_item"]["plan"]["workflow"], "project_solver");
+        assert_eq!(
+            queued["work_item"]["plan"]["research_requirements"]["do_not_access_production_systems"],
+            true
+        );
+        assert_eq!(
+            queued["work_item"]["plan"]["research_requirements"]["minimum_independent_online_sources_per_factual_claim"],
+            2
+        );
+        assert_eq!(
+            queued["work_item"]["plan"]["research_requirements"]["citation_required_for_each_factual_claim"],
+            true
+        );
+        assert_eq!(repo.list_work_items().await.expect("work items").len(), 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/research-projects/{}/queue-research",
+                        created.id
+                    ))
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("duplicate queue response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(repo.list_work_items().await.expect("work items").len(), 1);
+
+        let work_item = repo.list_work_items().await.expect("work items").remove(0);
+        repo.patch_work_item(
+            work_item.id,
+            crate::models::WorkItemPatch {
+                status: Some(WorkStatus::Success),
+                progress_pct: Some(100),
+                ..crate::models::WorkItemPatch::default()
+            },
+        )
+        .await
+        .expect("complete Refiner work item");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/research-projects")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("refreshed project response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("refreshed project body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("projects");
+        assert_eq!(payload["projects"][0]["status"], "review");
+        assert_eq!(payload["projects"][0]["progress_pct"], 90);
+        assert!(
+            payload["projects"][0]["next_action"]
+                .as_str()
+                .expect("next action")
+                .contains("Review Refiner outputs")
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/research-projects/{}", created.id))
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"status": "completed", "progress_pct": 100}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("premature completion response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn public_research_list_excludes_unreviewed_or_unusable_projects() {
+        let config = ConductorConfig::default();
+        let repo = Arc::new(MemoryRepository::new());
+        let mut ready = ResearchProject::from_new(
+            NewResearchProject {
+                title: "Reviewed public project".to_string(),
+                summary: "A reviewed project summary.".to_string(),
+                intent: "A sufficiently detailed research intent.".to_string(),
+                domain: "science".to_string(),
+                owner: "Conductor".to_string(),
+                budget_limit_usdt: None,
+                resource_limits: json!({}),
+            },
+            "reviewed-public-project-test".to_string(),
+        );
+        let now = now_utc();
+        ready.status = ResearchProjectStatus::Published;
+        ready.visibility = ResearchVisibility::Public;
+        ready.published_at = Some(now);
+        let decision = |reviewer: &str| crate::models::ResearchReviewDecision {
+            approved: true,
+            reviewer: Some(reviewer.to_string()),
+            reviewed_at: Some(now),
+            evidence_url: None,
+        };
+        ready.review_gates = crate::models::ResearchReviewGates {
+            subject: decision("subject reviewer"),
+            quality: decision("quality reviewer"),
+            evidence: decision("evidence reviewer"),
+            privacy: decision("privacy reviewer"),
+            safety: decision("safety reviewer"),
+            licensing: decision("licensing reviewer"),
+            accessibility: decision("accessibility reviewer"),
+        };
+        ready.artifacts.push(crate::models::ResearchArtifact {
+            id: Uuid::new_v4(),
+            title: "Public report".to_string(),
+            media_type: "report".to_string(),
+            url: "https://research.example.org/report".to_string(),
+            access: crate::models::ResearchArtifactAccess::Public,
+            license: Some("CC-BY-4.0".to_string()),
+            sha256: None,
+            provenance: "Reviewed report generated from cited public sources.".to_string(),
+            reviewed: true,
+            created_at: now,
+        });
+        ready
+            .fact_evidence
+            .push(crate::models::ResearchFactEvidence {
+                claim: "The example finding is supported by two independent online sources."
+                    .to_string(),
+                citations: vec![
+                    crate::models::ResearchCitationSource {
+                        url: "https://journal.example.org/article".to_string(),
+                        title: "Primary study".to_string(),
+                        publisher: "Example Journal".to_string(),
+                        accessed_at: now,
+                    },
+                    crate::models::ResearchCitationSource {
+                        url: "https://institute.example.net/briefing".to_string(),
+                        title: "Independent evidence review".to_string(),
+                        publisher: "Example Institute".to_string(),
+                        accessed_at: now,
+                    },
+                ],
+            });
+        repo.upsert_research_project(&ready)
+            .await
+            .expect("ready project");
+
+        let mut empty = ready.clone();
+        empty.id = Uuid::new_v4();
+        empty.slug = "published-without-artifacts-test".to_string();
+        empty.title = "Published but unusable".to_string();
+        empty.artifacts.clear();
+        repo.upsert_research_project(&empty)
+            .await
+            .expect("empty project");
+
+        let mut private = ready.clone();
+        private.id = Uuid::new_v4();
+        private.slug = "private-project-test".to_string();
+        private.title = "Private project".to_string();
+        private.visibility = ResearchVisibility::Private;
+        repo.upsert_research_project(&private)
+            .await
+            .expect("private project");
+
+        let app = build_router(ConductorService::new(
+            config,
+            repo,
+            build_http_client(2).expect("client"),
+        ));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/public/research-projects")
+                    .header("origin", "https://neuralmimicry.ai")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://neuralmimicry.ai")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("public body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("public projects");
+        assert_eq!(payload["projects"].as_array().expect("array").len(), 1);
+        assert_eq!(
+            payload["projects"][0]["slug"],
+            "reviewed-public-project-test"
+        );
+        assert_eq!(
+            payload["projects"][0]["fact_evidence"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/public/research-projects")
+                    .header("origin", "https://untrusted.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("untrusted origin response");
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn factual_claims_require_two_distinct_online_publishers() {
+        let now = now_utc();
+        let citation = |url: &str, publisher: &str| crate::models::ResearchCitationSource {
+            url: url.to_string(),
+            title: "Evidence source".to_string(),
+            publisher: publisher.to_string(),
+            accessed_at: now,
+        };
+        let insufficient = vec![crate::models::ResearchFactEvidence {
+            claim: "A factual research claim.".to_string(),
+            citations: vec![citation("https://one.example.org/source", "Publisher One")],
+        }];
+        assert!(validate_research_fact_evidence(&insufficient).is_err());
+
+        let same_publisher = vec![crate::models::ResearchFactEvidence {
+            claim: "A factual research claim.".to_string(),
+            citations: vec![
+                citation("https://one.example.org/source", "Publisher One"),
+                citation("https://one.example.org/another", " publisher one "),
+            ],
+        }];
+        assert!(validate_research_fact_evidence(&same_publisher).is_err());
+
+        let duplicate_url = vec![crate::models::ResearchFactEvidence {
+            claim: "A factual research claim.".to_string(),
+            citations: vec![
+                citation("https://one.example.org/source", "Publisher One"),
+                citation("https://one.example.org/source", "Publisher Two"),
+            ],
+        }];
+        assert!(validate_research_fact_evidence(&duplicate_url).is_err());
+    }
+
+    #[test]
+    fn budget_comparison_uses_decimal_units_without_float_rounding() {
+        assert!(!decimal_exceeds("1.23000000", "1.23"));
+        assert!(!decimal_exceeds("0002.4", "2.40000000"));
+        assert!(decimal_exceeds("1.00000001", "1"));
+        assert!(decimal_exceeds("10", "9.99999999"));
+        assert!(!decimal_exceeds(
+            "99999999999999999999999999998",
+            "99999999999999999999999999999"
+        ));
+    }
+
+    #[tokio::test]
+    async fn publication_is_rejected_without_a_complete_two_source_claim_matrix() {
+        let mut config = ConductorConfig::default();
+        config.security.admin_token = Some("secret".to_string());
+        let repo = Arc::new(MemoryRepository::new());
+        let mut project = ResearchProject::from_new(
+            NewResearchProject {
+                title: "Evidence gate test".to_string(),
+                summary: "Checks the research publication evidence gate.".to_string(),
+                intent: "Confirm publication cannot omit factual source evidence.".to_string(),
+                domain: "science".to_string(),
+                owner: "Conductor".to_string(),
+                budget_limit_usdt: Some("0".to_string()),
+                resource_limits: json!({}),
+            },
+            "evidence-gate-test".to_string(),
+        );
+        let now = now_utc();
+        let decision = |reviewer: &str| crate::models::ResearchReviewDecision {
+            approved: true,
+            reviewer: Some(reviewer.to_string()),
+            reviewed_at: Some(now),
+            evidence_url: None,
+        };
+        project.review_gates = crate::models::ResearchReviewGates {
+            subject: decision("subject reviewer"),
+            quality: decision("quality reviewer"),
+            evidence: decision("evidence reviewer"),
+            privacy: decision("privacy reviewer"),
+            safety: decision("safety reviewer"),
+            licensing: decision("licensing reviewer"),
+            accessibility: decision("accessibility reviewer"),
+        };
+        project.artifacts.push(crate::models::ResearchArtifact {
+            id: Uuid::new_v4(),
+            title: "Reviewed report".to_string(),
+            media_type: "report".to_string(),
+            url: "https://research.example.org/report".to_string(),
+            access: crate::models::ResearchArtifactAccess::Public,
+            license: Some("CC-BY-4.0".to_string()),
+            sha256: None,
+            provenance: "Report fixture for publication-gate testing.".to_string(),
+            reviewed: true,
+            created_at: now,
+        });
+        repo.upsert_research_project(&project)
+            .await
+            .expect("project fixture");
+        let app = build_router(ConductorService::new(
+            config,
+            repo.clone(),
+            build_http_client(2).expect("client"),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/research-projects/{}", project.id))
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"status": "published", "visibility": "public"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("publication response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("publication error body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error payload");
+        assert!(
+            payload["error"]
+                .as_str()
+                .expect("error text")
+                .contains("claim-by-claim evidence")
+        );
+        assert_eq!(
+            repo.get_research_project(project.id)
+                .await
+                .expect("stored project")
+                .expect("project")
+                .status,
+            ResearchProjectStatus::Proposed
+        );
     }
 
     #[tokio::test]

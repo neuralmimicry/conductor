@@ -3,8 +3,8 @@ use chrono::{DateTime, Utc};
 
 use crate::models::{
     ConductorEvent, DiscoveryRun, FindingEvidence, FindingProvenance, FindingRecord,
-    ImprovementCycle, RepositorySnapshot, ServiceMetricSample, ServiceSnapshot, TraceabilityLink,
-    WorkExecution, WorkItem, WorkItemListFilter, WorkItemListPage, WorkItemPatch,
+    ImprovementCycle, RepositorySnapshot, ResearchProject, ServiceMetricSample, ServiceSnapshot,
+    TraceabilityLink, WorkExecution, WorkItem, WorkItemListFilter, WorkItemListPage, WorkItemPatch,
 };
 
 #[async_trait]
@@ -106,6 +106,15 @@ pub trait ConductorRepository: Send + Sync {
     async fn count_improvement_cycles(&self) -> anyhow::Result<usize>;
     async fn insert_conductor_event(&self, event: &ConductorEvent) -> anyhow::Result<()>;
     async fn list_conductor_events(&self, limit: usize) -> anyhow::Result<Vec<ConductorEvent>>;
+
+    async fn upsert_research_project(&self, project: &ResearchProject) -> anyhow::Result<()>;
+    async fn list_research_projects(&self) -> anyhow::Result<Vec<ResearchProject>>;
+    async fn get_research_project(&self, id: uuid::Uuid)
+    -> anyhow::Result<Option<ResearchProject>>;
+    async fn get_research_project_by_slug(
+        &self,
+        slug: &str,
+    ) -> anyhow::Result<Option<ResearchProject>>;
 
     /// Remove bounded operational history while retaining recent evidence.
     /// Non-persistent implementations may use the default no-op.

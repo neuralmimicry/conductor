@@ -671,6 +671,375 @@ impl WorkItem {
     }
 }
 
+/// Lifecycle for a first-class research or education project.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResearchProjectStatus {
+    #[default]
+    Proposed,
+    Planning,
+    Active,
+    Review,
+    Published,
+    Paused,
+    Blocked,
+    Completed,
+    Withdrawn,
+}
+
+impl ResearchProjectStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Proposed => "proposed",
+            Self::Planning => "planning",
+            Self::Active => "active",
+            Self::Review => "review",
+            Self::Published => "published",
+            Self::Paused => "paused",
+            Self::Blocked => "blocked",
+            Self::Completed => "completed",
+            Self::Withdrawn => "withdrawn",
+        }
+    }
+}
+
+/// Audience allowed to discover a project or an individual artifact.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResearchVisibility {
+    #[default]
+    Private,
+    Customer,
+    Public,
+}
+
+impl ResearchVisibility {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Customer => "customer",
+            Self::Public => "public",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct ResearchReviewDecision {
+    pub approved: bool,
+    pub reviewer: Option<String>,
+    pub reviewed_at: Option<DateTime<Utc>>,
+    pub evidence_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct ResearchReviewGates {
+    pub subject: ResearchReviewDecision,
+    pub quality: ResearchReviewDecision,
+    #[serde(default)]
+    pub evidence: ResearchReviewDecision,
+    pub privacy: ResearchReviewDecision,
+    pub safety: ResearchReviewDecision,
+    pub licensing: ResearchReviewDecision,
+    pub accessibility: ResearchReviewDecision,
+}
+
+impl ResearchReviewGates {
+    pub fn publication_ready(&self) -> bool {
+        let decisions = [
+            &self.subject,
+            &self.quality,
+            &self.evidence,
+            &self.privacy,
+            &self.safety,
+            &self.licensing,
+            &self.accessibility,
+        ];
+        let all_approved = decisions.iter().all(|decision| {
+            decision.approved
+                && decision
+                    .reviewer
+                    .as_deref()
+                    .is_some_and(|reviewer| !reviewer.trim().is_empty())
+                && decision.reviewed_at.is_some()
+        });
+        let subject_reviewer = self.subject.reviewer.as_deref().unwrap_or_default().trim();
+        let quality_reviewer = self.quality.reviewer.as_deref().unwrap_or_default().trim();
+        let evidence_reviewer = self.evidence.reviewer.as_deref().unwrap_or_default().trim();
+        all_approved
+            && !subject_reviewer.eq_ignore_ascii_case(quality_reviewer)
+            && !subject_reviewer.eq_ignore_ascii_case(evidence_reviewer)
+            && !quality_reviewer.eq_ignore_ascii_case(evidence_reviewer)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResearchArtifactAccess {
+    #[default]
+    Private,
+    Customer,
+    Public,
+}
+
+impl ResearchArtifactAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Customer => "customer",
+            Self::Public => "public",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResearchArtifact {
+    pub id: Uuid,
+    pub title: String,
+    pub media_type: String,
+    pub url: String,
+    pub access: ResearchArtifactAccess,
+    pub license: Option<String>,
+    pub sha256: Option<String>,
+    pub provenance: String,
+    pub reviewed: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResearchMilestone {
+    pub id: Uuid,
+    pub title: String,
+    pub status: String,
+    pub evidence_urls: Vec<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// An online source used to support a factual claim in a research result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResearchCitationSource {
+    pub url: String,
+    pub title: String,
+    /// Publisher identity used by reviewers to distinguish independent sources.
+    pub publisher: String,
+    pub accessed_at: DateTime<Utc>,
+}
+
+/// Claim-by-claim evidence ledger. Publication requires at least two distinct
+/// publishers and two distinct HTTPS URLs for every recorded claim.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResearchFactEvidence {
+    pub claim: String,
+    pub citations: Vec<ResearchCitationSource>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct ResearchSandbox {
+    pub status: String,
+    pub deployment_id: Option<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub resource_manifest: Value,
+    pub retained_data: Vec<String>,
+    pub cleanup_verified_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResearchProject {
+    pub id: Uuid,
+    pub slug: String,
+    pub title: String,
+    pub summary: String,
+    pub intent: String,
+    pub domain: String,
+    pub owner: String,
+    pub status: ResearchProjectStatus,
+    pub visibility: ResearchVisibility,
+    pub progress_pct: i32,
+    pub next_action: Option<String>,
+    /// Decimal USDT strings avoid floating-point rounding in budget records.
+    pub budget_limit_usdt: Option<String>,
+    pub budget_spent_usdt: Option<String>,
+    pub resource_limits: Value,
+    pub milestones: Vec<ResearchMilestone>,
+    pub evidence_urls: Vec<String>,
+    #[serde(default)]
+    pub fact_evidence: Vec<ResearchFactEvidence>,
+    pub artifacts: Vec<ResearchArtifact>,
+    pub review_gates: ResearchReviewGates,
+    pub sandbox: ResearchSandbox,
+    pub solver_work_item_ids: Vec<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub published_at: Option<DateTime<Utc>>,
+}
+
+impl ResearchProject {
+    pub fn from_new(input: NewResearchProject, slug: String) -> Self {
+        let now = now_utc();
+        Self {
+            id: Uuid::new_v4(),
+            slug,
+            title: input.title.trim().to_string(),
+            summary: input.summary.trim().to_string(),
+            intent: input.intent.trim().to_string(),
+            domain: input.domain.trim().to_ascii_lowercase(),
+            owner: input.owner.trim().to_string(),
+            status: ResearchProjectStatus::Proposed,
+            visibility: ResearchVisibility::Private,
+            progress_pct: 0,
+            next_action: Some(
+                "Review the project brief and queue a Refiner research task.".to_string(),
+            ),
+            budget_limit_usdt: input.budget_limit_usdt,
+            budget_spent_usdt: None,
+            resource_limits: input.resource_limits,
+            milestones: Vec::new(),
+            evidence_urls: Vec::new(),
+            fact_evidence: Vec::new(),
+            artifacts: Vec::new(),
+            review_gates: ResearchReviewGates::default(),
+            sandbox: ResearchSandbox {
+                status: "not_requested".to_string(),
+                ..ResearchSandbox::default()
+            },
+            solver_work_item_ids: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            published_at: None,
+        }
+    }
+
+    pub fn public_page_ready(&self) -> bool {
+        let public_artifacts = self
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.access == ResearchArtifactAccess::Public)
+            .collect::<Vec<_>>();
+        self.status == ResearchProjectStatus::Published
+            && self.visibility == ResearchVisibility::Public
+            && self.review_gates.publication_ready()
+            && self.fact_evidence_ready()
+            && !public_artifacts.is_empty()
+            && public_artifacts.iter().all(|artifact| {
+                artifact.reviewed
+                    && artifact
+                        .license
+                        .as_deref()
+                        .is_some_and(|license| !license.trim().is_empty())
+                    && is_public_https_url(&artifact.url)
+            })
+    }
+
+    pub fn fact_evidence_ready(&self) -> bool {
+        !self.fact_evidence.is_empty()
+            && self.fact_evidence.iter().all(|fact| {
+                if fact.claim.trim().is_empty() || fact.citations.len() < 2 {
+                    return false;
+                }
+                let mut publishers = BTreeSet::new();
+                let mut urls = BTreeSet::new();
+                fact.citations.iter().all(|citation| {
+                    let publisher = citation.publisher.trim().to_ascii_lowercase();
+                    let url = citation.url.trim().to_ascii_lowercase();
+                    !publisher.is_empty()
+                        && !citation.title.trim().is_empty()
+                        && is_online_citation_url(&citation.url)
+                        && publishers.insert(publisher)
+                        && urls.insert(url)
+                })
+            })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PublicResearchProject {
+    pub slug: String,
+    pub title: String,
+    pub summary: String,
+    pub domain: String,
+    pub artifacts: Vec<ResearchArtifact>,
+    pub fact_evidence: Vec<ResearchFactEvidence>,
+    pub published_at: Option<DateTime<Utc>>,
+}
+
+impl From<&ResearchProject> for PublicResearchProject {
+    fn from(project: &ResearchProject) -> Self {
+        Self {
+            slug: project.slug.clone(),
+            title: project.title.clone(),
+            summary: project.summary.clone(),
+            domain: project.domain.clone(),
+            artifacts: project
+                .artifacts
+                .iter()
+                .filter(|artifact| {
+                    artifact.access == ResearchArtifactAccess::Public
+                        && artifact.reviewed
+                        && artifact
+                            .license
+                            .as_deref()
+                            .is_some_and(|license| !license.trim().is_empty())
+                        && is_public_https_url(&artifact.url)
+                })
+                .cloned()
+                .collect(),
+            fact_evidence: project.fact_evidence.clone(),
+            published_at: project.published_at,
+        }
+    }
+}
+
+fn is_public_https_url(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some_and(|host| !host.is_empty())
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
+}
+
+fn is_online_citation_url(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some_and(|host| !host.is_empty())
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NewResearchProject {
+    pub title: String,
+    pub summary: String,
+    pub intent: String,
+    pub domain: String,
+    pub owner: String,
+    pub budget_limit_usdt: Option<String>,
+    #[serde(default)]
+    pub resource_limits: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct ResearchProjectPatch {
+    pub summary: Option<String>,
+    pub intent: Option<String>,
+    pub owner: Option<String>,
+    pub status: Option<ResearchProjectStatus>,
+    pub visibility: Option<ResearchVisibility>,
+    pub progress_pct: Option<i32>,
+    pub next_action: Option<String>,
+    pub budget_limit_usdt: Option<String>,
+    pub budget_spent_usdt: Option<String>,
+    pub resource_limits: Option<Value>,
+    pub milestones: Option<Vec<ResearchMilestone>>,
+    pub evidence_urls: Option<Vec<String>>,
+    pub fact_evidence: Option<Vec<ResearchFactEvidence>>,
+    pub artifacts: Option<Vec<ResearchArtifact>>,
+    pub review_gates: Option<ResearchReviewGates>,
+    pub sandbox: Option<ResearchSandbox>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServiceSnapshot {
     pub service_key: String,

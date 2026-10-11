@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::Result;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use chrono::Duration as ChronoDuration;
 use futures::{StreamExt, stream};
 use reqwest::Client;
@@ -126,6 +126,25 @@ impl ConductorService {
 
     pub fn authorize_admin(&self, headers: &HeaderMap) -> Result<(), ApiError> {
         self.authorize_admin_with_token(headers, None)
+    }
+
+    /// Require a configured secret for private research records and controls.
+    /// General local-development routes may retain the existing no-token
+    /// behaviour, but private project data must fail closed when unconfigured.
+    pub fn require_configured_admin(&self, headers: &HeaderMap) -> Result<(), ApiError> {
+        if self
+            .config
+            .security
+            .admin_token
+            .as_deref()
+            .is_none_or(|token| token.trim().is_empty())
+        {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a Conductor admin token must be configured before accessing private research projects",
+            ));
+        }
+        self.authorize_admin(headers)
     }
 
     pub fn authorize_admin_with_token(
