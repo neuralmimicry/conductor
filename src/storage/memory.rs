@@ -9,9 +9,9 @@ use uuid::Uuid;
 use crate::{
     models::{
         ConductorEvent, DiscoveryRun, FindingEvidence, FindingProvenance, FindingRecord,
-        ImprovementCycle, RepositorySnapshot, ServiceMetricSample, ServiceSnapshot,
-        TraceabilityLink, WorkExecution, WorkItem, WorkItemListFilter, WorkItemListPage,
-        WorkItemPatch,
+        ImprovementCycle, RepositorySnapshot, ResearchProject, ServiceMetricSample,
+        ServiceSnapshot, TraceabilityLink, WorkExecution, WorkItem, WorkItemListFilter,
+        WorkItemListPage, WorkItemPatch,
     },
     repository::ConductorRepository,
 };
@@ -30,6 +30,7 @@ pub struct MemoryRepository {
     executions: RwLock<HashMap<Uuid, WorkExecution>>,
     cycles: RwLock<Vec<ImprovementCycle>>,
     events: RwLock<Vec<ConductorEvent>>,
+    research_projects: RwLock<HashMap<Uuid, ResearchProject>>,
     claim_guard: Mutex<()>,
 }
 
@@ -479,5 +480,44 @@ impl ConductorRepository for MemoryRepository {
         events.sort_by(|left, right| right.created_at.cmp(&left.created_at));
         events.truncate(limit);
         Ok(events)
+    }
+
+    async fn upsert_research_project(&self, project: &ResearchProject) -> Result<()> {
+        self.research_projects
+            .write()
+            .await
+            .insert(project.id, project.clone());
+        Ok(())
+    }
+
+    async fn list_research_projects(&self) -> Result<Vec<ResearchProject>> {
+        let mut projects: Vec<_> = self
+            .research_projects
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        projects.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.slug.cmp(&right.slug))
+        });
+        Ok(projects)
+    }
+
+    async fn get_research_project(&self, id: Uuid) -> Result<Option<ResearchProject>> {
+        Ok(self.research_projects.read().await.get(&id).cloned())
+    }
+
+    async fn get_research_project_by_slug(&self, slug: &str) -> Result<Option<ResearchProject>> {
+        Ok(self
+            .research_projects
+            .read()
+            .await
+            .values()
+            .find(|project| project.slug == slug)
+            .cloned())
     }
 }

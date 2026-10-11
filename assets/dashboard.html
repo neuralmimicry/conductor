@@ -189,10 +189,22 @@
     .link-list { display: grid; gap: 10px; }
     .link-item { padding: 12px; border-radius: 14px; border: 1px solid var(--line); background: rgba(255,255,255,0.03); }
     .summary-lines { display: grid; gap: 10px; }
+    .research-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .research-card { display: grid; gap: 12px; background: var(--panel-strong); border: 1px solid var(--line); border-radius: 18px; padding: 16px; min-width: 0; }
+    .research-create { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .research-create .wide { grid-column: 1 / -1; }
+    .research-card details { border-top: 1px solid var(--line); padding-top: 10px; }
+    .research-card summary { cursor: pointer; color: var(--accent); }
+    .progress-track { height: 8px; border-radius: 999px; background: rgba(255,255,255,0.08); overflow: hidden; }
+    .progress-track span { display: block; height: 100%; background: linear-gradient(90deg, #d9a441, #4fba8f); }
+    .research-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .research-fields .wide { grid-column: 1 / -1; }
+    .research-field label { display: block; color: var(--muted); font-size: 0.72rem; margin-bottom: 5px; }
     @media (max-width: 1100px) {
-      .hero, .grid, .cards { grid-template-columns: 1fr; }
+      .hero, .grid, .cards, .research-grid { grid-template-columns: 1fr; }
       .control-version { margin-left: 0; width: 100%; }
     }
+    @media (max-width: 700px) { .research-create, .research-fields { grid-template-columns: 1fr; } .research-create .wide, .research-fields .wide { grid-column: auto; } }
   </style>
 </head>
 <body>
@@ -293,6 +305,26 @@
       <div id="cycles"></div>
     </div>
   </section>
+  <section class="panel" id="research-projects-section">
+    <div class="section-head">
+      <div>
+        <h2 class="section-title">Research &amp; Projects</h2>
+        <div class="muted">Humanity-benefiting research coordinated through Refiner, with evidence, review, budget and publication status tracked here. USDT ROI remains the primary funding constraint.</div>
+      </div>
+      <button class="secondary" id="refresh-research">Refresh Projects</button>
+    </div>
+    <form class="research-create" id="research-create-form">
+      <div class="research-field"><label for="research-title">Project title</label><input id="research-title" maxlength="160" required /></div>
+      <div class="research-field"><label for="research-domain">Research domain</label><select id="research-domain"><option value="science">Science</option><option value="mathematics">Mathematics</option><option value="humanities">Humanities</option><option value="education">Education</option><option value="languages">Languages</option><option value="law_ethics">Law &amp; ethics</option><option value="arts">Arts</option><option value="cross_disciplinary">Cross-disciplinary</option></select></div>
+      <div class="research-field wide"><label for="research-summary">Summary</label><textarea id="research-summary" maxlength="4000" required></textarea></div>
+      <div class="research-field wide"><label for="research-intent">Research intent and success criteria</label><textarea id="research-intent" maxlength="20000" required></textarea></div>
+      <div class="research-field"><label for="research-budget">Maximum budget (USDT)</label><input id="research-budget" inputmode="decimal" value="0" required /><span class="muted">Required ceiling; use 0 to prohibit paid spend.</span></div>
+      <div class="research-field"><label for="research-resource-limits">Resource limits (JSON object)</label><input id="research-resource-limits" value='{"max_cost_usdt":"0","network":"online-research-only"}' /><span class="muted">Queueing is blocked until explicit resource limits are recorded.</span></div>
+      <div class="actions wide"><button type="submit">Create Private Project</button><span class="muted" id="research-action-status" role="status"></span></div>
+    </form>
+    <div id="research-projects" class="research-grid"><div class="muted">Loading research projects…</div></div>
+    <p class="muted">Project records and sandbox state are tracked here. Sandbox provisioning, customer-only artifact delivery and customer sign-in are not connected by this dashboard yet; no paid lab resources are launched automatically.</p>
+  </section>
   <section class="panel">
     <div class="section-head"><h2 class="section-title">Service Topology</h2></div>
     <div class="table-wrap">
@@ -334,11 +366,14 @@ const state = {
   cyclesFetchedAt: 0,
   graphCache: null,
   graphFetchedAt: 0,
+  researchProjectsCache: null,
+  researchProjectsFetchedAt: 0,
 };
 const LIVE_REFRESH_MIN_MS = 1500;
 const SERVICES_REFRESH_MS = 10000;
 const CYCLES_REFRESH_MS = 10000;
 const GRAPH_REFRESH_MS = 30000;
+const RESEARCH_PROJECTS_REFRESH_MS = 15000;
 let eventSource = null;
 let eventRetryTimer = null;
 let reloadTimer = null;
@@ -359,6 +394,8 @@ const els = {
   workItemsPageLabel: document.getElementById('work-items-page-label'),
   workItemsPrevious: document.getElementById('work-items-previous'),
   workItemsNext: document.getElementById('work-items-next'),
+  researchProjects: document.getElementById('research-projects'), researchCreateForm: document.getElementById('research-create-form'),
+  researchActionStatus: document.getElementById('research-action-status'), refreshResearch: document.getElementById('refresh-research'),
   syncSelected: document.getElementById('sync-selected'), createJira: document.getElementById('create-jira'), publishConfluence: document.getElementById('publish-confluence'),
 };
 els.token.value = state.token; updateAuthBadge();
@@ -409,6 +446,8 @@ function resetDashboardCaches() {
   state.cyclesFetchedAt = 0;
   state.graphCache = null;
   state.graphFetchedAt = 0;
+  state.researchProjectsCache = null;
+  state.researchProjectsFetchedAt = 0;
 }
 function connectEventStream() {
   if (eventSource || typeof EventSource === 'undefined') {
@@ -517,6 +556,115 @@ function renderServices(services) {
 }
 function renderCycles(cycles) {
   els.cycles.innerHTML = cycles.map((cycle) => `<div class="cycle"><div><strong>${cycle.summary}</strong></div><div class="muted">${new Date(cycle.finished_at).toLocaleString()} · ${cycle.status}</div><div>${(cycle.source_services || []).map((item) => `<span class="pill">${item}</span>`).join('')}</div>${cycle.gail_response ? `<details><summary>Gail advisory</summary><pre class="mono">${JSON.stringify(cycle.gail_response, null, 2)}</pre></details>` : ''}</div>`).join('') || '<div class="muted">No improvement cycles recorded yet.</div>';
+}
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
+}
+function researchSafeUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) return '';
+    return url.href;
+  } catch (_error) { return ''; }
+}
+function researchSafeCitationUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && !url.username && !url.password ? url.href : '';
+  } catch (_error) { return ''; }
+}
+function renderResearchProjects(projects, errorMessage) {
+  if (errorMessage) {
+    els.researchProjects.innerHTML = `<div class="detail-block"><strong>Research projects unavailable</strong><div class="muted">${escapeHtml(errorMessage)}. A configured Conductor admin token is required to view private project records.</div></div>`;
+    return;
+  }
+  if (!projects.length) {
+    els.researchProjects.innerHTML = '<div class="detail-block muted">No research projects have been created. Start with a scoped question, measurable success criteria and an explicit resource ceiling.</div>';
+    return;
+  }
+  const gateNames = ['subject', 'quality', 'evidence', 'privacy', 'safety', 'licensing', 'accessibility'];
+  els.researchProjects.innerHTML = projects.map((project) => {
+    const id = escapeHtml(project.id);
+    const artifacts = (project.artifacts || []).map((artifact) => {
+      const url = artifact.access === 'public' ? researchSafeUrl(artifact.url) : '';
+      const link = url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">Open reviewed public material</a>` : '';
+      const restricted = artifact.access === 'customer' ? 'Customer material; authenticated delivery is not connected.' : (artifact.access === 'private' ? 'Private material.' : 'Public link failed URL validation.');
+      return `<div class="link-item"><strong>${escapeHtml(artifact.title)}</strong> <span class="pill">${escapeHtml(artifact.media_type)}</span><div class="muted">${escapeHtml(artifact.license || 'No licence recorded')} · ${artifact.reviewed ? 'reviewed' : 'awaiting review'}</div>${link || `<div class="muted">${restricted}</div>`}</div>`;
+    }).join('') || '<div class="muted">No generated or reviewed materials recorded yet.</div>';
+    const milestones = (project.milestones || []).map((milestone) => `<div class="link-item"><strong>${escapeHtml(milestone.title)}</strong> <span class="pill">${escapeHtml(milestone.status)}</span><div class="muted">Updated ${escapeHtml(formatDateTime(milestone.updated_at))}</div></div>`).join('') || '<div class="muted">No milestones recorded yet.</div>';
+    const evidence = (project.evidence_urls || []).map((url) => {
+      const safe = researchSafeUrl(url);
+      return safe ? `<div><a href="${escapeHtml(safe)}" target="_blank" rel="noopener noreferrer">${escapeHtml(safe)}</a></div>` : `<div class="muted">Invalid evidence URL omitted.</div>`;
+    }).join('') || '<div class="muted">No evidence links recorded yet.</div>';
+    const factEvidence = (project.fact_evidence || []).map((fact) => {
+      const citations = (fact.citations || []).map((citation) => {
+        const safe = researchSafeCitationUrl(citation.url);
+        const source = safe ? `<a href="${escapeHtml(safe)}" target="_blank" rel="noopener noreferrer">${escapeHtml(citation.title)}</a>` : escapeHtml(citation.title);
+        return `<div>${source} · ${escapeHtml(citation.publisher)} · accessed ${escapeHtml(formatDateTime(citation.accessed_at))}</div>`;
+      }).join('');
+      return `<div class="link-item"><strong>${escapeHtml(fact.claim)}</strong><div class="muted">${(fact.citations || []).length} cited source(s)</div>${citations}</div>`;
+    }).join('') || '<div class="muted">No claim-by-claim source matrix recorded.</div>';
+    const gates = gateNames.map((name) => {
+      const gate = project.review_gates?.[name] || {};
+      return `<div><span class="pill">${escapeHtml(name)}: ${gate.approved ? 'approved' : 'pending'}</span><span class="muted">${escapeHtml(gate.reviewer || 'no reviewer')} · ${escapeHtml(formatDateTime(gate.reviewed_at))}</span></div>`;
+    }).join('');
+    const sandbox = project.sandbox || {};
+    const resources = escapeHtml(JSON.stringify(project.resource_limits || {}, null, 2));
+    const sandboxManifest = escapeHtml(JSON.stringify(sandbox.resource_manifest || {}, null, 2));
+    const patchExample = JSON.stringify({ budget_limit_usdt: project.budget_limit_usdt, budget_spent_usdt: project.budget_spent_usdt, resource_limits: project.resource_limits || {}, milestones: project.milestones || [], evidence_urls: project.evidence_urls || [], fact_evidence: project.fact_evidence || [], artifacts: project.artifacts || [], review_gates: project.review_gates || {}, sandbox: project.sandbox || {} }, null, 2);
+    return `<article class="research-card" data-project-card="${id}">
+      <div><div class="section-head"><h3>${escapeHtml(project.title)}</h3><span class="pill">${escapeHtml(project.status)}</span></div><div class="muted">${escapeHtml(project.domain)} · ${escapeHtml(project.owner)} · ${escapeHtml(project.visibility)}</div></div>
+      <div>${escapeHtml(project.summary)}</div><div class="muted"><strong>Intent:</strong> ${escapeHtml(project.intent)}</div>
+      <div><div class="section-head"><span>Progress</span><strong>${escapeHtml(project.progress_pct)}%</strong></div><div class="progress-track" role="progressbar" aria-valuenow="${Math.max(0, Math.min(100, Number(project.progress_pct) || 0))}" aria-valuemin="0" aria-valuemax="100"><span style="width:${Math.max(0, Math.min(100, Number(project.progress_pct) || 0))}%"></span></div></div>
+      <div class="muted"><strong>Next action:</strong> ${escapeHtml(project.next_action || 'None recorded')}</div>
+      <div class="muted">Budget limit: ${escapeHtml(project.budget_limit_usdt || 'unset')} USDT · spent: ${escapeHtml(project.budget_spent_usdt || 'not recorded')} USDT · Refiner items: ${(project.solver_work_item_ids || []).length}</div>
+      <div class="research-fields">
+        <div class="research-field"><label>Status</label><select data-project-field="status" data-id="${id}">${['proposed','planning','active','review','published','paused','blocked','completed','withdrawn'].map((status) => `<option value="${status}" ${status === project.status ? 'selected' : ''}>${status}</option>`).join('')}</select></div>
+        <div class="research-field"><label>Progress (%)</label><input type="number" min="0" max="100" data-project-field="progress_pct" data-id="${id}" value="${Math.max(0, Math.min(100, Number(project.progress_pct) || 0))}" /></div>
+        <div class="research-field wide"><label>Next action</label><input data-project-field="next_action" data-id="${id}" value="${escapeHtml(project.next_action || '')}" maxlength="1000" /></div>
+        <div class="actions wide"><button class="secondary" data-project-save="${id}">Save Progress</button><button class="secondary" data-project-queue="${id}" ${['published','withdrawn'].includes(project.status) ? 'disabled' : ''}>Queue Refiner Research</button></div>
+      </div>
+      <details><summary>Evidence, milestones, review gates, materials and sandbox</summary><div class="detail-card" style="margin-top:10px">
+        <div class="detail-block"><h4>Milestones</h4>${milestones}</div><div class="detail-block"><h4>Evidence links</h4>${evidence}</div><div class="detail-block"><h4>Claim-by-claim citations</h4><div class="link-list">${factEvidence}</div><div class="muted">Each factual claim needs two distinct publisher identities and two distinct online HTTPS sources, then an independent evidence review.</div></div>
+        <div class="detail-block"><h4>Publication review gates</h4>${gates}</div><div class="detail-block"><h4>Materials</h4><div class="link-list">${artifacts}</div></div>
+        <div class="detail-block"><h4>Sandbox tracking</h4><div class="muted">${escapeHtml(sandbox.status || 'not_requested')} · deployment ${escapeHtml(sandbox.deployment_id || 'none')} · expires ${escapeHtml(formatDateTime(sandbox.expires_at))} · cleanup verified ${escapeHtml(formatDateTime(sandbox.cleanup_verified_at))}</div><pre class="mono">${sandboxManifest}</pre><div class="muted">This dashboard records sandbox state; it does not provision or tear down infrastructure.</div></div>
+        <div class="detail-block"><h4>Resource limits</h4><pre class="mono">${resources}</pre></div>
+        <div class="detail-block"><h4>Advanced metadata patch (JSON)</h4><textarea data-project-patch="${id}" aria-label="Advanced project patch JSON">${escapeHtml(patchExample)}</textarea><button class="secondary" data-project-patch-save="${id}">Save Metadata Patch</button></div>
+      </div></details>
+      <div class="muted">Updated ${escapeHtml(formatDateTime(project.updated_at))}</div>
+    </article>`;
+  }).join('');
+
+  els.researchProjects.querySelectorAll('[data-project-save]').forEach((button) => button.addEventListener('click', async () => {
+    const id = button.dataset.projectSave;
+    const values = {};
+    els.researchProjects.querySelectorAll(`[data-id="${id}"][data-project-field]`).forEach((input) => {
+      values[input.dataset.projectField] = input.dataset.projectField === 'progress_pct' ? Number(input.value) : input.value;
+    });
+    await submitResearchPatch(id, values);
+  }));
+  els.researchProjects.querySelectorAll('[data-project-queue]').forEach((button) => button.addEventListener('click', async () => {
+    try {
+      await fetchJson(`/api/v1/research-projects/${button.dataset.projectQueue}/queue-research`, { method: 'POST' });
+      els.researchActionStatus.textContent = 'Refiner work item created; it remains subject to the standard approval and verification gates.';
+      await load(true);
+    } catch (error) { els.researchActionStatus.textContent = error.message; }
+  }));
+  els.researchProjects.querySelectorAll('[data-project-patch-save]').forEach((button) => button.addEventListener('click', async () => {
+    const area = els.researchProjects.querySelector(`[data-project-patch="${button.dataset.projectPatchSave}"]`);
+    try {
+      const values = JSON.parse(area.value);
+      if (!values || Array.isArray(values) || typeof values !== 'object') throw new Error('Patch must be a JSON object.');
+      await submitResearchPatch(button.dataset.projectPatchSave, values);
+    } catch (error) { els.researchActionStatus.textContent = `Invalid project patch: ${error.message}`; }
+  }));
+}
+async function submitResearchPatch(id, values) {
+  try {
+    await fetchJson(`/api/v1/research-projects/${id}`, { method: 'PATCH', body: JSON.stringify(values) });
+    els.researchActionStatus.textContent = 'Project updated.';
+    await load(true);
+  } catch (error) { els.researchActionStatus.textContent = error.message; }
 }
 function toDateTimeLocal(value) {
   if (!value) return '';
@@ -677,6 +825,7 @@ async function load(force = false) {
     const refreshServices = force || !state.servicesCache || shouldRefresh(state.servicesFetchedAt, SERVICES_REFRESH_MS);
     const refreshCycles = force || !state.cyclesCache || shouldRefresh(state.cyclesFetchedAt, CYCLES_REFRESH_MS);
     const refreshGraph = force || !state.graphCache || shouldRefresh(state.graphFetchedAt, GRAPH_REFRESH_MS);
+    const refreshResearchProjects = force || !state.researchProjectsCache || shouldRefresh(state.researchProjectsFetchedAt, RESEARCH_PROJECTS_REFRESH_MS);
     const traceabilityPromise = state.selectedWorkItemId
       ? fetchJson(`/api/v1/work-items/${state.selectedWorkItemId}/traceability`).catch((error) => ({ __error: error.message }))
       : Promise.resolve(null);
@@ -684,13 +833,16 @@ async function load(force = false) {
     if (els.workItemsStatusFilter.value) workItemsParams.set('status', els.workItemsStatusFilter.value);
     if (els.workItemsServiceFilter.value.trim()) workItemsParams.set('target_service', els.workItemsServiceFilter.value.trim());
     if (els.workItemsSearchFilter.value.trim()) workItemsParams.set('search', els.workItemsSearchFilter.value.trim());
-    const [summary, services, workItems, cycles, traceability, graph] = await Promise.all([
+    const [summary, services, workItems, cycles, traceability, graph, researchProjects] = await Promise.all([
       fetchJson('/api/v1/summary'),
       refreshServices ? fetchJson('/api/v1/services') : Promise.resolve(state.servicesCache),
       fetchJson(`/api/v1/work-items?${workItemsParams.toString()}`),
       refreshCycles ? fetchJson('/api/v1/cycles?limit=10') : Promise.resolve(state.cyclesCache),
       traceabilityPromise,
       refreshGraph ? fetchJson('/api/v1/traceability/graph') : Promise.resolve(state.graphCache),
+      refreshResearchProjects
+        ? fetchJson('/api/v1/research-projects').catch((error) => ({ __error: error.message }))
+        : Promise.resolve(state.researchProjectsCache),
     ]);
     if (refreshServices) {
       state.servicesCache = services;
@@ -704,11 +856,15 @@ async function load(force = false) {
       state.graphCache = graph;
       state.graphFetchedAt = Date.now();
     }
+    if (refreshResearchProjects) {
+      state.researchProjectsCache = researchProjects?.__error ? null : researchProjects;
+      state.researchProjectsFetchedAt = Date.now();
+    }
     const items = workItems.work_items || workItems;
     const servicesPayload = state.servicesCache || services;
     const cyclesPayload = state.cyclesCache || cycles;
     const graphPayload = state.graphCache || graph;
-    renderSummary(summary); renderExternalSummary(summary, graphPayload.graph || graphPayload); renderServices(servicesPayload.services || servicesPayload); renderWorkItems(items, workItems.pagination); renderCycles(cyclesPayload.cycles || cyclesPayload); renderTraceability(traceability?.traceability || null, traceability?.__error); updateAuthBadge();
+    renderSummary(summary); renderExternalSummary(summary, graphPayload.graph || graphPayload); renderServices(servicesPayload.services || servicesPayload); renderWorkItems(items, workItems.pagination); renderCycles(cyclesPayload.cycles || cyclesPayload); renderTraceability(traceability?.traceability || null, traceability?.__error); renderResearchProjects(researchProjects?.projects || [], researchProjects?.__error); updateAuthBadge();
     connectEventStream();
   } catch (error) {
     closeEventStream();
@@ -728,6 +884,32 @@ els.refresh.addEventListener('click', () => { resetDashboardCaches(); load(true)
 els.workItemsApplyFilter.addEventListener('click', () => { state.workItemsOffset = 0; load(true); });
 els.workItemsPrevious.addEventListener('click', () => { state.workItemsOffset = Math.max(0, state.workItemsOffset - state.workItemsPageSize); load(true); });
 els.workItemsNext.addEventListener('click', () => { state.workItemsOffset += state.workItemsPageSize; load(true); });
+els.refreshResearch.addEventListener('click', () => { state.researchProjectsCache = null; state.researchProjectsFetchedAt = 0; load(true); });
+els.researchCreateForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  els.researchActionStatus.textContent = 'Creating private project…';
+  try {
+    const resourceLimits = JSON.parse(document.getElementById('research-resource-limits').value || '{}');
+    if (!resourceLimits || Array.isArray(resourceLimits) || typeof resourceLimits !== 'object') throw new Error('Resource limits must be a JSON object.');
+    const budget = document.getElementById('research-budget').value.trim();
+    await fetchJson('/api/v1/research-projects', {
+      method: 'POST',
+      body: JSON.stringify({
+        title: document.getElementById('research-title').value,
+        domain: document.getElementById('research-domain').value,
+        summary: document.getElementById('research-summary').value,
+        intent: document.getElementById('research-intent').value,
+        owner: 'Conductor',
+        budget_limit_usdt: budget || null,
+        resource_limits: resourceLimits,
+      }),
+    });
+    els.researchCreateForm.reset();
+    els.researchActionStatus.textContent = 'Private project created. Review its scope and limits before queueing research.';
+    resetDashboardCaches();
+    await load(true);
+  } catch (error) { els.researchActionStatus.textContent = error.message; }
+});
 els.runDiscovery.addEventListener('click', async () => { try { await fetchJson('/api/v1/discovery/run', { method: 'POST' }); resetDashboardCaches(); await load(true); } catch (error) { updateAuthBadge(error.message); } });
 els.runPlanning.addEventListener('click', async () => { try { await fetchJson('/api/v1/planning/run', { method: 'POST' }); resetDashboardCaches(); await load(true); } catch (error) { updateAuthBadge(error.message); } });
 els.runExecution.addEventListener('click', async () => { try { await fetchJson('/api/v1/execution/run', { method: 'POST' }); resetDashboardCaches(); await load(true); } catch (error) { updateAuthBadge(error.message); } });

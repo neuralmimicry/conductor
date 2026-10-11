@@ -14,9 +14,9 @@ use crate::{
     models::{
         ConductorEvent, DeliveryStage, DiscoveryRun, ExecutionStatus, FindingEvidence,
         FindingProvenance, FindingRecord, FindingSeverity, FindingStatus, ImprovementCycle,
-        RepositorySnapshot, RolloutStrategy, RunStatus, ServiceHealth, ServiceMetricSample,
-        ServiceSnapshot, TraceabilityLink, WorkExecution, WorkItem, WorkItemListFilter,
-        WorkItemListPage, WorkItemPatch, WorkStatus,
+        RepositorySnapshot, ResearchProject, RolloutStrategy, RunStatus, ServiceHealth,
+        ServiceMetricSample, ServiceSnapshot, TraceabilityLink, WorkExecution, WorkItem,
+        WorkItemListFilter, WorkItemListPage, WorkItemPatch, WorkStatus,
     },
     repository::ConductorRepository,
 };
@@ -1035,6 +1035,56 @@ impl ConductorRepository for PostgresRepository {
         rows.into_iter().map(map_conductor_event).collect()
     }
 
+    async fn upsert_research_project(&self, project: &ResearchProject) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO research_projects (id, slug, status, visibility, domain, updated_at, payload)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (id) DO UPDATE SET
+                slug = EXCLUDED.slug,
+                status = EXCLUDED.status,
+                visibility = EXCLUDED.visibility,
+                domain = EXCLUDED.domain,
+                updated_at = EXCLUDED.updated_at,
+                payload = EXCLUDED.payload
+            "#,
+        )
+        .bind(project.id)
+        .bind(&project.slug)
+        .bind(project.status.as_str())
+        .bind(project.visibility.as_str())
+        .bind(&project.domain)
+        .bind(project.updated_at)
+        .bind(Json(project.clone()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_research_projects(&self) -> Result<Vec<ResearchProject>> {
+        let rows =
+            sqlx::query("SELECT payload FROM research_projects ORDER BY updated_at DESC, slug ASC")
+                .fetch_all(&self.pool)
+                .await?;
+        rows.into_iter().map(map_research_project).collect()
+    }
+
+    async fn get_research_project(&self, id: Uuid) -> Result<Option<ResearchProject>> {
+        let row = sqlx::query("SELECT payload FROM research_projects WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(map_research_project).transpose()
+    }
+
+    async fn get_research_project_by_slug(&self, slug: &str) -> Result<Option<ResearchProject>> {
+        let row = sqlx::query("SELECT payload FROM research_projects WHERE slug = $1")
+            .bind(slug)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(map_research_project).transpose()
+    }
+
     async fn prune_history(&self, before: DateTime<Utc>) -> Result<()> {
         // Discovery runs own service metric samples through a foreign key with
         // ON DELETE CASCADE. Delete the parent first so this high-volume
@@ -1332,4 +1382,8 @@ fn map_conductor_event(row: PgRow) -> Result<ConductorEvent> {
         created_at: row.try_get("created_at")?,
         payload: row.try_get::<Json<serde_json::Value>, _>("payload")?.0,
     })
+}
+
+fn map_research_project(row: PgRow) -> Result<ResearchProject> {
+    Ok(row.try_get::<Json<ResearchProject>, _>("payload")?.0)
 }
