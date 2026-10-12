@@ -1525,7 +1525,8 @@ impl ConductorService {
             if issue_state != "active" || !history_complete {
                 continue;
             }
-            let (weekday, hour, minute) = parse_weekly_window(&policy.weekly_window_utc)?;
+            let (weekday, hour, minute) =
+                parse_weekly_window(&policy.weekly_window_utc).map_err(anyhow::Error::msg)?;
             let suggested_start =
                 next_window_after(now, weekday, hour, minute, policy.minimum_notice_hours);
             let id = proposal_id(
@@ -1694,8 +1695,9 @@ impl ConductorService {
                             .get("issue_state")
                             .and_then(Value::as_str)
                             .unwrap_or("unknown")
+                            .to_string()
                     } else {
-                        "stale"
+                        "stale".to_string()
                     };
                     object.insert("chassis_id".to_string(), json!(chassis.id));
                     object.insert("chassis_label".to_string(), json!(chassis.label));
