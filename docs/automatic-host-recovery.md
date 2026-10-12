@@ -15,8 +15,9 @@ those services, a complete configured dependency map with healthy live
 probes, healthy or explicitly unavailable Prometheus/Grafana observations,
 and a successful Gail trainer-status read showing no active job requesting the
 host. Missing, stale, ambiguous or contradictory inputs suppress the action
-and are exposed as blockers. `SYS_V3_Battery` is recorded as a warning; other
-critical sensors and an unavailable system event log block restart.
+and are exposed as blockers. A critical `SYS_V3_Battery` reading is a warning
+for a warm restart but blocks a cold restart; other critical sensors and an
+unavailable system event log block either restart.
 
 Each allowlisted target maps Continuum's exact service labels to Conductor
 `service_key` values. Dependencies map exact Continuum device IDs to one or

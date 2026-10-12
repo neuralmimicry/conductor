@@ -33,11 +33,15 @@ pub struct HostRecoveryAssessment {
 
 pub fn assess_host_recovery(
     input: &HostRecoveryInput,
+    action: &str,
     minimum_offline_seconds: u64,
     maximum_observation_age_seconds: u64,
 ) -> HostRecoveryAssessment {
     let mut blockers = Vec::new();
     let mut warnings = Vec::new();
+    if !matches!(action, "warm_restart" | "cold_restart") {
+        blockers.push("host recovery action is unsupported".to_string());
+    }
     if input.device_id.trim().is_empty() || input.controller_id.trim().is_empty() {
         blockers.push("host or controller identity is missing".to_string());
     }
@@ -79,10 +83,14 @@ pub fn assess_host_recovery(
     blockers.extend(input.power_faults.iter().cloned());
     for sensor in &input.critical_sensors {
         if sensor.eq_ignore_ascii_case("SYS_V3_Battery") {
-            // A warm IPMI reset does not remove chassis power. Record the
-            // degraded RTC battery, but never escalate this automatic path to
-            // cold power-cycle while the sensor is critical.
-            warnings.push(format!("critical BMC battery sensor: {sensor}"));
+            if action == "warm_restart" {
+                // A warm IPMI reset does not remove chassis power. A cold
+                // power-cycle remains blocked until this critical sensor has
+                // been diagnosed.
+                warnings.push(format!("critical BMC battery sensor: {sensor}"));
+            } else {
+                blockers.push(format!("critical BMC sensor blocks cold restart: {sensor}"));
+            }
         } else {
             blockers.push(format!("critical BMC sensor blocks restart: {sensor}"));
         }
@@ -578,7 +586,7 @@ mod tests {
             critical_sensors: vec!["SYS_V3_Battery".to_string()],
             ..HostRecoveryInput::default()
         };
-        let assessment = assess_host_recovery(&input, 3_600, 120);
+        let assessment = assess_host_recovery(&input, "warm_restart", 3_600, 120);
         assert!(!assessment.eligible);
         assert!(
             assessment
@@ -593,7 +601,7 @@ mod tests {
 
         input.scheduler_status_fresh = true;
         input.scheduler_blockers = vec!["active Slurm job requests qc04".to_string()];
-        let assessment = assess_host_recovery(&input, 3_600, 120);
+        let assessment = assess_host_recovery(&input, "warm_restart", 3_600, 120);
         assert!(!assessment.eligible);
         assert!(
             assessment
@@ -626,8 +634,16 @@ mod tests {
             critical_sensors: vec!["SYS_V3_Battery".to_string()],
             ..HostRecoveryInput::default()
         };
-        let assessment = assess_host_recovery(&input, 3_600, 120);
+        let assessment = assess_host_recovery(&input, "warm_restart", 3_600, 120);
         assert!(assessment.eligible, "{:?}", assessment.blockers);
         assert_eq!(assessment.warnings.len(), 1);
+
+        let cold = assess_host_recovery(&input, "cold_restart", 3_600, 120);
+        assert!(!cold.eligible);
+        assert!(
+            cold.blockers
+                .iter()
+                .any(|blocker| { blocker.contains("critical BMC sensor blocks cold restart") })
+        );
     }
 }

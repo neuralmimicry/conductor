@@ -939,6 +939,7 @@ impl ConductorService {
             };
             let mut assessment = crate::host_recovery::assess_host_recovery(
                 &input,
+                &target.action,
                 policy.minimum_offline_seconds,
                 policy.maximum_tracey_source_age_seconds,
             );
