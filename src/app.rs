@@ -1902,6 +1902,7 @@ mod tests {
                 payload: json!({
                     "issue_state": "active",
                     "issue_generation": "episode-1",
+                    "all_members_fresh": true,
                     "affected_devices": ["qc04"],
                     "critical_sensors": ["SYS_V3_Battery"],
                 }),
