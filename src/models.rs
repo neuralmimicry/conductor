@@ -1520,6 +1520,13 @@ pub struct ConductorEvent {
     pub payload: Value,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MaintenanceObservation {
+    pub chassis_id: String,
+    pub observed_at: DateTime<Utc>,
+    pub payload: Value,
+}
+
 impl ConductorEvent {
     pub fn new(event_type: impl Into<String>, message: impl Into<String>, payload: Value) -> Self {
         Self {

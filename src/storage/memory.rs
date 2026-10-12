@@ -9,9 +9,9 @@ use uuid::Uuid;
 use crate::{
     models::{
         ConductorEvent, DiscoveryRun, FindingEvidence, FindingProvenance, FindingRecord,
-        ImprovementCycle, RepositorySnapshot, ResearchProject, ServiceMetricSample,
-        ServiceSnapshot, TraceabilityLink, WorkExecution, WorkItem, WorkItemListFilter,
-        WorkItemListPage, WorkItemPatch,
+        ImprovementCycle, MaintenanceObservation, RepositorySnapshot, ResearchProject,
+        ServiceMetricSample, ServiceSnapshot, TraceabilityLink, WorkExecution, WorkItem,
+        WorkItemListFilter, WorkItemListPage, WorkItemPatch,
     },
     repository::ConductorRepository,
 };
@@ -30,6 +30,7 @@ pub struct MemoryRepository {
     executions: RwLock<HashMap<Uuid, WorkExecution>>,
     cycles: RwLock<Vec<ImprovementCycle>>,
     events: RwLock<Vec<ConductorEvent>>,
+    maintenance_observations: RwLock<HashMap<String, MaintenanceObservation>>,
     research_projects: RwLock<HashMap<Uuid, ResearchProject>>,
     claim_guard: Mutex<()>,
 }
@@ -480,6 +481,29 @@ impl ConductorRepository for MemoryRepository {
         events.sort_by(|left, right| right.created_at.cmp(&left.created_at));
         events.truncate(limit);
         Ok(events)
+    }
+
+    async fn upsert_maintenance_observation(
+        &self,
+        observation: &MaintenanceObservation,
+    ) -> Result<()> {
+        self.maintenance_observations
+            .write()
+            .await
+            .insert(observation.chassis_id.clone(), observation.clone());
+        Ok(())
+    }
+
+    async fn list_maintenance_observations(&self) -> Result<Vec<MaintenanceObservation>> {
+        let mut observations = self
+            .maintenance_observations
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        observations.sort_by(|left, right| left.chassis_id.cmp(&right.chassis_id));
+        Ok(observations)
     }
 
     async fn upsert_research_project(&self, project: &ResearchProject) -> Result<()> {

@@ -216,3 +216,22 @@ recovery:
   # explicit cluster label. Add further exact labels when required to make
   # replica series unambiguous; an empty target list keeps recovery disabled.
   targets: []
+
+# Centriq 2400 modules share chassis power. These pairs are monitored and
+# represented as one maintenance unit; the weekly slot is a suggestion only.
+maintenance:
+  enabled: true
+  interval_seconds: 60
+  minimum_notice_hours: 168
+  duration_minutes: 240
+  weekly_window_utc: "Sunday 02:00"
+  chassis:
+    - id: "centriq-qc00-qc01"
+      label: "Centriq 2400 chassis qc00/qc01"
+      device_ids: ["qc00", "qc01"]
+    - id: "centriq-qc02-qc03"
+      label: "Centriq 2400 chassis qc02/qc03"
+      device_ids: ["qc02", "qc03"]
+    - id: "centriq-qc04-qc05"
+      label: "Centriq 2400 chassis qc04/qc05"
+      device_ids: ["qc04", "qc05"]
