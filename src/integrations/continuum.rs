@@ -81,6 +81,65 @@ impl ContinuumClient {
         self.get_json("/health").await
     }
 
+    /// Read the verified device registry through Continuum. Host recovery must
+    /// never construct controller mappings from names or addresses on its own.
+    pub async fn device_inventory(&self) -> Result<Value> {
+        self.get_json("/devices/inventory").await
+    }
+
+    /// Read the bounded DHCP observations collected by Continuum.
+    pub async fn device_dhcp(&self) -> Result<Value> {
+        self.get_json("/devices/dhcp").await
+    }
+
+    pub async fn controller_diagnostics(&self, controller_id: &str) -> Result<Value> {
+        let mut request = self
+            .client
+            .get(format!("{}/devices/controllers/diagnostics", self.base_url))
+            .query(&[("controller_id", controller_id)]);
+        if let Some(token) = self
+            .bearer_token
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            request = request.bearer_auth(token);
+        }
+        super::decode_json(request.send().await?).await
+    }
+
+    pub async fn gail_trainer_status(&self, limit: usize) -> Result<Value> {
+        let mut request = self
+            .client
+            .get(format!("{}/gail/status/training", self.base_url))
+            .query(&[("limit", limit.clamp(1, 25))]);
+        if let Some(token) = self
+            .bearer_token
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            request = request.bearer_auth(token);
+        }
+        super::decode_json(request.send().await?).await
+    }
+
+    /// Submit only a fully formed action to Continuum's audited controller
+    /// endpoint. NMC validates the fresh inventory, dependency and outage
+    /// evidence again immediately before contacting the BMC.
+    pub async fn controller_action(&self, payload: &Value) -> Result<Value> {
+        let mut request = self
+            .client
+            .post(format!("{}/devices/controllers/actions", self.base_url))
+            .json(payload);
+        if let Some(token) = self
+            .bearer_token
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            request = request.bearer_auth(token);
+        }
+        super::decode_json(request.send().await?).await
+    }
+
     pub async fn deployment_recovery_status(
         &self,
         cluster_id: &str,

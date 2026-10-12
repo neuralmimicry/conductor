@@ -26,6 +26,12 @@ use crate::{
         ExecutionEventCallback, execute_prepared_work_item, execute_specific_work_item,
         prepare_specific_work_item, run_execution_cycle,
     },
+    host_recovery::{
+        HostRecoveryInput, continuum_data, critical_sensor_names, dhcp_has_device_lease,
+        diagnostic_observation_age_seconds, diagnostic_powered, diagnostic_safety_faults,
+        inventory_controller, inventory_device, inventory_is_fresh, tracey_host,
+        tracey_observation_age_seconds, tracey_offline_age_seconds, trainer_jobs_for_host,
+    },
     host_resources::reconcile_service_host_resources,
     integrations::{
         atlassian::AtlassianClients, continuum::ContinuumClient, probe_service,
@@ -597,6 +603,731 @@ impl ConductorService {
             }
         }
         Ok(actions)
+    }
+
+    /// Continuously assess only the physical hosts named in the explicit
+    /// allow-list. The intent is durable before Continuum is asked to perform
+    /// an audited BMC action, and an offline episode is never submitted twice.
+    pub async fn run_host_recovery_cycle(&self) -> Result<usize> {
+        let policy = &self.config.host_recovery;
+        if !policy.enabled || policy.targets.is_empty() {
+            return Ok(0);
+        }
+
+        let services = self.repository.list_service_snapshots().await?;
+        let continuum_service = services.iter().find(|item| item.service_key == "continuum");
+        let continuum =
+            ContinuumClient::from_sources(&self.config.integrations.continuum, continuum_service)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Continuum host-recovery integration is disabled")
+                })?;
+
+        let inventory = continuum.device_inventory().await?;
+        let dhcp = continuum.device_dhcp().await.ok();
+        let tracey = continuum.tracey_agents().await.ok();
+        let tracey_response_read_at_ms = tracey.as_ref().map(|_| now_utc().timestamp_millis());
+        let trainer_status = continuum.gail_trainer_status(25).await;
+        let events = self.repository.list_conductor_events(5_000).await?;
+        let history_complete = events.len() < 5_000;
+        let now = now_utc();
+        let now_ms = now.timestamp_millis();
+        let mut actions = 0usize;
+
+        for target in &policy.targets {
+            if actions >= policy.max_actions_per_cycle {
+                break;
+            }
+
+            let device = crate::host_recovery::inventory_device(&inventory, &target.device_id);
+            let inventory_data = continuum_data(&inventory);
+            let controller_id = device
+                .and_then(|item| item.get("controller_id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let device_match_count = inventory_data
+                .get("devices")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter(|item| {
+                            item.get("id").and_then(Value::as_str)
+                                == Some(target.device_id.as_str())
+                        })
+                        .count()
+                })
+                .unwrap_or_default();
+            let controller_match_count = inventory_data
+                .get("controllers")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter(|item| {
+                            item.get("id").and_then(Value::as_str) == Some(controller_id)
+                                && item.get("manages").and_then(Value::as_array).is_some_and(
+                                    |ids| {
+                                        ids.iter().any(|id| {
+                                            id.as_str() == Some(target.device_id.as_str())
+                                        })
+                                    },
+                                )
+                        })
+                        .count()
+                })
+                .unwrap_or_default();
+            let controller = inventory_controller(&inventory, controller_id);
+            let identity_verified = device_match_count == 1
+                && controller_match_count == 1
+                && device.is_some_and(|item| {
+                    item.get("controller_id").and_then(Value::as_str) == Some(controller_id)
+                });
+
+            let tracey_agent = tracey
+                .as_ref()
+                .and_then(|payload| tracey_host(payload, &target.device_id));
+            let link_state = tracey_agent
+                .and_then(|agent| agent.get("link_state").and_then(Value::as_str))
+                .or_else(|| {
+                    tracey_agent.and_then(|agent| agent.get("status").and_then(Value::as_str))
+                })
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let agent_stale = tracey_agent
+                .and_then(|agent| agent.get("stale").and_then(Value::as_bool))
+                .unwrap_or(false);
+            let host_offline = link_state == "offline" && agent_stale;
+            let host_online = matches!(link_state.as_str(), "online" | "healthy") && !agent_stale;
+            let tracey_age = tracey_agent.and_then(tracey_observation_age_seconds);
+            let tracey_timestamp_present = tracey_agent
+                .and_then(|agent| agent.get("last_query_epoch_ms"))
+                .and_then(Value::as_i64)
+                .is_some();
+            let offline_age = tracey_agent.and_then(tracey_offline_age_seconds);
+            let offline_last_seen_ms = tracey_agent
+                .and_then(|agent| agent.get("last_seen_epoch_ms"))
+                .and_then(Value::as_i64);
+            let dhcp_lease = dhcp
+                .as_ref()
+                .and_then(|payload| dhcp_has_device_lease(payload, &target.device_id));
+            let dhcp_fresh = dhcp.as_ref().is_some_and(|payload| {
+                continuum_data(payload)
+                    .get("inventory_stale")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                    && continuum_data(payload)
+                        .get("servers")
+                        .and_then(Value::as_object)
+                        .is_some_and(|servers| {
+                            servers.values().any(|server| {
+                                server.get("available").and_then(Value::as_bool) == Some(true)
+                                    && server.get("stale").and_then(Value::as_bool) == Some(false)
+                            })
+                        })
+            });
+
+            let diagnostics = if identity_verified {
+                continuum.controller_diagnostics(controller_id).await.ok()
+            } else {
+                None
+            };
+            let diagnostic_data = diagnostics.as_ref().map(continuum_data);
+            let diagnostic_identity = diagnostic_data.is_some_and(|data| {
+                data.get("controller_id").and_then(Value::as_str) == Some(controller_id)
+                    && data.get("inventory_stale").and_then(Value::as_bool) == Some(false)
+            });
+            let diagnostic_age = diagnostics
+                .as_ref()
+                .and_then(|value| diagnostic_observation_age_seconds(value, now_ms));
+            let diagnostic_fresh =
+                diagnostic_identity && diagnostic_age.is_some_and(|age| age <= 60);
+            let mut power_faults = diagnostics
+                .as_ref()
+                .map(diagnostic_safety_faults)
+                .unwrap_or_else(|| vec!["fresh BMC diagnostics are unavailable".to_string()]);
+            if diagnostics.is_some() && !diagnostic_fresh {
+                power_faults
+                    .push("BMC diagnostics are stale or identify another controller".to_string());
+            }
+            let critical_sensors = diagnostics
+                .as_ref()
+                .map(critical_sensor_names)
+                .unwrap_or_default();
+            let chassis_powered = diagnostics.as_ref().and_then(diagnostic_powered);
+
+            let scheduler_data = trainer_status.as_ref().ok().map(continuum_data);
+            let scheduler_fresh = scheduler_data.is_some_and(|data| {
+                trainer_status
+                    .as_ref()
+                    .ok()
+                    .and_then(|body| body.get("success"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                    && data
+                        .get("upstream_status")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|status| (200..300).contains(&status))
+                    && data.get("payload").is_some_and(Value::is_object)
+            });
+            let scheduler_blockers = trainer_status
+                .as_ref()
+                .ok()
+                .filter(|_| scheduler_fresh)
+                .map(|payload| trainer_jobs_for_host(payload, &target.device_id))
+                .unwrap_or_default();
+
+            let registered_services = device
+                .and_then(|item| item.get("services"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let map_exact = !registered_services.is_empty()
+                && registered_services
+                    .iter()
+                    .all(|name| target.service_map.contains_key(name))
+                && target.service_map.len() == registered_services.len();
+            let mut hosted_services_known = map_exact;
+            let mut hosted_services_unavailable = map_exact;
+            let mut hosted_observations = Vec::new();
+            let mut healthy_service_keys = BTreeSet::new();
+            for service_name in &registered_services {
+                let Some(service_key) = target.service_map.get(service_name) else {
+                    hosted_services_known = false;
+                    hosted_services_unavailable = false;
+                    continue;
+                };
+                let Some(snapshot) = services
+                    .iter()
+                    .find(|item| item.service_key == *service_key)
+                else {
+                    hosted_services_known = false;
+                    hosted_services_unavailable = false;
+                    continue;
+                };
+                if !service_is_mapped_to_host(snapshot, &target.device_id) {
+                    hosted_services_known = false;
+                    hosted_services_unavailable = false;
+                    continue;
+                }
+                match probe_service(&self.http, &self.config, snapshot).await {
+                    Ok(probe) => {
+                        let health = probe.health.as_str();
+                        let unavailable = matches!(
+                            probe.health,
+                            crate::models::ServiceHealth::Unreachable
+                                | crate::models::ServiceHealth::Missing
+                        );
+                        hosted_services_unavailable &= unavailable;
+                        if probe.health == crate::models::ServiceHealth::Healthy {
+                            healthy_service_keys.insert(service_key.clone());
+                        }
+                        hosted_observations.push(json!({
+                            "service": service_name,
+                            "state": if unavailable { "unavailable" } else { health },
+                            "observed_at_unix_ms": now_utc().timestamp_millis(),
+                            "source": "conductor_live_service_probe",
+                            "reference": bounded_host_evidence_text(
+                                &format!("service_key={service_key}; health={health}"),
+                                480,
+                            ),
+                        }));
+                    }
+                    Err(_) => {
+                        hosted_services_unavailable = false;
+                        hosted_observations.push(json!({
+                            "service": service_name,
+                            "state": "unknown",
+                            "observed_at_unix_ms": now_utc().timestamp_millis(),
+                            "source": "conductor_live_service_probe",
+                            "reference": format!("service_key={service_key}; probe failed"),
+                        }));
+                    }
+                }
+            }
+
+            let dependency_ids = device
+                .and_then(|item| item.get("depends_on"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let dependency_map_exact = dependency_ids
+                .iter()
+                .all(|id| target.dependency_map.contains_key(id))
+                && target.dependency_map.len() == dependency_ids.len();
+            let dependency_graph_complete = if dependency_ids.is_empty() {
+                target.allow_empty_dependencies
+            } else {
+                dependency_map_exact
+            };
+            let mut dependencies_healthy = dependency_graph_complete;
+            let mut dependency_observations = Vec::new();
+            for dependency_id in &dependency_ids {
+                let Some(keys) = target.dependency_map.get(dependency_id) else {
+                    dependencies_healthy = false;
+                    continue;
+                };
+                if keys.is_empty() {
+                    dependencies_healthy = false;
+                    continue;
+                }
+                let mut key_healthy = true;
+                for service_key in keys {
+                    let Some(snapshot) = services
+                        .iter()
+                        .find(|item| item.service_key == *service_key)
+                    else {
+                        key_healthy = false;
+                        continue;
+                    };
+                    match probe_service(&self.http, &self.config, snapshot).await {
+                        Ok(probe) if probe.health == crate::models::ServiceHealth::Healthy => {
+                            healthy_service_keys.insert(service_key.clone());
+                        }
+                        _ => key_healthy = false,
+                    }
+                }
+                dependencies_healthy &= key_healthy;
+                dependency_observations.push(json!({
+                    "dependency_id": dependency_id,
+                    "state": if key_healthy { "healthy" } else { "unhealthy" },
+                    "observed_at_unix_ms": now_utc().timestamp_millis(),
+                    "source": "conductor_live_service_probe",
+                    "reference": bounded_host_evidence_text(
+                        &format!("service_keys={}", keys.join(",")),
+                        480,
+                    ),
+                }));
+            }
+
+            let monitoring_state = self.probe_host_recovery_monitoring(&services).await;
+            let input = HostRecoveryInput {
+                device_id: target.device_id.clone(),
+                controller_id: controller_id.to_string(),
+                inventory_fresh: inventory_is_fresh(&inventory, now_ms),
+                identity_verified,
+                power_actions_enabled: crate::host_recovery::controller_power_actions_enabled(
+                    controller,
+                ),
+                host_reported_offline: host_offline,
+                offline_age_seconds: host_offline.then_some(offline_age).flatten(),
+                tracey_observation_age_seconds: tracey_age,
+                dhcp_fresh,
+                target_has_dhcp_lease: dhcp_lease,
+                chassis_powered,
+                power_faults,
+                critical_sensors,
+                hosted_services_known,
+                hosted_services_unavailable,
+                dependency_graph_complete,
+                dependencies_healthy,
+                scheduler_status_fresh: scheduler_fresh,
+                scheduler_blockers,
+                monitoring_state: monitoring_state.clone(),
+            };
+            let mut assessment = crate::host_recovery::assess_host_recovery(
+                &input,
+                policy.minimum_offline_seconds,
+                policy.maximum_tracey_source_age_seconds,
+            );
+            if !device
+                .and_then(|item| item.get("affected_services"))
+                .and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+            {
+                assessment
+                    .blockers
+                    .push("affected-service inventory is empty or unknown".to_string());
+            }
+            if !tracey_timestamp_present {
+                assessment
+                    .blockers
+                    .push("Tracey host evidence has no source timestamp".to_string());
+            }
+            assessment.blockers.sort();
+            assessment.blockers.dedup();
+            assessment.eligible &= assessment.blockers.is_empty();
+
+            if tracey_response_read_at_ms.is_none_or(|observed_at| {
+                now_utc().timestamp_millis().saturating_sub(observed_at) > 60_000
+            }) {
+                assessment.eligible = false;
+                assessment.blockers.push(
+                    "Continuum Tracey response is too old for a fresh BMC action preflight"
+                        .to_string(),
+                );
+                assessment.blockers.sort();
+                assessment.blockers.dedup();
+            }
+
+            let previous_action = events.iter().find(|event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "host_recovery.action_intent" | "host_recovery.action_result"
+                ) && event.payload.get("device_id").and_then(Value::as_str)
+                    == Some(target.device_id.as_str())
+                    && event
+                        .payload
+                        .get("offline_last_seen_epoch_ms")
+                        .and_then(Value::as_i64)
+                        == offline_last_seen_ms
+            });
+            let online = host_online;
+            let mut state = if online {
+                "online"
+            } else if host_offline {
+                "blocked"
+            } else {
+                "evidence_uncertain"
+            }
+            .to_string();
+            let mut action_result = None;
+            if online {
+                let services_recovered = hosted_services_known
+                    && registered_services.iter().all(|name| {
+                        target
+                            .service_map
+                            .get(name)
+                            .is_some_and(|key| healthy_service_keys.contains(key))
+                    });
+                state = if services_recovered
+                    && dependencies_healthy
+                    && monitoring_state.as_deref() == Some("healthy")
+                {
+                    "recovered".to_string()
+                } else {
+                    "recovery_verification_pending".to_string()
+                };
+            } else if previous_action.is_some() {
+                state = previous_action
+                    .and_then(|event| event.payload.get("state"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("action_outcome_unknown")
+                    .to_string();
+                assessment.eligible = false;
+                assessment.blockers.push(
+                    "an action was already submitted during this offline episode; it will not be replayed".to_string(),
+                );
+                assessment.blockers.sort();
+                assessment.blockers.dedup();
+            } else if assessment.eligible && policy.dry_run {
+                state = "eligible_dry_run".to_string();
+            }
+
+            if !online
+                && assessment.eligible
+                && !policy.dry_run
+                && history_complete
+                && actions < policy.max_actions_per_cycle
+            {
+                let target_id = format!("device:{}", target.device_id);
+                let last_hour = host_recovery_action_count(&events, None, now, 3_600);
+                let target_day = host_recovery_action_count(&events, Some(&target_id), now, 86_400);
+                let cooling = events.iter().any(|event| {
+                    event.event_type == "host_recovery.action_intent"
+                        && event.payload.get("device_id").and_then(Value::as_str)
+                            == Some(target.device_id.as_str())
+                        && (now
+                            .signed_duration_since(event.created_at)
+                            .num_seconds()
+                            .max(0) as u64)
+                            < policy.cooldown_seconds
+                });
+                if last_hour >= policy.max_actions_global_per_hour
+                    || target_day >= policy.max_actions_per_target_24h
+                    || cooling
+                {
+                    assessment.eligible = false;
+                    assessment
+                        .blockers
+                        .push("host recovery action cooldown or rate limit is active".to_string());
+                    assessment.blockers.sort();
+                    assessment.blockers.dedup();
+                    state = "cooldown".to_string();
+                } else {
+                    let Some(device) = device else {
+                        continue;
+                    };
+                    let Some(inventory_revision) =
+                        inventory_data.get("revision").and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    let dependency_graph_revision = inventory_data
+                        .get("dependency_graph_revision")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let Some(last_seen_ms) = offline_last_seen_ms else {
+                        continue;
+                    };
+                    let request_id = host_recovery_request_id(
+                        &target.device_id,
+                        inventory_revision,
+                        last_seen_ms,
+                        &target.action,
+                    );
+                    let change_id = format!("auto-{}", &request_id["host-recovery-".len()..]);
+                    let observation_time = now_utc().timestamp_millis();
+                    let monitoring_healthy = monitoring_state.as_deref() == Some("healthy");
+                    let host_recovery_evidence = json!({
+                        "outage_id": format!("offline-{}-{last_seen_ms}", target.device_id),
+                        "target": {
+                            "device_id": target.device_id,
+                            "state": "unreachable",
+                            "observed_at_unix_ms": tracey_agent
+                                .and_then(|_| tracey_response_read_at_ms)
+                                .unwrap_or_default(),
+                            "source": "continuum_tracey_agent",
+                            "reference": format!("agent=tracey-{}; link_state={link_state}", target.device_id),
+                        },
+                        "hosted_services": hosted_observations,
+                        "dependencies": dependency_observations,
+                        "monitoring": {
+                            "state": monitoring_state.clone().unwrap_or_else(|| "unknown".to_string()),
+                            "observed_at_unix_ms": observation_time,
+                            "source": "conductor_live_monitoring_probe",
+                            "reference": "Prometheus and Grafana live health probes",
+                        },
+                    });
+                    let payload = json!({
+                        "controller_id": controller_id,
+                        "device_id": target.device_id,
+                        "action": target.action,
+                        "request_id": request_id,
+                        "change_id": change_id,
+                        "reason": "Automatic recovery of a persistently unreachable, explicitly allowlisted host after fresh safety preflight.",
+                        "expected_inventory_revision": inventory_revision,
+                        "preflight": {
+                            "observed_at_unix_ms": observation_time,
+                            "inventory_revision": inventory_revision,
+                            "dependency_graph_revision": dependency_graph_revision,
+                            "expected_power_state": "On",
+                            "target_identity_verified": true,
+                            "dependencies_healthy": true,
+                            "dependents_known": true,
+                            "affected_services_healthy": false,
+                            "monitoring_healthy": monitoring_healthy,
+                            "affected_services": device.get("affected_services").cloned().unwrap_or_else(|| json!([])),
+                            "dependency_ids": device.get("depends_on").cloned().unwrap_or_else(|| json!([])),
+                            "host_recovery": host_recovery_evidence,
+                        },
+                    });
+                    let mut intent = ConductorEvent::new(
+                        "host_recovery.action_intent",
+                        format!(
+                            "Submitting {0} for allowlisted host {1} through Continuum.",
+                            target.action, target.device_id
+                        ),
+                        json!({
+                            "device_id": target.device_id,
+                            "controller_id": controller_id,
+                            "request_id": request_id,
+                            "offline_last_seen_epoch_ms": last_seen_ms,
+                            "state": "action_outcome_unknown",
+                            "inventory_revision": inventory_revision,
+                            "action_payload_sha256": host_recovery_fingerprint(&payload),
+                            "preflight": payload.get("preflight"),
+                            "gail_scheduler_evidence": {
+                                "source": "continuum_gail_trainer_status",
+                                "fresh": scheduler_fresh,
+                                "blockers": input.scheduler_blockers,
+                            },
+                        }),
+                    );
+                    intent.status = Some("intent".to_string());
+                    self.persist_recovery_event(intent).await?;
+                    state = "action_outcome_unknown".to_string();
+                    actions += 1;
+                    match continuum.controller_action(&payload).await {
+                        Ok(response) => {
+                            let verified =
+                                response.pointer("/data/verified").and_then(Value::as_bool)
+                                    == Some(true);
+                            let outcome = if verified {
+                                "action_submitted"
+                            } else {
+                                "action_uncertain"
+                            };
+                            let mut event = ConductorEvent::new(
+                                "host_recovery.action_result",
+                                if verified {
+                                    "Continuum accepted the BMC action and verified the controller power state."
+                                } else {
+                                    "Continuum returned without verified post-action controller state; no retry will be made."
+                                },
+                                json!({
+                                    "device_id": target.device_id,
+                                    "controller_id": controller_id,
+                                    "request_id": request_id,
+                                    "offline_last_seen_epoch_ms": last_seen_ms,
+                                    "state": outcome,
+                                    "verified": verified,
+                                    "response": bounded_host_recovery_response(&response),
+                                }),
+                            );
+                            event.status = Some(outcome.to_string());
+                            self.persist_recovery_event(event).await?;
+                            state = outcome.to_string();
+                            action_result = Some(bounded_host_recovery_response(&response));
+                        }
+                        Err(error) => {
+                            let mut event = ConductorEvent::new(
+                                "host_recovery.action_result",
+                                "The Continuum action response was uncertain; this offline episode will not be replayed.",
+                                json!({
+                                    "device_id": target.device_id,
+                                    "controller_id": controller_id,
+                                    "request_id": request_id,
+                                    "offline_last_seen_epoch_ms": last_seen_ms,
+                                    "state": "action_outcome_unknown",
+                                    "error": error.to_string(),
+                                }),
+                            );
+                            event.status = Some("uncertain".to_string());
+                            self.persist_recovery_event(event).await?;
+                            assessment.eligible = false;
+                            assessment.blockers.push("Continuum action outcome is uncertain; operator reconciliation is required".to_string());
+                            assessment.blockers.sort();
+                            assessment.blockers.dedup();
+                            state = "action_outcome_unknown".to_string();
+                        }
+                    }
+                }
+            } else if !history_complete && assessment.eligible && !policy.dry_run {
+                assessment.eligible = false;
+                assessment.blockers.push("Conductor event history is at its safety limit; no physical action will be scheduled".to_string());
+                assessment.blockers.sort();
+                assessment.blockers.dedup();
+                state = "history_incomplete".to_string();
+            }
+
+            let assessment_payload = json!({
+                "device_id": target.device_id,
+                "controller_id": controller_id,
+                "state": state,
+                "assessed_at_unix_ms": now_ms,
+                "offline_last_seen_epoch_ms": offline_last_seen_ms,
+                "eligible": assessment.eligible,
+                "dry_run": policy.dry_run,
+                "action": target.action,
+                "blockers": assessment.blockers,
+                "warnings": assessment.warnings,
+                "evidence": {
+                    "inventory_revision": inventory_data.get("revision"),
+                    "inventory_fresh": input.inventory_fresh,
+                    "tracey_link_state": link_state,
+                    "tracey_observation_age_seconds": tracey_age,
+                    "offline_age_seconds": offline_age,
+                    "dhcp_fresh": dhcp_fresh,
+                    "target_has_dhcp_lease": dhcp_lease,
+                    "controller_id_verified": identity_verified,
+                    "controller_actions_enabled": input.power_actions_enabled,
+                    "bmc_diagnostics_fresh": diagnostic_fresh,
+                    "bmc_chassis_powered": chassis_powered,
+                    "critical_sensors": input.critical_sensors,
+                    "gail_trainer_status_fresh": scheduler_fresh,
+                    "hosted_services_known": hosted_services_known,
+                    "hosted_services_unavailable": hosted_services_unavailable,
+                    "dependency_graph_complete": dependency_graph_complete,
+                    "dependencies_healthy": dependencies_healthy,
+                    "monitoring_state": monitoring_state,
+                },
+                "action_result": action_result,
+            });
+            let fingerprint = host_recovery_fingerprint(&assessment_payload);
+            let last_recorded = events.iter().find(|event| {
+                event.event_type == "host_recovery.assessed"
+                    && event.payload.get("device_id").and_then(Value::as_str)
+                        == Some(target.device_id.as_str())
+            });
+            let changed = last_recorded
+                .and_then(|event| event.payload.get("fingerprint"))
+                .and_then(Value::as_str)
+                != Some(fingerprint.as_str());
+            if changed {
+                let mut event = ConductorEvent::new(
+                    "host_recovery.assessed",
+                    format!(
+                        "Host recovery assessment for {}: {}.",
+                        target.device_id, state
+                    ),
+                    json!({"fingerprint": fingerprint, "assessment": assessment_payload}),
+                );
+                event.status = Some(state.clone());
+                self.persist_recovery_event(event).await?;
+            }
+        }
+        Ok(actions)
+    }
+
+    pub async fn host_recovery_status(&self) -> Result<Value> {
+        let events = self.repository.list_conductor_events(5_000).await?;
+        let latest = latest_host_recovery_assessments(&events);
+        let recent_actions = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "host_recovery.action_intent" | "host_recovery.action_result"
+                )
+            })
+            .take(100)
+            .map(|event| {
+                json!({
+                    "event_type": event.event_type,
+                    "status": event.status,
+                    "created_at": event.created_at,
+                    "payload": event.payload,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "automatic_loop_enabled": self.config.host_recovery.enabled,
+            "dry_run": self.config.host_recovery.dry_run,
+            "interval_seconds": self.config.host_recovery.interval_seconds,
+            "targets": self.config.host_recovery.targets.iter().map(|target| target.device_id.clone()).collect::<Vec<_>>(),
+            "history_complete": events.len() < 5_000,
+            "hosts": latest,
+            "recent_actions": recent_actions,
+        }))
+    }
+
+    async fn probe_host_recovery_monitoring(&self, services: &[ServiceSnapshot]) -> Option<String> {
+        let mut states = Vec::new();
+        for key in ["prometheus", "grafana"] {
+            let snapshot = services.iter().find(|service| service.service_key == key)?;
+            let probe = probe_service(&self.http, &self.config, snapshot)
+                .await
+                .ok()?;
+            states.push(probe.health);
+        }
+        if states
+            .iter()
+            .all(|health| *health == crate::models::ServiceHealth::Healthy)
+        {
+            Some("healthy".to_string())
+        } else if states.iter().all(|health| {
+            matches!(
+                health,
+                crate::models::ServiceHealth::Unreachable | crate::models::ServiceHealth::Missing
+            )
+        }) {
+            Some("unavailable".to_string())
+        } else {
+            Some("degraded".to_string())
+        }
     }
 
     async fn live_recovery_assessment(
@@ -4006,6 +4737,37 @@ pub fn spawn_background_loops(service: ConductorService) {
         });
     }
 
+    if service.config.host_recovery.enabled {
+        let recovery_service = service.clone();
+        let recovery_interval = Duration::from_secs(
+            recovery_service
+                .config
+                .host_recovery
+                .interval_seconds
+                .clamp(15, 3_600),
+        );
+        tokio::spawn(async move {
+            // Allow discovery to publish the service and dependency snapshots
+            // used by the host-specific live probes.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let mut interval = tokio::time::interval(recovery_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if let Err(error) = recovery_service.run_host_recovery_cycle().await {
+                    tracing::error!(error = %error, "automatic host-recovery cycle failed");
+                    let mut event = ConductorEvent::new(
+                        "host_recovery.cycle_failed",
+                        "Automatic host-recovery assessment failed; no BMC action was submitted.",
+                        json!({"error": error.to_string()}),
+                    );
+                    event.status = Some("failure".to_string());
+                    recovery_service.publish_event(event);
+                }
+            }
+        });
+    }
+
     // One scheduler owns discovery, planning, and approval so those control
     // plane stages cannot race. Execution has its own loop below: Refiner jobs
     // can take many minutes, and must not hold up discovery, planning, or
@@ -6343,6 +7105,132 @@ fn conductor_self_test_service(
     }
 }
 
+fn service_is_mapped_to_host(service: &ServiceSnapshot, host: &str) -> bool {
+    service
+        .hosts
+        .iter()
+        .chain(service.host_targets.iter())
+        .any(|value| value.trim().eq_ignore_ascii_case(host))
+}
+
+fn bounded_host_evidence_text(value: &str, max_bytes: usize) -> String {
+    let mut output = String::new();
+    for character in value.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if output.len() + character.len_utf8() > max_bytes {
+            break;
+        }
+        output.push(character);
+    }
+    output
+}
+
+fn host_recovery_request_id(device_id: &str, revision: &str, episode: i64, action: &str) -> String {
+    let digest = Sha256::digest(format!("{device_id}:{revision}:{episode}:{action}").as_bytes());
+    let mut safe_device = device_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    safe_device.truncate(32);
+    let digest = digest
+        .iter()
+        .take(12)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("host-recovery-{safe_device}-{digest}")
+}
+
+fn host_recovery_fingerprint(value: &Value) -> String {
+    let digest = Sha256::digest(value.to_string().as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn bounded_host_recovery_response(value: &Value) -> Value {
+    let mut response = json!({});
+    for key in ["success", "message"] {
+        if let Some(item) = value.get(key) {
+            response[key] = item.clone();
+        }
+    }
+    for key in [
+        "verified",
+        "request_id",
+        "controller_power_state_before",
+        "controller_power_state_after",
+    ] {
+        if let Some(item) = value.pointer(&format!("/data/{key}")) {
+            response[key] = item.clone();
+        }
+    }
+    if let Some(error) = value.get("error") {
+        response["error"] = json!({
+            "code": error.get("code"),
+            "message": error.get("message").and_then(Value::as_str).map(|text| text.chars().take(512).collect::<String>()),
+        });
+    }
+    response
+}
+
+fn host_recovery_action_count(
+    events: &[ConductorEvent],
+    target_id: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+    window_seconds: u64,
+) -> usize {
+    events
+        .iter()
+        .filter(|event| event.event_type == "host_recovery.action_intent")
+        .filter(|event| {
+            (now.signed_duration_since(event.created_at)
+                .num_seconds()
+                .max(0) as u64)
+                < window_seconds
+        })
+        .filter(|event| {
+            target_id.is_none_or(|target| {
+                event
+                    .payload
+                    .get("device_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|device| format!("device:{device}") == target)
+            })
+        })
+        .count()
+}
+
+fn latest_host_recovery_assessments(events: &[ConductorEvent]) -> Vec<Value> {
+    let mut latest = BTreeMap::new();
+    for event in events {
+        if event.event_type != "host_recovery.assessed" {
+            continue;
+        }
+        let Some(assessment) = event.payload.get("assessment") else {
+            continue;
+        };
+        let Some(device_id) = assessment.get("device_id").and_then(Value::as_str) else {
+            continue;
+        };
+        latest.entry(device_id.to_string()).or_insert_with(|| {
+            json!({
+                "last_event_at": event.created_at,
+                "status": event.status,
+                "assessment": assessment,
+            })
+        });
+    }
+    latest.into_values().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6362,6 +7250,30 @@ mod tests {
     use std::{fs, sync::Arc};
     use tempfile::tempdir;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn host_recovery_request_id_is_stable_for_one_offline_episode() {
+        let first = host_recovery_request_id("qc04", "inventory-r1", 1234, "cold_restart");
+        let retry = host_recovery_request_id("qc04", "inventory-r1", 1234, "cold_restart");
+        let next_episode = host_recovery_request_id("qc04", "inventory-r1", 5678, "cold_restart");
+        assert_eq!(first, retry);
+        assert_ne!(first, next_episode);
+        assert!(first.starts_with("host-recovery-qc04-"));
+    }
+
+    #[tokio::test]
+    async fn host_recovery_status_reports_disabled_defaults_without_claiming_a_loop() {
+        let repository = Arc::new(MemoryRepository::new());
+        let service = ConductorService::new(
+            ConductorConfig::default(),
+            repository,
+            build_http_client(2).expect("HTTP client"),
+        );
+        let status = service.host_recovery_status().await.expect("status");
+        assert_eq!(status["automatic_loop_enabled"], json!(false));
+        assert_eq!(status["dry_run"], json!(true));
+        assert_eq!(status["hosts"], json!([]));
+    }
 
     #[test]
     fn recovery_defaults_are_non_mutating_and_request_ids_are_scoped() {

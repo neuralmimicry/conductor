@@ -48,6 +48,9 @@ pub struct ConductorConfig {
     /// Optional workload recovery coordinated through NMC Continuum.
     /// Disabled by default and requires explicit per-deployment targets.
     pub recovery: RecoveryConfig,
+    /// Automatic, evidence-gated recovery for explicitly allowlisted physical
+    /// hosts managed by Continuum's audited device controller.
+    pub host_recovery: HostRecoveryConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -318,6 +321,50 @@ pub struct RecoveryTargetConfig {
     pub prometheus_labels: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HostRecoveryConfig {
+    pub enabled: bool,
+    pub dry_run: bool,
+    pub interval_seconds: u64,
+    pub minimum_offline_seconds: u64,
+    pub maximum_tracey_source_age_seconds: u64,
+    pub cooldown_seconds: u64,
+    pub max_actions_per_cycle: usize,
+    pub max_actions_per_target_24h: usize,
+    pub max_actions_global_per_hour: usize,
+    /// Device IDs must be explicit; inventory discovery alone never grants
+    /// permission to operate a physical controller.
+    pub targets: Vec<HostRecoveryTargetConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HostRecoveryTargetConfig {
+    pub device_id: String,
+    /// Continuum's audited action API accepts only the explicitly selected
+    /// restart semantic. Cold restart is never inferred from a failed warm one.
+    pub action: String,
+    /// Exact Continuum service label -> Conductor service_key mapping.
+    pub service_map: BTreeMap<String, String>,
+    /// Exact dependency device_id -> Conductor service_keys used to prove it
+    /// healthy. Empty dependency lists require the explicit flag below.
+    pub dependency_map: BTreeMap<String, Vec<String>>,
+    pub allow_empty_dependencies: bool,
+}
+
+impl Default for HostRecoveryTargetConfig {
+    fn default() -> Self {
+        Self {
+            device_id: String::new(),
+            action: "warm_restart".to_string(),
+            service_map: BTreeMap::new(),
+            dependency_map: BTreeMap::new(),
+            allow_empty_dependencies: false,
+        }
+    }
+}
+
 impl Default for ConductorConfig {
     fn default() -> Self {
         Self {
@@ -335,6 +382,7 @@ impl Default for ConductorConfig {
             policy: PolicyConfig::default(),
             safety: SafetyConfig::default(),
             recovery: RecoveryConfig::default(),
+            host_recovery: HostRecoveryConfig::default(),
         }
     }
 }
@@ -634,6 +682,23 @@ impl Default for RecoveryConfig {
     }
 }
 
+impl Default for HostRecoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dry_run: true,
+            interval_seconds: 60,
+            minimum_offline_seconds: 3_600,
+            maximum_tracey_source_age_seconds: 180,
+            cooldown_seconds: 86_400,
+            max_actions_per_cycle: 1,
+            max_actions_per_target_24h: 1,
+            max_actions_global_per_hour: 1,
+            targets: Vec::new(),
+        }
+    }
+}
+
 impl ConductorConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
@@ -920,6 +985,60 @@ impl ConductorConfig {
                 ));
             }
         }
+        self.host_recovery.interval_seconds = self.host_recovery.interval_seconds.clamp(15, 3_600);
+        self.host_recovery.minimum_offline_seconds = self
+            .host_recovery
+            .minimum_offline_seconds
+            .clamp(300, 604_800);
+        self.host_recovery.maximum_tracey_source_age_seconds = self
+            .host_recovery
+            .maximum_tracey_source_age_seconds
+            .clamp(30, 900);
+        self.host_recovery.cooldown_seconds =
+            self.host_recovery.cooldown_seconds.clamp(3_600, 604_800);
+        self.host_recovery.max_actions_per_cycle =
+            self.host_recovery.max_actions_per_cycle.clamp(1, 1);
+        self.host_recovery.max_actions_per_target_24h =
+            self.host_recovery.max_actions_per_target_24h.clamp(1, 1);
+        self.host_recovery.max_actions_global_per_hour =
+            self.host_recovery.max_actions_global_per_hour.clamp(1, 2);
+        if self.host_recovery.targets.len() > 64 {
+            return Err(anyhow!(
+                "host_recovery.targets may contain at most 64 devices"
+            ));
+        }
+        let mut host_recovery_targets = std::collections::BTreeSet::new();
+        for target in &mut self.host_recovery.targets {
+            target.device_id = target.device_id.trim().to_ascii_lowercase();
+            if !valid_device_identifier(&target.device_id) {
+                return Err(anyhow!(
+                    "host_recovery targets require a valid Continuum device_id"
+                ));
+            }
+            if !host_recovery_targets.insert(target.device_id.clone()) {
+                return Err(anyhow!("host_recovery.targets must not repeat a device_id"));
+            }
+            target.action = target.action.trim().to_ascii_lowercase();
+            if !matches!(target.action.as_str(), "warm_restart" | "cold_restart") {
+                return Err(anyhow!(
+                    "host_recovery target action must be warm_restart or cold_restart"
+                ));
+            }
+            if target
+                .service_map
+                .values()
+                .any(|key| !valid_device_identifier(key))
+                || target
+                    .dependency_map
+                    .values()
+                    .flatten()
+                    .any(|key| !valid_device_identifier(key))
+            {
+                return Err(anyhow!(
+                    "host_recovery service mappings must contain valid service identifiers"
+                ));
+            }
+        }
         normalize_unique_strings(&mut self.policy.protected_services);
         for mandatory in ["conductor", "refiner", "gail", "aarnn", "aarnn_rust"] {
             if !self
@@ -983,6 +1102,14 @@ fn valid_kubernetes_dns_label(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn valid_device_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_' | '.' | ':')
+        })
 }
 
 fn valid_prometheus_label_name(value: &str) -> bool {

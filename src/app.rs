@@ -63,6 +63,7 @@ pub fn build_router(service: ConductorService) -> Router {
         .route("/dashboard", get(dashboard))
         .nest_service("/assets", ServeDir::new("assets"))
         .route("/api/v1/summary", get(summary))
+        .route("/api/v1/host-recovery", get(host_recovery_status))
         .route("/api/v1/findings", get(findings))
         .route("/api/v1/findings/{id}", get(get_finding))
         .route("/api/v1/findings/{id}/evidence", get(get_finding_evidence))
@@ -171,6 +172,14 @@ async fn summary(
 ) -> ApiResult<Json<crate::models::DashboardSummary>> {
     service.authorize_read(&headers)?;
     Ok(Json(service.summary().await?))
+}
+
+async fn host_recovery_status(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    service.authorize_read(&headers)?;
+    Ok(Json(service.host_recovery_status().await?))
 }
 
 async fn services(
@@ -1764,6 +1773,38 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn host_recovery_status_requires_auth_when_token_is_configured() {
+        let response = build_router(test_service())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/host-recovery")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("unauthorised response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = build_router(test_service())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/host-recovery")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("authorised response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("status body");
+        let status: serde_json::Value = serde_json::from_slice(&body).expect("status JSON");
+        assert_eq!(status["automatic_loop_enabled"], false);
+        assert_eq!(status["dry_run"], true);
     }
 
     #[tokio::test]
