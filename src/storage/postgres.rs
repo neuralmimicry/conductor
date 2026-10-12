@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use serde_json::Value;
 use sqlx::{
     Pool, Postgres, Row,
     migrate::Migrator,
@@ -14,9 +15,9 @@ use crate::{
     models::{
         ConductorEvent, DeliveryStage, DiscoveryRun, ExecutionStatus, FindingEvidence,
         FindingProvenance, FindingRecord, FindingSeverity, FindingStatus, ImprovementCycle,
-        RepositorySnapshot, ResearchProject, RolloutStrategy, RunStatus, ServiceHealth,
-        ServiceMetricSample, ServiceSnapshot, TraceabilityLink, WorkExecution, WorkItem,
-        WorkItemListFilter, WorkItemListPage, WorkItemPatch, WorkStatus,
+        MaintenanceObservation, RepositorySnapshot, ResearchProject, RolloutStrategy, RunStatus,
+        ServiceHealth, ServiceMetricSample, ServiceSnapshot, TraceabilityLink, WorkExecution,
+        WorkItem, WorkItemListFilter, WorkItemListPage, WorkItemPatch, WorkStatus,
     },
     repository::ConductorRepository,
 };
@@ -1033,6 +1034,44 @@ impl ConductorRepository for PostgresRepository {
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(map_conductor_event).collect()
+    }
+
+    async fn upsert_maintenance_observation(
+        &self,
+        observation: &MaintenanceObservation,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO maintenance_chassis_observations (chassis_id, observed_at, payload)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (chassis_id) DO UPDATE SET
+                observed_at = EXCLUDED.observed_at,
+                payload = EXCLUDED.payload
+            "#,
+        )
+        .bind(&observation.chassis_id)
+        .bind(observation.observed_at)
+        .bind(Json(observation.payload.clone()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_maintenance_observations(&self) -> Result<Vec<MaintenanceObservation>> {
+        let rows = sqlx::query(
+            "SELECT chassis_id, observed_at, payload FROM maintenance_chassis_observations ORDER BY chassis_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(MaintenanceObservation {
+                    chassis_id: row.try_get("chassis_id")?,
+                    observed_at: row.try_get("observed_at")?,
+                    payload: row.try_get::<Json<Value>, _>("payload")?.0,
+                })
+            })
+            .collect()
     }
 
     async fn upsert_research_project(&self, project: &ResearchProject) -> Result<()> {

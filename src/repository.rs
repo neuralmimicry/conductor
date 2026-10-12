@@ -3,8 +3,9 @@ use chrono::{DateTime, Utc};
 
 use crate::models::{
     ConductorEvent, DiscoveryRun, FindingEvidence, FindingProvenance, FindingRecord,
-    ImprovementCycle, RepositorySnapshot, ResearchProject, ServiceMetricSample, ServiceSnapshot,
-    TraceabilityLink, WorkExecution, WorkItem, WorkItemListFilter, WorkItemListPage, WorkItemPatch,
+    ImprovementCycle, MaintenanceObservation, RepositorySnapshot, ResearchProject,
+    ServiceMetricSample, ServiceSnapshot, TraceabilityLink, WorkExecution, WorkItem,
+    WorkItemListFilter, WorkItemListPage, WorkItemPatch,
 };
 
 #[async_trait]
@@ -106,6 +107,11 @@ pub trait ConductorRepository: Send + Sync {
     async fn count_improvement_cycles(&self) -> anyhow::Result<usize>;
     async fn insert_conductor_event(&self, event: &ConductorEvent) -> anyhow::Result<()>;
     async fn list_conductor_events(&self, limit: usize) -> anyhow::Result<Vec<ConductorEvent>>;
+    async fn upsert_maintenance_observation(
+        &self,
+        observation: &MaintenanceObservation,
+    ) -> anyhow::Result<()>;
+    async fn list_maintenance_observations(&self) -> anyhow::Result<Vec<MaintenanceObservation>>;
 
     async fn upsert_research_project(&self, project: &ResearchProject) -> anyhow::Result<()>;
     async fn list_research_projects(&self) -> anyhow::Result<Vec<ResearchProject>>;

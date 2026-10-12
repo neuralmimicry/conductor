@@ -51,6 +51,8 @@ pub struct ConductorConfig {
     /// Automatic, evidence-gated recovery for explicitly allowlisted physical
     /// hosts managed by Continuum's audited device controller.
     pub host_recovery: HostRecoveryConfig,
+    /// Shared-chassis maintenance planning for paired Centriq modules.
+    pub maintenance: MaintenanceConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -353,6 +355,66 @@ pub struct HostRecoveryTargetConfig {
     pub allow_empty_dependencies: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MaintenanceConfig {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub minimum_notice_hours: u64,
+    pub duration_minutes: u64,
+    /// Weekly UTC slot, for example `Sunday 02:00`.
+    pub weekly_window_utc: String,
+    pub chassis: Vec<MaintenanceChassisConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MaintenanceChassisConfig {
+    pub id: String,
+    pub label: String,
+    /// Centriq 2400 chassis contain exactly two independently managed modules.
+    pub device_ids: Vec<String>,
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 60,
+            minimum_notice_hours: 168,
+            duration_minutes: 240,
+            weekly_window_utc: "Sunday 02:00".to_string(),
+            chassis: vec![
+                MaintenanceChassisConfig {
+                    id: "centriq-qc00-qc01".to_string(),
+                    label: "Centriq 2400 chassis qc00/qc01".to_string(),
+                    device_ids: vec!["qc00".to_string(), "qc01".to_string()],
+                },
+                MaintenanceChassisConfig {
+                    id: "centriq-qc02-qc03".to_string(),
+                    label: "Centriq 2400 chassis qc02/qc03".to_string(),
+                    device_ids: vec!["qc02".to_string(), "qc03".to_string()],
+                },
+                MaintenanceChassisConfig {
+                    id: "centriq-qc04-qc05".to_string(),
+                    label: "Centriq 2400 chassis qc04/qc05".to_string(),
+                    device_ids: vec!["qc04".to_string(), "qc05".to_string()],
+                },
+            ],
+        }
+    }
+}
+
+impl Default for MaintenanceChassisConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            label: String::new(),
+            device_ids: Vec::new(),
+        }
+    }
+}
+
 impl Default for HostRecoveryTargetConfig {
     fn default() -> Self {
         Self {
@@ -383,6 +445,7 @@ impl Default for ConductorConfig {
             safety: SafetyConfig::default(),
             recovery: RecoveryConfig::default(),
             host_recovery: HostRecoveryConfig::default(),
+            maintenance: MaintenanceConfig::default(),
         }
     }
 }
@@ -1039,6 +1102,48 @@ impl ConductorConfig {
                 ));
             }
         }
+        self.maintenance.interval_seconds = self.maintenance.interval_seconds.clamp(15, 3_600);
+        self.maintenance.minimum_notice_hours =
+            self.maintenance.minimum_notice_hours.clamp(24, 2_160);
+        self.maintenance.duration_minutes = self.maintenance.duration_minutes.clamp(30, 1_440);
+        self.maintenance.weekly_window_utc = self.maintenance.weekly_window_utc.trim().to_string();
+        crate::maintenance::parse_weekly_window(&self.maintenance.weekly_window_utc)
+            .map_err(|error| anyhow!("maintenance.weekly_window_utc: {error}"))?;
+        if self.maintenance.chassis.len() > 32 {
+            return Err(anyhow!("maintenance.chassis may contain at most 32 groups"));
+        }
+        let mut chassis_ids = std::collections::BTreeSet::new();
+        let mut chassis_devices = std::collections::BTreeSet::new();
+        for chassis in &mut self.maintenance.chassis {
+            chassis.id = chassis.id.trim().to_ascii_lowercase();
+            chassis.label = chassis.label.trim().to_string();
+            for device_id in &mut chassis.device_ids {
+                *device_id = device_id.trim().to_ascii_lowercase();
+            }
+            normalize_unique_strings(&mut chassis.device_ids);
+            if !valid_device_identifier(&chassis.id)
+                || chassis.label.is_empty()
+                || chassis.device_ids.len() != 2
+                || chassis
+                    .device_ids
+                    .iter()
+                    .any(|id| !valid_device_identifier(id))
+            {
+                return Err(anyhow!(
+                    "maintenance chassis entries require an identifier, label, and exactly two valid device IDs"
+                ));
+            }
+            if !chassis_ids.insert(chassis.id.clone()) {
+                return Err(anyhow!("maintenance chassis IDs must be unique"));
+            }
+            for device_id in &chassis.device_ids {
+                if !chassis_devices.insert(device_id.clone()) {
+                    return Err(anyhow!(
+                        "a device ID may belong to only one maintenance chassis"
+                    ));
+                }
+            }
+        }
         normalize_unique_strings(&mut self.policy.protected_services);
         for mandatory in ["conductor", "refiner", "gail", "aarnn", "aarnn_rust"] {
             if !self
@@ -1256,5 +1361,19 @@ mod recovery_config_tests {
             )]),
         });
         assert!(reserved.normalize().is_err());
+    }
+
+    #[test]
+    fn maintenance_chassis_must_have_exactly_two_unique_modules() {
+        let mut valid = ConductorConfig::default();
+        valid.normalize().expect("default shared-chassis mapping");
+
+        let mut missing_peer = ConductorConfig::default();
+        missing_peer.maintenance.chassis[2].device_ids.pop();
+        assert!(missing_peer.normalize().is_err());
+
+        let mut duplicate_peer = ConductorConfig::default();
+        duplicate_peer.maintenance.chassis[2].device_ids[1] = "qc04".to_string();
+        assert!(duplicate_peer.normalize().is_err());
     }
 }

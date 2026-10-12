@@ -36,12 +36,16 @@ return and verifies mapped services, dependencies and monitoring before
 reporting recovery. The authenticated read-only status endpoint is
 `GET /api/v1/host-recovery`.
 
-The code defaults to disabled and dry-run. The production pilot allowlists
-qc04 with `cold_restart`, because the owner explicitly requested a BMC power
-cycle for that host. The current pilot intentionally has empty service and
-dependency maps and does not permit empty dependencies, so it reports blocked
-state without submitting a BMC action until those mappings are verified and
-filled in. Gail's current trainer-status proxy returns HTTP 404, qc04's BMC
-event log is unavailable, and its dependency inventory is empty; these remain
-independent fail-closed blockers. No live controller action is claimed by
-this document.
+The code defaults to disabled and dry-run. qc04's critical `SYS_V3_Battery`
+sensor blocks a cold restart. The owner has requested a warm restart as the
+interim recovery candidate; it remains blocked until current Gail/Slurm,
+service, dependency, monitoring, Tracey and Continuum controller evidence is
+complete. The current pilot has no verified service/dependency maps, Gail's
+trainer-status route returned HTTP 404, and qc04's system event log was
+unavailable. No live controller action is claimed by this document.
+
+Battery replacement is a different operation from host recovery. qc04 and
+qc05 share chassis power, so maintenance must be planned for both modules.
+See [shared-chassis maintenance planning](SHARED_CHASSIS_MAINTENANCE.md) for
+the dashboard, approval state and the still-missing Continuum evacuation and
+restore operation.

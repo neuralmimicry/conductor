@@ -37,6 +37,7 @@ use crate::{
         atlassian::AtlassianClients, continuum::ContinuumClient, probe_service,
         query_recovery_deployment_metrics, refiner::RefinerClient, tracey::TraceyClient,
     },
+    maintenance::{affected_service_labels, next_window_after, parse_weekly_window, proposal_id},
     metrics::{
         record_approval_cycle, record_claimed_work_items, record_discovery_cycle,
         record_event_persistence, record_execution_cycle, record_execution_duration,
@@ -45,11 +46,11 @@ use crate::{
     models::{
         ConductorEvent, ConfluencePageLinkRequest, DashboardSummary, DeliveryStage, DiscoveryRun,
         DoraMetricsSummary, ExternalLinkOperationResult, FindingEvidence, FindingProvenance,
-        FindingRecord, ImprovementCycle, JiraIssueLinkRequest, NewTraceabilityLink,
-        RepositorySnapshot, ServiceMetricSample, ServiceSnapshot, TraceabilityGraph,
-        TraceabilityGraphEdge, TraceabilityGraphNode, TraceabilityLink, TraceabilitySyncRequest,
-        TraceabilitySyncResult, WorkExecution, WorkItem, WorkItemTraceability, WorkStatus, now_utc,
-        topology_from_services, unique_strings,
+        FindingRecord, ImprovementCycle, JiraIssueLinkRequest, MaintenanceObservation,
+        NewTraceabilityLink, RepositorySnapshot, ServiceMetricSample, ServiceSnapshot,
+        TraceabilityGraph, TraceabilityGraphEdge, TraceabilityGraphNode, TraceabilityLink,
+        TraceabilitySyncRequest, TraceabilitySyncResult, WorkExecution, WorkItem,
+        WorkItemTraceability, WorkStatus, now_utc, topology_from_services, unique_strings,
     },
     planner::run_planning_cycle,
     policy::{
@@ -1302,6 +1303,542 @@ impl ConductorService {
             "history_complete": events.len() < 5_000,
             "hosts": latest,
             "recent_actions": recent_actions,
+        }))
+    }
+
+    /// Create durable suggestions when fresh BMC evidence identifies a
+    /// critical Centriq battery sensor. A suggestion includes both physical
+    /// modules in the shared chassis and never initiates a shutdown.
+    pub async fn run_maintenance_planning_cycle(&self) -> Result<usize> {
+        let policy = &self.config.maintenance;
+        if !policy.enabled {
+            return Ok(0);
+        }
+        let events = self.repository.list_conductor_events(5_000).await?;
+        let history_complete = events.len() < 5_000;
+        if !history_complete {
+            tracing::warn!(
+                "Conductor event history reached its limit; maintenance proposal creation is suppressed"
+            );
+        }
+        let now = now_utc();
+        let now_ms = now.timestamp_millis();
+        let services = self.repository.list_service_snapshots().await?;
+        let Some(continuum) = ContinuumClient::from_sources(
+            &self.config.integrations.continuum,
+            services.iter().find(|item| item.service_key == "continuum"),
+        )
+        .await?
+        else {
+            return Ok(0);
+        };
+        let inventory = continuum.device_inventory().await?;
+        let inventory_fresh = inventory_is_fresh(&inventory, now_ms);
+        if !inventory_fresh {
+            return Ok(0);
+        }
+        let previous_observations = self.repository.list_maintenance_observations().await?;
+        let previous_by_chassis = previous_observations
+            .into_iter()
+            .map(|item| (item.chassis_id.clone(), item))
+            .collect::<BTreeMap<_, _>>();
+        let mut created = 0usize;
+
+        for chassis in &policy.chassis {
+            let previous = previous_by_chassis.get(&chassis.id);
+            let previous_members = previous
+                .and_then(|item| item.payload.get("members"))
+                .and_then(Value::as_object);
+            let mut members = serde_json::Map::new();
+            let mut current_affected_devices = Vec::new();
+            let mut current_critical_sensors = BTreeSet::new();
+            let mut any_member_unknown = false;
+            for device_id in &chassis.device_ids {
+                let device = inventory_device(&inventory, device_id);
+                let inventory_data = continuum_data(&inventory);
+                let controller_id = device
+                    .and_then(|item| item.get("controller_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let controller = inventory_controller(&inventory, controller_id);
+                let identity_verified = !controller_id.is_empty()
+                    && inventory_data
+                        .get("devices")
+                        .and_then(Value::as_array)
+                        .is_some_and(|items| {
+                            items
+                                .iter()
+                                .filter(|item| {
+                                    item.get("id").and_then(Value::as_str) == Some(device_id)
+                                })
+                                .count()
+                                == 1
+                        })
+                    && controller.is_some_and(|item| {
+                        item.get("manages")
+                            .and_then(Value::as_array)
+                            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(device_id)))
+                    });
+                let diagnostics = if identity_verified {
+                    continuum.controller_diagnostics(controller_id).await.ok()
+                } else {
+                    None
+                };
+                let diagnostic_data = diagnostics.as_ref().map(continuum_data);
+                let diagnostic_age = diagnostics
+                    .as_ref()
+                    .and_then(|value| diagnostic_observation_age_seconds(value, now_ms));
+                let fresh = identity_verified
+                    && diagnostic_data.is_some_and(|data| {
+                        data.get("controller_id").and_then(Value::as_str) == Some(controller_id)
+                            && data.get("inventory_stale").and_then(Value::as_bool) == Some(false)
+                    })
+                    && diagnostic_age.is_some_and(|age| age <= 60);
+                let old_member = previous_members.and_then(|items| items.get(device_id));
+                let mut sensors = if fresh {
+                    diagnostics
+                        .as_ref()
+                        .map(critical_sensor_names)
+                        .unwrap_or_default()
+                } else {
+                    any_member_unknown = true;
+                    old_member
+                        .and_then(|item| item.get("critical_sensors"))
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                sensors.sort();
+                sensors.dedup();
+                let has_battery_fault = fresh
+                    && sensors
+                        .iter()
+                        .any(|sensor| sensor.eq_ignore_ascii_case("SYS_V3_Battery"));
+                if has_battery_fault {
+                    current_affected_devices.push(device_id.clone());
+                    current_critical_sensors.extend(sensors.iter().cloned());
+                }
+                members.insert(
+                    device_id.clone(),
+                    json!({
+                        "controller_id": if controller_id.is_empty() { Value::Null } else { json!(controller_id) },
+                        "identity_verified": identity_verified,
+                        "fresh": fresh,
+                        "diagnostic_age_seconds": diagnostic_age,
+                        "critical_sensors": sensors,
+                        "services": affected_service_labels(device),
+                    }),
+                );
+            }
+
+            let all_members_fresh = !any_member_unknown;
+            let previous_generation = previous
+                .and_then(|item| item.payload.get("issue_generation"))
+                .and_then(Value::as_str);
+            let previous_affected = previous
+                .and_then(|item| item.payload.get("affected_devices"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let previous_sensors = previous
+                .and_then(|item| item.payload.get("critical_sensors"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            let issue_state = if !current_affected_devices.is_empty() {
+                "active"
+            } else if all_members_fresh {
+                "clear"
+            } else {
+                "unknown"
+            };
+            let (affected_devices, critical_sensors, issue_generation) = match issue_state {
+                "active" => {
+                    let was_active = previous.is_some_and(|item| {
+                        item.payload.get("issue_state").and_then(Value::as_str) == Some("active")
+                    });
+                    let same_episode = was_active
+                        && (!all_members_fresh
+                            || (previous_affected == current_affected_devices
+                                && previous_sensors == current_critical_sensors));
+                    let (affected, sensors) = if same_episode && !all_members_fresh {
+                        (previous_affected.clone(), previous_sensors.clone())
+                    } else {
+                        (
+                            current_affected_devices.clone(),
+                            current_critical_sensors.clone(),
+                        )
+                    };
+                    let generation = if same_episode {
+                        previous_generation
+                            .map(str::to_string)
+                            .unwrap_or_else(|| Uuid::new_v4().to_string())
+                    } else {
+                        Uuid::new_v4().to_string()
+                    };
+                    (affected, sensors, Some(generation))
+                }
+                "unknown" => (
+                    previous_affected.clone(),
+                    previous_sensors.clone(),
+                    previous_generation.map(str::to_string),
+                ),
+                _ => (Vec::new(), BTreeSet::new(), None),
+            };
+            let observation = MaintenanceObservation {
+                chassis_id: chassis.id.clone(),
+                observed_at: now,
+                payload: json!({
+                    "chassis_label": chassis.label,
+                    "member_device_ids": chassis.device_ids,
+                    "inventory_fresh": inventory_fresh,
+                    "all_members_fresh": all_members_fresh,
+                    "issue_state": issue_state,
+                    "affected_devices": affected_devices,
+                    "critical_sensors": critical_sensors,
+                    "issue_generation": issue_generation,
+                    "members": members,
+                }),
+            };
+            self.repository
+                .upsert_maintenance_observation(&observation)
+                .await?;
+
+            if issue_state != "active" || !history_complete {
+                continue;
+            }
+            let (weekday, hour, minute) = parse_weekly_window(&policy.weekly_window_utc)?;
+            let suggested_start =
+                next_window_after(now, weekday, hour, minute, policy.minimum_notice_hours);
+            let id = proposal_id(
+                &chassis.id,
+                &affected_devices,
+                issue_generation.as_deref().unwrap_or_default(),
+                suggested_start,
+            );
+            if events.iter().any(|event| {
+                event.event_type == "maintenance.window.proposed"
+                    && event.payload.get("proposal_id").and_then(Value::as_str) == Some(id.as_str())
+            }) {
+                continue;
+            }
+            let mut blockers = vec![
+                "Continuum has no configured chassis-maintenance evacuation adapter; service scaling or movement has not started".to_string(),
+                "destination capacity and scheduler placement for both chassis modules are not verified".to_string(),
+                "maintenance success and workload restoration cannot be automated until the Continuum maintenance operation is available".to_string(),
+            ];
+            if !all_members_fresh {
+                blockers.push(
+                    "fresh diagnostics are not available from both BMC modules in the shared chassis".to_string(),
+                );
+            }
+            let payload = json!({
+                "proposal_id": id,
+                "chassis_id": chassis.id,
+                "chassis_label": chassis.label,
+                "member_device_ids": chassis.device_ids,
+                "affected_devices": affected_devices,
+                "critical_sensors": critical_sensors,
+                "issue_generation": issue_generation,
+                "inventory_fresh": inventory_fresh,
+                "services_by_device": members.iter().map(|(device, data)| (device.clone(), data.get("services").cloned().unwrap_or(Value::Null))).collect::<serde_json::Map<_, _>>(),
+                "suggested_window_start": suggested_start,
+                "duration_minutes": policy.duration_minutes,
+                "state": "suggested",
+                "preparation_status": "blocked",
+                "preparation_blockers": blockers,
+            });
+            let mut event = ConductorEvent::new(
+                "maintenance.window.proposed",
+                format!(
+                    "Suggested shared-chassis maintenance for {} after a critical battery reading.",
+                    chassis.label
+                ),
+                payload,
+            );
+            event.status = Some("suggested".to_string());
+            self.persist_recovery_event(event).await?;
+            created += 1;
+        }
+        Ok(created)
+    }
+
+    pub async fn maintenance_windows(&self) -> Result<Value> {
+        let events = self.repository.list_conductor_events(5_000).await?;
+        let observations = self.repository.list_maintenance_observations().await?;
+        let observations_by_chassis = observations
+            .iter()
+            .map(|item| (item.chassis_id.as_str(), item))
+            .collect::<BTreeMap<_, _>>();
+        let mut proposals = BTreeMap::<String, &ConductorEvent>::new();
+        let mut decisions = BTreeMap::<String, &ConductorEvent>::new();
+        for event in &events {
+            let Some(id) = event.payload.get("proposal_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let target = match event.event_type.as_str() {
+                "maintenance.window.proposed" => &mut proposals,
+                "maintenance.window.decision" => &mut decisions,
+                _ => continue,
+            };
+            if target
+                .get(id)
+                .is_none_or(|existing| event.created_at > existing.created_at)
+            {
+                target.insert(id.to_string(), event);
+            }
+        }
+        let now = now_utc();
+        let observation_max_age = ChronoDuration::seconds(
+            self.config
+                .maintenance
+                .interval_seconds
+                .max(60)
+                .saturating_mul(3)
+                .min(i64::MAX as u64) as i64,
+        );
+        let windows = proposals
+            .into_iter()
+            .map(|(id, event)| {
+                let mut payload = event.payload.clone();
+                let chassis_id = payload
+                    .get("chassis_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let observation = observations_by_chassis.get(chassis_id);
+                let observation_fresh = observation.is_some_and(|item| {
+                    now.signed_duration_since(item.observed_at) <= observation_max_age
+                        && item.observed_at <= now + ChronoDuration::seconds(30)
+                });
+                let issue_state = observation
+                    .map(|item| item.payload.get("issue_state").and_then(Value::as_str))
+                    .flatten()
+                    .unwrap_or("unknown");
+                let issue_current = observation_fresh && issue_state == "active";
+                let decision = decisions.get(&id).map(|event| {
+                    json!({
+                        "decision": event.payload.get("decision"),
+                        "decided_at": event.created_at,
+                        "status": event.status,
+                        "preparation_status": event.payload.get("preparation_status"),
+                        "preparation_blockers": event.payload.get("preparation_blockers"),
+                    })
+                });
+                let state = decision
+                    .as_ref()
+                    .and_then(|item| item.get("decision"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "suggested".to_string());
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert("proposal_id".to_string(), json!(id));
+                    object.insert("state".to_string(), json!(state));
+                    object.insert("current_issue".to_string(), json!(issue_current));
+                    object.insert(
+                        "issue_state".to_string(),
+                        json!(if observation_fresh {
+                            issue_state
+                        } else {
+                            "stale"
+                        }),
+                    );
+                    object.insert(
+                        "last_observation_at".to_string(),
+                        observation
+                            .map(|item| json!(item.observed_at))
+                            .unwrap_or(Value::Null),
+                    );
+                    object.insert(
+                        "decision_record".to_string(),
+                        decision.unwrap_or(Value::Null),
+                    );
+                }
+                payload
+            })
+            .collect::<Vec<_>>();
+        let current_observations = self
+            .config
+            .maintenance
+            .chassis
+            .iter()
+            .map(|chassis| {
+                let observation = observations_by_chassis.get(chassis.id.as_str());
+                let fresh = observation.is_some_and(|item| {
+                    now.signed_duration_since(item.observed_at) <= observation_max_age
+                        && item.observed_at <= now + ChronoDuration::seconds(30)
+                });
+                let mut payload = observation
+                    .map(|item| item.payload.clone())
+                    .unwrap_or_else(|| json!({}));
+                if let Some(object) = payload.as_object_mut() {
+                    let state = if fresh {
+                        object
+                            .get("issue_state")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                    } else {
+                        "stale"
+                    };
+                    object.insert("chassis_id".to_string(), json!(chassis.id));
+                    object.insert("chassis_label".to_string(), json!(chassis.label));
+                    object.insert(
+                        "observed_at".to_string(),
+                        observation
+                            .map(|item| json!(item.observed_at))
+                            .unwrap_or(Value::Null),
+                    );
+                    object.insert("state".to_string(), json!(state));
+                }
+                payload
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "enabled": self.config.maintenance.enabled,
+            "weekly_window_utc": self.config.maintenance.weekly_window_utc,
+            "minimum_notice_hours": self.config.maintenance.minimum_notice_hours,
+            "chassis": self.config.maintenance.chassis,
+            "windows": windows,
+            "observations": current_observations,
+            "history_complete": events.len() < 5_000,
+            "evacuation_automation_available": false,
+            "limitation": "Conductor records paired-chassis plans and admin decisions. Continuum currently exposes no general workload evacuation, maintenance completion, or restore/rebalance operation, so accepting a window does not change service placement.",
+        }))
+    }
+
+    pub async fn decide_maintenance_window(
+        &self,
+        proposal_id: &str,
+        decision: &str,
+    ) -> std::result::Result<Value, ApiError> {
+        let decision = decision.trim().to_ascii_lowercase();
+        if !matches!(decision.as_str(), "accept" | "reject") {
+            return Err(ApiError::bad_request(
+                "decision must be `accept` or `reject`",
+            ));
+        }
+        if proposal_id.is_empty()
+            || proposal_id.len() > 128
+            || !proposal_id
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        {
+            return Err(ApiError::bad_request("maintenance proposal ID is invalid"));
+        }
+        let events = self.repository.list_conductor_events(5_000).await?;
+        let proposal = events.iter().find(|event| {
+            event.event_type == "maintenance.window.proposed"
+                && event.payload.get("proposal_id").and_then(Value::as_str) == Some(proposal_id)
+        });
+        let Some(proposal) = proposal else {
+            return Err(ApiError::not_found("maintenance window proposal not found"));
+        };
+        if decision == "accept" {
+            let window_start = proposal
+                .payload
+                .get("suggested_window_start")
+                .and_then(Value::as_str)
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&chrono::Utc));
+            if window_start.is_none_or(|start| start <= now_utc()) {
+                return Err(ApiError::conflict(
+                    "the suggested maintenance slot has passed; wait for an updated proposal",
+                ));
+            }
+            let chassis_id = proposal
+                .payload
+                .get("chassis_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let current_observation = self
+                .repository
+                .list_maintenance_observations()
+                .await?
+                .into_iter()
+                .find(|item| item.chassis_id == chassis_id);
+            let current_matches = current_observation.is_some_and(|item| {
+                let age = now_utc().signed_duration_since(item.observed_at);
+                age <= ChronoDuration::seconds(
+                    self.config
+                        .maintenance
+                        .interval_seconds
+                        .max(60)
+                        .saturating_mul(3)
+                        .min(i64::MAX as u64) as i64,
+                ) && item.payload.get("issue_state").and_then(Value::as_str) == Some("active")
+                    && item
+                        .payload
+                        .get("all_members_fresh")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    && item.payload.get("issue_generation").and_then(Value::as_str)
+                        == proposal
+                            .payload
+                            .get("issue_generation")
+                            .and_then(Value::as_str)
+            });
+            if !current_matches {
+                return Err(ApiError::conflict(
+                    "fresh Continuum evidence no longer confirms this maintenance issue",
+                ));
+            }
+        }
+        if events.iter().any(|event| {
+            event.event_type == "maintenance.window.decision"
+                && event.payload.get("proposal_id").and_then(Value::as_str) == Some(proposal_id)
+        }) {
+            return Err(ApiError::conflict(
+                "this maintenance proposal already has an admin decision",
+            ));
+        }
+        let mut payload = json!({
+            "proposal_id": proposal_id,
+            "decision": decision,
+            "chassis_id": proposal.payload.get("chassis_id"),
+            "suggested_window_start": proposal.payload.get("suggested_window_start"),
+        });
+        let state = if decision == "accept" {
+            let blockers = vec![
+                "Continuum has no configured chassis-maintenance evacuation adapter; service scaling or movement has not started".to_string(),
+                "destination capacity and scheduler placement for both chassis modules are not verified".to_string(),
+                "maintenance success and workload restoration cannot be automated until the Continuum maintenance operation is available".to_string(),
+            ];
+            payload["preparation_status"] = json!("blocked");
+            payload["preparation_blockers"] = json!(blockers);
+            "accepted_blocked"
+        } else {
+            "rejected"
+        };
+        let mut event = ConductorEvent::new(
+            "maintenance.window.decision",
+            format!("Admin {decision}ed maintenance proposal {proposal_id}."),
+            payload,
+        );
+        event.status = Some(state.to_string());
+        self.repository.insert_conductor_event(&event).await?;
+        let _ = self.events.send(event.clone());
+        Ok(json!({
+            "proposal_id": proposal_id,
+            "decision": decision,
+            "status": state,
+            "event": event,
         }))
     }
 
@@ -4764,6 +5301,35 @@ pub fn spawn_background_loops(service: ConductorService) {
                     );
                     event.status = Some("failure".to_string());
                     recovery_service.publish_event(event);
+                }
+            }
+        });
+    }
+
+    if service.config.maintenance.enabled {
+        let maintenance_service = service.clone();
+        let interval = Duration::from_secs(
+            maintenance_service
+                .config
+                .maintenance
+                .interval_seconds
+                .clamp(15, 3_600),
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(35)).await;
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                if let Err(error) = maintenance_service.run_maintenance_planning_cycle().await {
+                    tracing::warn!(error = %error, "shared-chassis maintenance planning failed");
+                    let mut event = ConductorEvent::new(
+                        "maintenance.window.cycle_failed",
+                        "Shared-chassis maintenance planning failed; no service or hardware action was submitted.",
+                        json!({"error": error.to_string()}),
+                    );
+                    event.status = Some("failure".to_string());
+                    maintenance_service.publish_event(event);
                 }
             }
         });

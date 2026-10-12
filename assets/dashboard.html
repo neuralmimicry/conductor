@@ -259,6 +259,16 @@
     </div>
   </section>
   <section class="cards" id="summary-cards"></section>
+  <section class="panel" id="maintenance-section">
+    <div class="section-head">
+      <div>
+        <h2 class="section-title">Shared-chassis maintenance</h2>
+        <div class="muted">Centriq qc00/qc01, qc02/qc03 and qc04/qc05 share chassis power. A service window affects both modules.</div>
+      </div>
+      <button class="secondary" id="refresh-maintenance">Refresh windows</button>
+    </div>
+    <div id="maintenance-windows" aria-live="polite"><div class="muted">Loading maintenance status…</div></div>
+  </section>
   <section class="grid">
     <div class="panel">
       <div class="section-head">
@@ -366,6 +376,8 @@ const state = {
   cyclesFetchedAt: 0,
   graphCache: null,
   graphFetchedAt: 0,
+  maintenanceCache: null,
+  maintenanceFetchedAt: 0,
   researchProjectsCache: null,
   researchProjectsFetchedAt: 0,
 };
@@ -373,6 +385,7 @@ const LIVE_REFRESH_MIN_MS = 1500;
 const SERVICES_REFRESH_MS = 10000;
 const CYCLES_REFRESH_MS = 10000;
 const GRAPH_REFRESH_MS = 30000;
+const MAINTENANCE_REFRESH_MS = 15000;
 const RESEARCH_PROJECTS_REFRESH_MS = 15000;
 let eventSource = null;
 let eventRetryTimer = null;
@@ -385,6 +398,7 @@ const els = {
   policyPreview: document.getElementById('policy-preview'),
   eventStatus: document.getElementById('event-status'), services: document.getElementById('services'), cycles: document.getElementById('cycles'), refresh: document.getElementById('refresh'),
   runDiscovery: document.getElementById('run-discovery'), runPlanning: document.getElementById('run-planning'), runExecution: document.getElementById('run-execution'),
+  maintenanceWindows: document.getElementById('maintenance-windows'), refreshMaintenance: document.getElementById('refresh-maintenance'),
   traceabilityDetail: document.getElementById('traceability-detail'), externalReferenceSummary: document.getElementById('external-reference-summary'),
   estateGraphSummary: document.getElementById('estate-graph-summary'),
   workItemsStatusFilter: document.getElementById('work-items-status-filter'),
@@ -446,6 +460,8 @@ function resetDashboardCaches() {
   state.cyclesFetchedAt = 0;
   state.graphCache = null;
   state.graphFetchedAt = 0;
+  state.maintenanceCache = null;
+  state.maintenanceFetchedAt = 0;
   state.researchProjectsCache = null;
   state.researchProjectsFetchedAt = 0;
 }
@@ -556,6 +572,47 @@ function renderServices(services) {
 }
 function renderCycles(cycles) {
   els.cycles.innerHTML = cycles.map((cycle) => `<div class="cycle"><div><strong>${cycle.summary}</strong></div><div class="muted">${new Date(cycle.finished_at).toLocaleString()} · ${cycle.status}</div><div>${(cycle.source_services || []).map((item) => `<span class="pill">${item}</span>`).join('')}</div>${cycle.gail_response ? `<details><summary>Gail advisory</summary><pre class="mono">${JSON.stringify(cycle.gail_response, null, 2)}</pre></details>` : ''}</div>`).join('') || '<div class="muted">No improvement cycles recorded yet.</div>';
+}
+function renderMaintenance(payload) {
+  if (payload?.__error) {
+    els.maintenanceWindows.innerHTML = `<div class="status warn">Maintenance status unavailable: ${escapeHtml(payload.__error)}</div>`;
+    return;
+  }
+  const windows = payload?.windows || [];
+  const observations = (payload?.observations || []).map((observation) => {
+    const memberRows = Object.entries(observation.members || {}).map(([device, member]) => {
+      const bmcState = member.fresh ? 'fresh' : 'stale or unavailable';
+      const sensors = (member.critical_sensors || []).map(escapeHtml).join(', ') || 'no critical sensor recorded';
+      const services = (member.services || []).map(escapeHtml).join(', ') || 'service mapping unavailable';
+      return `<div class="muted"><strong>${escapeHtml(device)}</strong> · BMC ${bmcState} · ${sensors} · services: ${services}</div>`;
+    }).join('');
+    const state = observation.state === 'active' ? 'Critical battery issue'
+      : (observation.state === 'clear' ? 'No critical battery sensor' : `BMC evidence ${observation.state || 'unknown'}`);
+    return `<div class="detail-block"><div class="section-head"><strong>${escapeHtml(observation.chassis_label || observation.chassis_id)}</strong><span class="pill">${escapeHtml(state)}</span></div><div class="muted">Last inventory/BMC sample: ${escapeHtml(formatMaintenanceUtc(observation.observed_at))}</div>${memberRows}</div>`;
+  }).join('');
+  const cards = windows.map((window) => {
+    const members = (window.member_device_ids || []).map(escapeHtml).join(' + ');
+    const affected = (window.affected_devices || []).map(escapeHtml).join(', ') || 'shared chassis';
+    const services = Object.entries(window.services_by_device || {}).map(([device, names]) =>
+      `<div class="muted"><strong>${escapeHtml(device)}</strong>: ${(names || []).map(escapeHtml).join(', ') || 'service mapping unavailable'}</div>`
+    ).join('');
+    const blockers = (window.decision_record?.preparation_blockers || window.preparation_blockers || [])
+      .map((reason) => `<li>${escapeHtml(reason)}</li>`).join('');
+    const status = window.state === 'accept' ? 'Accepted · preparation blocked'
+      : (window.state === 'reject' ? 'Rejected' : 'Suggested');
+    const actions = window.state === 'suggested'
+      ? `<div class="actions"><button class="secondary" data-maintenance-decision="accept" data-proposal-id="${escapeHtml(window.proposal_id)}">Accept window</button><button class="secondary" data-maintenance-decision="reject" data-proposal-id="${escapeHtml(window.proposal_id)}">Reject</button></div>`
+      : '';
+    return `<div class="cycle"><div class="section-head"><strong>${escapeHtml(window.chassis_label || window.chassis_id)}</strong><span class="pill">${status}</span></div><div class="muted">Both modules: ${members} · current issue on ${affected}</div><div>Suggested start: <strong>${escapeHtml(formatMaintenanceUtc(window.suggested_window_start))}</strong> · ${escapeHtml(window.duration_minutes)} minutes</div><div>Critical sensors: ${(window.critical_sensors || []).map(escapeHtml).join(', ') || 'none recorded'} · ${window.current_issue ? 'issue active' : 'issue no longer current'}</div>${services}${blockers ? `<details><summary>Preparation blockers</summary><ul>${blockers}</ul></details>` : ''}${actions}</div>`;
+  }).join('');
+  const groups = (payload?.chassis || []).map((chassis) => `<span class="pill">${escapeHtml(chassis.label)} · ${(chassis.device_ids || []).map(escapeHtml).join(' + ')}</span>`).join(' ');
+  const limitation = payload?.limitation || 'Maintenance workload automation is unavailable.';
+  els.maintenanceWindows.innerHTML = `<div class="detail-card"><div>${groups || 'No chassis pairs configured.'}</div><div class="status warn">${escapeHtml(limitation)}</div>${observations || '<div class="muted">No Continuum BMC samples have been recorded yet.</div>'}${cards || '<div class="muted">No fresh critical battery issue has produced a maintenance proposal.</div>'}</div>`;
+}
+function formatMaintenanceUtc(value) {
+  if (!value) return 'not scheduled';
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf()) ? 'invalid schedule' : `${date.toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'UTC' })} UTC`;
 }
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
@@ -825,6 +882,7 @@ async function load(force = false) {
     const refreshServices = force || !state.servicesCache || shouldRefresh(state.servicesFetchedAt, SERVICES_REFRESH_MS);
     const refreshCycles = force || !state.cyclesCache || shouldRefresh(state.cyclesFetchedAt, CYCLES_REFRESH_MS);
     const refreshGraph = force || !state.graphCache || shouldRefresh(state.graphFetchedAt, GRAPH_REFRESH_MS);
+    const refreshMaintenance = force || !state.maintenanceCache || shouldRefresh(state.maintenanceFetchedAt, MAINTENANCE_REFRESH_MS);
     const refreshResearchProjects = force || !state.researchProjectsCache || shouldRefresh(state.researchProjectsFetchedAt, RESEARCH_PROJECTS_REFRESH_MS);
     const traceabilityPromise = state.selectedWorkItemId
       ? fetchJson(`/api/v1/work-items/${state.selectedWorkItemId}/traceability`).catch((error) => ({ __error: error.message }))
@@ -833,7 +891,7 @@ async function load(force = false) {
     if (els.workItemsStatusFilter.value) workItemsParams.set('status', els.workItemsStatusFilter.value);
     if (els.workItemsServiceFilter.value.trim()) workItemsParams.set('target_service', els.workItemsServiceFilter.value.trim());
     if (els.workItemsSearchFilter.value.trim()) workItemsParams.set('search', els.workItemsSearchFilter.value.trim());
-    const [summary, services, workItems, cycles, traceability, graph, researchProjects] = await Promise.all([
+    const [summary, services, workItems, cycles, traceability, graph, researchProjects, maintenance] = await Promise.all([
       fetchJson('/api/v1/summary'),
       refreshServices ? fetchJson('/api/v1/services') : Promise.resolve(state.servicesCache),
       fetchJson(`/api/v1/work-items?${workItemsParams.toString()}`),
@@ -843,6 +901,9 @@ async function load(force = false) {
       refreshResearchProjects
         ? fetchJson('/api/v1/research-projects').catch((error) => ({ __error: error.message }))
         : Promise.resolve(state.researchProjectsCache),
+      refreshMaintenance
+        ? fetchJson('/api/v1/maintenance-windows').catch((error) => ({ __error: error.message }))
+        : Promise.resolve(state.maintenanceCache),
     ]);
     if (refreshServices) {
       state.servicesCache = services;
@@ -856,6 +917,10 @@ async function load(force = false) {
       state.graphCache = graph;
       state.graphFetchedAt = Date.now();
     }
+    if (refreshMaintenance) {
+      state.maintenanceCache = maintenance;
+      state.maintenanceFetchedAt = Date.now();
+    }
     if (refreshResearchProjects) {
       state.researchProjectsCache = researchProjects?.__error ? null : researchProjects;
       state.researchProjectsFetchedAt = Date.now();
@@ -864,7 +929,7 @@ async function load(force = false) {
     const servicesPayload = state.servicesCache || services;
     const cyclesPayload = state.cyclesCache || cycles;
     const graphPayload = state.graphCache || graph;
-    renderSummary(summary); renderExternalSummary(summary, graphPayload.graph || graphPayload); renderServices(servicesPayload.services || servicesPayload); renderWorkItems(items, workItems.pagination); renderCycles(cyclesPayload.cycles || cyclesPayload); renderTraceability(traceability?.traceability || null, traceability?.__error); renderResearchProjects(researchProjects?.projects || [], researchProjects?.__error); updateAuthBadge();
+    renderSummary(summary); renderExternalSummary(summary, graphPayload.graph || graphPayload); renderServices(servicesPayload.services || servicesPayload); renderWorkItems(items, workItems.pagination); renderCycles(cyclesPayload.cycles || cyclesPayload); renderMaintenance(state.maintenanceCache || maintenance); renderTraceability(traceability?.traceability || null, traceability?.__error); renderResearchProjects(researchProjects?.projects || [], researchProjects?.__error); updateAuthBadge();
     connectEventStream();
   } catch (error) {
     closeEventStream();
@@ -881,6 +946,26 @@ async function load(force = false) {
 els.saveToken.addEventListener('click', () => { state.token = els.token.value.trim(); localStorage.setItem('conductor_admin_token', state.token); closeEventStream(); resetDashboardCaches(); load(true); });
 els.clearToken.addEventListener('click', () => { state.token = ''; els.token.value = ''; localStorage.removeItem('conductor_admin_token'); closeEventStream(); resetDashboardCaches(); load(true); });
 els.refresh.addEventListener('click', () => { resetDashboardCaches(); load(true); });
+els.refreshMaintenance.addEventListener('click', () => { state.maintenanceCache = null; state.maintenanceFetchedAt = 0; load(true); });
+els.maintenanceWindows.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-maintenance-decision]');
+  if (!button) return;
+  button.disabled = true;
+  try {
+    const decision = button.dataset.maintenanceDecision;
+    const proposalId = button.dataset.proposalId;
+    await fetchJson(`/api/v1/maintenance-windows/${encodeURIComponent(proposalId)}/decision`, {
+      method: 'POST', body: JSON.stringify({ decision }),
+    });
+    updateEventBadge(`Maintenance window ${decision}ed; preparation status refreshed.`, decision === 'accept' ? 'warn' : 'ok');
+    state.maintenanceCache = null;
+    state.maintenanceFetchedAt = 0;
+    await load(true);
+  } catch (error) {
+    updateAuthBadge(error.message);
+    button.disabled = false;
+  }
+});
 els.workItemsApplyFilter.addEventListener('click', () => { state.workItemsOffset = 0; load(true); });
 els.workItemsPrevious.addEventListener('click', () => { state.workItemsOffset = Math.max(0, state.workItemsOffset - state.workItemsPageSize); load(true); });
 els.workItemsNext.addEventListener('click', () => { state.workItemsOffset += state.workItemsPageSize; load(true); });

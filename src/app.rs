@@ -64,6 +64,11 @@ pub fn build_router(service: ConductorService) -> Router {
         .nest_service("/assets", ServeDir::new("assets"))
         .route("/api/v1/summary", get(summary))
         .route("/api/v1/host-recovery", get(host_recovery_status))
+        .route("/api/v1/maintenance-windows", get(maintenance_windows))
+        .route(
+            "/api/v1/maintenance-windows/{proposal_id}/decision",
+            post(decide_maintenance_window),
+        )
         .route("/api/v1/findings", get(findings))
         .route("/api/v1/findings/{id}", get(get_finding))
         .route("/api/v1/findings/{id}/evidence", get(get_finding_evidence))
@@ -180,6 +185,33 @@ async fn host_recovery_status(
 ) -> ApiResult<Json<serde_json::Value>> {
     service.authorize_read(&headers)?;
     Ok(Json(service.host_recovery_status().await?))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MaintenanceDecisionRequest {
+    pub decision: String,
+}
+
+async fn maintenance_windows(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    service.authorize_read(&headers)?;
+    Ok(Json(service.maintenance_windows().await?))
+}
+
+async fn decide_maintenance_window(
+    State(service): State<ConductorService>,
+    headers: HeaderMap,
+    Path(proposal_id): Path<String>,
+    Json(request): Json<MaintenanceDecisionRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    service.require_configured_admin(&headers)?;
+    Ok(Json(
+        service
+            .decide_maintenance_window(&proposal_id, &request.decision)
+            .await?,
+    ))
 }
 
 async fn services(
@@ -1805,6 +1837,122 @@ mod tests {
         let status: serde_json::Value = serde_json::from_slice(&body).expect("status JSON");
         assert_eq!(status["automatic_loop_enabled"], false);
         assert_eq!(status["dry_run"], true);
+    }
+
+    #[tokio::test]
+    async fn maintenance_windows_require_auth_and_show_shared_chassis_pairs() {
+        let response = build_router(test_service())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/maintenance-windows")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("unauthorised response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = build_router(test_service())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/maintenance-windows")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("authorised response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("maintenance status body");
+        let status: serde_json::Value = serde_json::from_slice(&body).expect("status JSON");
+        assert_eq!(status["chassis"].as_array().expect("chassis").len(), 3);
+        assert_eq!(status["chassis"][2]["device_ids"], json!(["qc04", "qc05"]));
+        assert_eq!(status["evacuation_automation_available"], false);
+    }
+
+    #[tokio::test]
+    async fn accepted_maintenance_decision_is_persisted_but_does_not_start_evacuations() {
+        let mut config = ConductorConfig::default();
+        config.security.admin_token = Some("secret".to_string());
+        let repository = Arc::new(MemoryRepository::new());
+        let proposal_id = "centriq-qc04-qc05-0123456789abcdef";
+        let suggested_start = now_utc() + chrono::Duration::days(8);
+        let mut proposal = crate::models::ConductorEvent::new(
+            "maintenance.window.proposed",
+            "qc04 battery service proposal",
+            json!({
+                "proposal_id": proposal_id,
+                "chassis_id": "centriq-qc04-qc05",
+                "suggested_window_start": suggested_start,
+                "issue_generation": "episode-1",
+                "affected_devices": ["qc04"],
+            }),
+        );
+        proposal.status = Some("suggested".to_string());
+        repository
+            .insert_conductor_event(&proposal)
+            .await
+            .expect("proposal event");
+        repository
+            .upsert_maintenance_observation(&crate::models::MaintenanceObservation {
+                chassis_id: "centriq-qc04-qc05".to_string(),
+                observed_at: now_utc(),
+                payload: json!({
+                    "issue_state": "active",
+                    "issue_generation": "episode-1",
+                    "affected_devices": ["qc04"],
+                    "critical_sensors": ["SYS_V3_Battery"],
+                }),
+            })
+            .await
+            .expect("current BMC observation");
+        let service = ConductorService::new(
+            config,
+            repository.clone(),
+            build_http_client(2).expect("HTTP client"),
+        );
+        let app = build_router(service);
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/maintenance-windows/{proposal_id}/decision"
+                ))
+                .header("authorization", "Bearer secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"decision":"accept"}"#))
+                .unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(request())
+            .await
+            .expect("accepted decision response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("decision body");
+        let result: serde_json::Value = serde_json::from_slice(&body).expect("decision JSON");
+        assert_eq!(result["status"], "accepted_blocked");
+        assert_eq!(result["event"]["payload"]["preparation_status"], "blocked");
+        assert_eq!(
+            repository
+                .list_conductor_events(10)
+                .await
+                .expect("persisted events")
+                .iter()
+                .filter(|event| event.event_type == "maintenance.window.decision")
+                .count(),
+            1
+        );
+
+        let response = app
+            .oneshot(request())
+            .await
+            .expect("duplicate decision response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ pub mod host_recovery;
 pub mod host_resources;
 pub mod improvement_catalog;
 pub mod integrations;
+pub mod maintenance;
 pub mod metrics;
 pub mod models;
 pub mod planner;
