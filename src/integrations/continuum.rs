@@ -83,6 +83,39 @@ impl ContinuumClient {
 
     /// Read the verified device registry through Continuum. Host recovery must
     /// never construct controller mappings from names or addresses on its own.
+    pub async fn recovery_history(&self) -> Result<Value> {
+        self.get_json("/devices/recovery-history").await
+    }
+    pub async fn tracey_host_logs(&self, agent: &str) -> Result<Value> {
+        anyhow::ensure!(
+            !agent.is_empty()
+                && agent.len() <= 128
+                && agent
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)),
+            "invalid Tracey agent identity"
+        );
+        self.get_json(&format!(
+            "/tracey/agents/{agent}/analysis?window_seconds=604800&bucket_seconds=300&log_limit=200"
+        ))
+        .await
+    }
+    pub async fn post_restart_workload_logs(
+        &self,
+        namespace: &str,
+        deployment: &str,
+        previous: bool,
+    ) -> Result<Value> {
+        anyhow::ensure!(
+            [namespace, deployment].iter().all(|s| !s.is_empty()
+                && s.len() <= 63
+                && s.bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')),
+            "invalid recovery log target"
+        );
+        self.get_json(&format!("/k8s/workload/logs?namespace={namespace}&deployment={deployment}&since_seconds=86400&tail_lines=100&previous={previous}")).await
+    }
+
     pub async fn device_inventory(&self) -> Result<Value> {
         self.get_json("/devices/inventory").await
     }
@@ -159,6 +192,49 @@ impl ContinuumClient {
             .as_deref()
             .filter(|value| !value.trim().is_empty())
         {
+            request = request.bearer_auth(token);
+        }
+        super::decode_json(request.send().await?).await
+    }
+
+    pub async fn deployment_status(
+        &self,
+        cluster: &str,
+        namespace: &str,
+        deployment: &str,
+    ) -> Result<Value> {
+        let mut request = self
+            .client
+            .get(format!("{}/k8s/deployment/status", self.base_url))
+            .query(&[
+                ("cluster_id", cluster),
+                ("namespace", namespace),
+                ("deployment", deployment),
+            ]);
+        if let Some(token) = &self.bearer_token {
+            request = request.bearer_auth(token);
+        }
+        super::decode_json(request.send().await?).await
+    }
+
+    pub async fn rollout_image(
+        &self,
+        target: &crate::release::DeploymentTarget,
+        image: &str,
+        expected: &str,
+        request_id: &str,
+        change_id: &str,
+        production: bool,
+    ) -> Result<Value> {
+        let mut body = serde_json::json!({"cluster_id":target.cluster_id,"namespace":target.namespace,"deployment":target.deployment,"container":target.container,"image":image,"expected_image":expected,"request_id":request_id,"change_id":change_id});
+        if production {
+            body["require_zero_unavailable"] = serde_json::json!(true);
+        }
+        let mut request = self
+            .client
+            .post(format!("{}/k8s/deployment/image-rollout", self.base_url))
+            .json(&body);
+        if let Some(token) = &self.bearer_token {
             request = request.bearer_auth(token);
         }
         super::decode_json(request.send().await?).await

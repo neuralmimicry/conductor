@@ -544,8 +544,11 @@ async fn dispatch_claimed_work_item_inner(
     if requires_live_protected_readiness {
         apply_safety_baseline_gate(&mut policy, &safety_baseline);
     }
-    let github_actions =
-        production_github_actions_evidence(config, item, target_service, &repositories).await;
+    let github_actions = if item.plan.get("release_candidate").is_some() {
+        None
+    } else {
+        production_github_actions_evidence(config, item, target_service, &repositories).await
+    };
     apply_github_actions_gate(&mut policy, github_actions.as_ref());
 
     let mut execution = initial_execution.unwrap_or_else(|| {
@@ -594,6 +597,64 @@ async fn dispatch_claimed_work_item_inner(
             .await;
         item.clear_claim();
         return Ok(execution);
+    }
+
+    if item.delivery_stage.is_release_gate() {
+        item.status = WorkStatus::InOperation;
+        execution.mark_status(ExecutionStatus::Verifying);
+        repository.upsert_work_item(item).await?;
+        repository.upsert_work_execution(&execution).await?;
+        let result = crate::release::execute_release_stage(
+            repository,
+            config,
+            item,
+            &mut execution,
+            &services,
+        )
+        .await;
+        match result {
+            Ok(report) => {
+                execution.verification = report.clone();
+                execution.latest_payload = json!({"qualified_release": report});
+                execution.mark_status(ExecutionStatus::Success);
+                let stage = item.delivery_stage;
+                item.mark_stage_validated(stage);
+                if stage == DeliveryStage::Uat {
+                    item.delivery_stage = DeliveryStage::Production;
+                    item.rollout_strategy =
+                        RolloutStrategy::default_for_stage(DeliveryStage::Production);
+                    item.execution_approved = false;
+                    item.status = WorkStatus::Planned;
+                    item.notes.push("Conductor verified the qualified package in UAT; production promotion requires renewed authorization".into());
+                } else {
+                    item.status = WorkStatus::Success;
+                    item.progress_pct = 100;
+                    item.finished_at = Some(crate::models::now_utc());
+                }
+                repository.upsert_work_execution(&execution).await?;
+                repository.upsert_work_item(item).await?;
+                emit_execution_event(
+                    event_callback,
+                    "execution.qualified_release",
+                    "Conductor verified immutable package delivery",
+                    Some(item),
+                    Some(&execution),
+                    Some("success"),
+                    execution.verification.clone(),
+                );
+                return Ok(execution);
+            }
+            Err(error) => {
+                return finalize_execution_failure(
+                    repository,
+                    item,
+                    &mut execution,
+                    event_callback,
+                    error.to_string(),
+                )
+                .await;
+            }
+        }
     }
 
     item.status = WorkStatus::InOperation;
@@ -675,7 +736,10 @@ async fn dispatch_claimed_work_item_inner(
         .await;
     }
 
-    let prompt = build_refiner_prompt(config, item, target_service, &policy);
+    let prompt = format!(
+        "{}\n\nRefiner may choose project_solver, research, NMIDE or a combination with AI Agent assistance via Gail. Implement and test the scoped improvement. Return exact source and a release_candidate manifest. Conductor independently verifies required CI validation/build/package jobs and published release provenance, then instructs Continuum to validate and promote the same immutable artifact. Do not mutate production from a coding-agent or delivery shell stage.",
+        build_refiner_prompt(config, item, target_service, &policy)
+    );
     let heartbeat_interval = execution_heartbeat_interval(config);
     let plan_response = match refiner_request_with_heartbeat(
         post_refiner_json(
@@ -1076,6 +1140,17 @@ async fn dispatch_claimed_work_item_inner(
         );
     }
     if verification_passed {
+        if let Some(manifest) = terminal
+            .get("release_candidate")
+            .or_else(|| terminal.pointer("/result/release_candidate"))
+        {
+            let candidate: crate::release::ReleaseCandidate =
+                serde_json::from_value(manifest.clone())
+                    .context("Refiner returned a malformed release candidate handoff")?;
+            item.plan["release_candidate"] = serde_json::to_value(&candidate)?;
+            item.plan["release_candidate_origin"] = json!({"refiner_job_id": refiner_job_id, "execution_id":execution.id,
+                "qualification":"pending independent Conductor checks", "candidate_id":candidate.identity()?});
+        }
         execution.mark_status(ExecutionStatus::Success);
         item.mark_stage_validated(current_stage);
         repository.upsert_work_execution(&execution).await?;
@@ -1225,7 +1300,7 @@ fn safety_contract(
     })
 }
 
-async fn capture_safety_probe(
+pub(crate) async fn capture_safety_probe(
     config: &ConductorConfig,
     service: Option<&ServiceSnapshot>,
 ) -> Value {
@@ -4843,6 +4918,7 @@ mod tests {
         config.integrations.refiner.base_url = Some(refiner_url);
         config.integrations.refiner.timeout_seconds = 2;
         config.validation.enabled = false;
+        config.validation.require_success = false; // This mock tests handoff, not validation execution.
 
         let repository = Arc::new(MemoryRepository::new());
         let item = WorkItem::from_new(NewWorkItem {

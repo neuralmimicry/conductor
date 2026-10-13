@@ -16,6 +16,7 @@ pub mod models;
 pub mod planner;
 pub mod policy;
 pub mod recovery;
+pub mod release;
 pub mod repository;
 pub mod service;
 pub mod storage;

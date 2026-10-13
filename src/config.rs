@@ -139,6 +139,8 @@ pub struct IntegrationsConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DeliveryConfig {
+    /// Operator-owned release contracts; an empty map blocks automated delivery.
+    pub qualified_releases: BTreeMap<String, crate::release::ReleasePolicy>,
     pub auto_advance: bool,
     pub dora_window_days: i64,
     pub require_uat_before_production: bool,
@@ -326,6 +328,8 @@ pub struct RecoveryTargetConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostRecoveryConfig {
+    /// Read-only SSH evidence is separately allowlisted from recovery mutations.
+    pub review_ssh: Vec<RestartReviewSshConfig>,
     pub enabled: bool,
     pub dry_run: bool,
     pub interval_seconds: u64,
@@ -338,6 +342,16 @@ pub struct HostRecoveryConfig {
     /// Device IDs must be explicit; inventory discovery alone never grants
     /// permission to operate a physical controller.
     pub targets: Vec<HostRecoveryTargetConfig>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RestartReviewSshConfig {
+    pub device_id: String,
+    pub address: String,
+    pub username: String,
+    pub identity_file: String,
+    pub known_hosts_file: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -550,6 +564,7 @@ impl Default for IntegrationsConfig {
 impl Default for DeliveryConfig {
     fn default() -> Self {
         Self {
+            qualified_releases: BTreeMap::new(),
             auto_advance: true,
             dora_window_days: 30,
             require_uat_before_production: true,
@@ -748,6 +763,7 @@ impl Default for RecoveryConfig {
 impl Default for HostRecoveryConfig {
     fn default() -> Self {
         Self {
+            review_ssh: Vec::new(),
             enabled: false,
             dry_run: true,
             interval_seconds: 60,
@@ -1045,6 +1061,34 @@ impl ConductorConfig {
             }) {
                 return Err(anyhow!(
                     "recovery target Prometheus labels must identify its Continuum cluster"
+                ));
+            }
+        }
+        if self.host_recovery.review_ssh.len() > 64 {
+            return Err(anyhow!("host_recovery.review_ssh is limited to 64 devices"));
+        }
+        let mut review_devices = std::collections::BTreeSet::new();
+        for review in &self.host_recovery.review_ssh {
+            if !valid_device_identifier(&review.device_id)
+                || !review_devices.insert(&review.device_id)
+                || review.address.parse::<std::net::IpAddr>().is_err()
+                || review.username.is_empty()
+                || review.username.len() > 64
+                || !review
+                    .username
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+                || [&review.identity_file, &review.known_hosts_file]
+                    .iter()
+                    .any(|path| {
+                        !std::path::Path::new(path).is_absolute()
+                            || path
+                                .chars()
+                                .any(|c| c.is_whitespace() || matches!(c, '\0' | '%'))
+                    })
+            {
+                return Err(anyhow!(
+                    "host_recovery.review_ssh requires unique valid devices, IPs, usernames and absolute key/known-host paths"
                 ));
             }
         }
