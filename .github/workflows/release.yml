@@ -207,6 +207,10 @@ jobs:
           path: dist/*.deb
           if-no-files-found: error
 
+      - name: Remove the job's private container runtime
+        if: ${{ always() && env.CONDUCTOR_PODMAN_ROOT != '' }}
+        run: bash scripts/ci-podman.sh --cleanup
+
   github-release:
     name: Publish GitHub release
     needs:
@@ -371,6 +375,10 @@ jobs:
           subject-name: ${{ env.IMAGE_REPO }}
           subject-digest: ${{ steps.image.outputs.digest }}
 
+      - name: Remove the job's private container runtime
+        if: ${{ always() && env.CONDUCTOR_PODMAN_ROOT != '' }}
+        run: bash scripts/ci-podman.sh --cleanup
+
   publish-container:
     name: Publish multi-arch container
     needs:
@@ -449,3 +457,7 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE_REPO }}
           subject-digest: ${{ steps.manifest.outputs.digest }}
+
+      - name: Remove the job's private container runtime
+        if: ${{ always() && env.CONDUCTOR_PODMAN_ROOT != '' }}
+        run: bash scripts/ci-podman.sh --cleanup

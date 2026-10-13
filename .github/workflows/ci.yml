@@ -43,6 +43,9 @@ jobs:
         with:
           components: rustfmt
 
+      - name: Verify isolated container runtime with estate-length runner paths
+        run: bash scripts/test-ci-podman.sh
+
       - name: Check formatting
         run: cargo fmt --check
 
