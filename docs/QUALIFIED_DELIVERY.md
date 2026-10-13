@@ -8,7 +8,7 @@ It is untrusted until independent qualification completes.
 
 `delivery.qualified_releases` is an operator-owned map keyed by `owner/repository`.
 Each entry fixes the workflow, all required validation/build/package job names,
-UAT/production service keys and the acceptance contract. An empty map blocks
+complete UAT/production coordinates and known-good rollback images, and the acceptance contract. An empty map blocks
 release execution. Refiner cannot supply a cheaper or weaker qualification policy.
 Candidate manifests contain full source SHA, Actions run ID/attempt, release tag,
 asset/checksum, immutable image, exact UAT/production Deployment/container/previous

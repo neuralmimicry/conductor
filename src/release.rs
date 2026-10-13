@@ -19,8 +19,8 @@ use std::{
 pub struct ReleasePolicy {
     pub workflow: String,
     pub required_jobs: BTreeMap<String, Vec<String>>,
-    pub uat_service_key: String,
-    pub production_service_key: String,
+    pub uat: DeploymentTarget,
+    pub production: DeploymentTarget,
     pub acceptance: Acceptance,
 }
 
@@ -94,8 +94,8 @@ impl ReleaseCandidate {
         ensure!(
             policy.workflow == self.workflow
                 && policy.required_jobs == self.required_jobs
-                && policy.uat_service_key == self.uat.service_key
-                && policy.production_service_key == self.production.service_key
+                && policy.uat == self.uat
+                && policy.production == self.production
                 && policy.acceptance == self.acceptance,
             "candidate changed the trusted workflow, required jobs, targets or acceptance contract"
         );
@@ -938,12 +938,15 @@ mod tests {
             ReleasePolicy {
                 workflow: c.workflow.clone(),
                 required_jobs: c.required_jobs.clone(),
-                uat_service_key: c.uat.service_key.clone(),
-                production_service_key: c.production.service_key.clone(),
+                uat: c.uat.clone(),
+                production: c.production.clone(),
                 acceptance: c.acceptance.clone(),
             },
         );
         assert!(c.validate(&config, &item).is_ok());
+        c.production.deployment = "another-workload".into();
+        assert!(c.validate(&config, &item).is_err());
+        c.production.deployment = "app".into();
         c.acceptance.minimum_improvement_pct = 0.1;
         assert!(c.validate(&config, &item).is_err());
     }
