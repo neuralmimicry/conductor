@@ -35,6 +35,23 @@ RUN set -eu; \
         --binary target/release/conductor \
         --out-dir /out
 
+# gh >= 2.83 is required for independent cryptographic attestation verification.
+FROM docker.io/library/debian:bookworm-slim AS github-cli
+ARG TARGETARCH
+RUN set -eu; \
+    apt-get update && apt-get install -y --no-install-recommends ca-certificates curl; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "$arch" in \
+      amd64) digest=a5cf6cdb40fc67751adf561126b3314044779cea81ba4f254fbe8e9a69f1676f ;; \
+      arm64) digest=12311e320d4cfdb54d7fa2d58cd1e3a2ccb4c12e1c3abb32b0a2e48bd0f991bf ;; \
+      *) exit 2 ;; \
+    esac; \
+    curl -fSL "https://github.com/cli/cli/releases/download/v2.83.0/gh_2.83.0_linux_${arch}.tar.gz" -o /tmp/gh.tar.gz; \
+    printf '%s  /tmp/gh.tar.gz\n' "$digest" | sha256sum -c -; \
+    tar -xzf /tmp/gh.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/gh_2.83.0_linux_${arch}/bin/gh" /usr/local/bin/gh; \
+    /usr/local/bin/gh attestation verify --help >/dev/null
+
 FROM docker.io/library/debian:bookworm-slim
 ARG TARGET_PAGE_SIZE
 LABEL org.opencontainers.image.page-size="${TARGET_PAGE_SIZE}"
@@ -49,6 +66,7 @@ ARG APP_USER=conductor
 ARG APP_UID=10001
 ARG APP_GID=10001
 
+COPY --from=github-cli /usr/local/bin/gh /usr/bin/gh
 COPY --from=source-deb /out/conductor_*.deb /tmp/source-conductor.deb
 COPY --from=source-deb /usr/local/cargo /usr/local/cargo
 COPY --from=source-deb /usr/local/rustup /usr/local/rustup

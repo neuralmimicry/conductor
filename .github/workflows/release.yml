@@ -153,16 +153,10 @@ jobs:
             sudo apt-get install -y --no-install-recommends dpkg
           fi
           if command -v podman >/dev/null 2>&1 && podman --version >/dev/null 2>&1; then
-            # Some self-hosted runners do not start a user systemd session.
-            # Give rootless Podman a private runtime directory instead of
-            # relying on the absent /run/user/<uid> path.
-            podman_runtime_dir="${RUNNER_TEMP}/podman-runtime"
-            mkdir -p "${podman_runtime_dir}"
-            chmod 700 "${podman_runtime_dir}"
-            echo "XDG_RUNTIME_DIR=${podman_runtime_dir}" >>"${GITHUB_ENV}"
-            echo "CONTAINER_RUNTIME=podman" >>"${GITHUB_ENV}"
+            bash scripts/ci-podman.sh --prepare
             container_runtime="podman"
           elif command -v docker >/dev/null 2>&1 && env -u DOCKER_HOST docker info >/dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME_ARGS=" >>"${GITHUB_ENV}"
             echo "CONTAINER_RUNTIME=docker" >>"${GITHUB_ENV}"
             echo "DOCKER_HOST=" >>"${GITHUB_ENV}"
             container_runtime="docker"
@@ -170,23 +164,18 @@ jobs:
             echo "No usable Podman or Docker runtime is available" >&2
             exit 1
           fi
-          # Rootless self-hosted runners may not have a user systemd session.
-          # Explicitly use cgroupfs so crun does not attempt an interactive
-          # sd-bus authentication call while creating the build container.
-          if [[ "${container_runtime}" == "podman" ]]; then
-            echo "CONTAINER_RUNTIME_ARGS=--cgroup-manager=cgroupfs" >>"${GITHUB_ENV}"
-          else
-            echo "CONTAINER_RUNTIME_ARGS=" >>"${GITHUB_ENV}"
-          fi
 
       - name: Build Debian package in bookworm toolchain container
         shell: bash
         run: |
           set -euo pipefail
+          network_args=()
+          if [[ "$CONTAINER_RUNTIME" != docker ]]; then network_args=(--network=slirp4netns); fi
           image_ref="localhost/conductor-release-build-${{ matrix.deb_arch }}:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           container_name="conductor-release-build-${{ matrix.deb_arch }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           # shellcheck disable=SC2086
           "${CONTAINER_RUNTIME}" ${CONTAINER_RUNTIME_ARGS:-} build \
+            "${network_args[@]}" \
             --target source-deb \
             --build-arg "CONDUCTOR_VERSION=${{ needs.version.outputs.app_version }}" \
             -f Containerfile \
@@ -332,10 +321,7 @@ jobs:
             fi
           fi
           podman --version
-          podman_runtime_dir="${RUNNER_TEMP}/podman-runtime"
-          mkdir -p "${podman_runtime_dir}"
-          chmod 700 "${podman_runtime_dir}"
-          echo "XDG_RUNTIME_DIR=${podman_runtime_dir}" >>"${GITHUB_ENV}"
+          bash scripts/ci-podman.sh --prepare
 
       - name: Log in to GHCR
         shell: bash
@@ -343,7 +329,7 @@ jobs:
           set -euo pipefail
           test -n "${GHCR_USERNAME}" || { echo "No GHCR username available" >&2; exit 1; }
           test -n "${GHCR_TOKEN}" || { echo "No GHCR token available" >&2; exit 1; }
-          printf '%s' "${GHCR_TOKEN}" | podman --cgroup-manager=cgroupfs login ghcr.io \
+          printf '%s' "${GHCR_TOKEN}" | "${CONTAINER_RUNTIME}" login ghcr.io \
             --username "${GHCR_USERNAME}" --password-stdin
 
       - name: Build and push architecture image
@@ -357,11 +343,12 @@ jobs:
           image_ref="${IMAGE_REPO}:${IMAGE_VERSION}-${ARCH}"
           iid_file="$(mktemp)"
           trap 'rm -f "${iid_file}"' EXIT
-          podman_build_runtime_args=(--cgroup-manager=cgroupfs)
+          podman_build_runtime_args=()
           if [[ "${ARCH}" == "arm64" ]] && command -v runc >/dev/null 2>&1; then
             podman_build_runtime_args+=(--runtime "$(command -v runc)")
           fi
-          podman "${podman_build_runtime_args[@]}" build \
+          "${CONTAINER_RUNTIME}" "${podman_build_runtime_args[@]}" build \
+            --network=slirp4netns \
             --pull \
             --build-arg "CONDUCTOR_VERSION=source" \
             --build-arg "TARGET_PAGE_SIZE=${PAGE_SIZE}" \
@@ -372,7 +359,7 @@ jobs:
           image_id="$(tr -d '\n' <"${iid_file}")"
           test -n "${image_id}" || { echo "Podman did not emit an image ID" >&2; exit 1; }
           digest_file="${RUNNER_TEMP}/conductor-${ARCH}-registry-digest"
-          podman --cgroup-manager=cgroupfs push --digestfile "${digest_file}" "${image_id}" "docker://${image_ref}"
+          "${CONTAINER_RUNTIME}" push --digestfile "${digest_file}" "${image_id}" "docker://${image_ref}"
           digest="$(tr -d '\n' <"${digest_file}")"
           [[ "${digest}" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "Invalid registry digest" >&2; exit 1; }
           echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
@@ -402,6 +389,9 @@ jobs:
       GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
       GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Prepare rootless Podman
         shell: bash
         run: |
@@ -416,10 +406,7 @@ jobs:
           # architecture builds can leave Podman trying to re-enter a stale
           # user namespace (exit 125: cannot re-exec process to join the
           # existing user namespace).
-          podman_runtime_dir="${RUNNER_TEMP}/podman-runtime"
-          mkdir -p "${podman_runtime_dir}"
-          chmod 700 "${podman_runtime_dir}"
-          echo "XDG_RUNTIME_DIR=${podman_runtime_dir}" >>"${GITHUB_ENV}"
+          bash scripts/ci-podman.sh --prepare
 
       - name: Log in to GHCR
         shell: bash
@@ -427,7 +414,7 @@ jobs:
           set -euo pipefail
           test -n "${GHCR_USERNAME}" || { echo "No GHCR username available" >&2; exit 1; }
           test -n "${GHCR_TOKEN}" || { echo "No GHCR token available" >&2; exit 1; }
-          printf '%s' "${GHCR_TOKEN}" | podman --cgroup-manager=cgroupfs login ghcr.io \
+          printf '%s' "${GHCR_TOKEN}" | "${CONTAINER_RUNTIME}" login ghcr.io \
             --username "${GHCR_USERNAME}" --password-stdin
 
       - name: Create and push multi-arch tags
@@ -436,15 +423,15 @@ jobs:
         run: |
           set -euo pipefail
           manifest="conductor-manifest-${IMAGE_VERSION}"
-          podman --cgroup-manager=cgroupfs manifest rm "${manifest}" >/dev/null 2>&1 || true
-          podman --cgroup-manager=cgroupfs manifest create "${manifest}"
-          podman --cgroup-manager=cgroupfs manifest add "${manifest}" \
+          "${CONTAINER_RUNTIME}" manifest rm "${manifest}" >/dev/null 2>&1 || true
+          "${CONTAINER_RUNTIME}" manifest create "${manifest}"
+          "${CONTAINER_RUNTIME}" manifest add "${manifest}" \
             "docker://${IMAGE_REPO}:${IMAGE_VERSION}-amd64"
-          podman --cgroup-manager=cgroupfs manifest add "${manifest}" \
+          "${CONTAINER_RUNTIME}" manifest add "${manifest}" \
             "docker://${IMAGE_REPO}:${IMAGE_VERSION}-arm64"
           for tag in latest "${IMAGE_VERSION}" "${IMAGE_TAG}" "${COMMIT_SHORT}"; do
             digest_file="${RUNNER_TEMP}/conductor-manifest-registry-digest"
-            podman --cgroup-manager=cgroupfs manifest push --all --digestfile "${digest_file}" "${manifest}" \
+            "${CONTAINER_RUNTIME}" manifest push --all --digestfile "${digest_file}" "${manifest}" \
               "docker://${IMAGE_REPO}:${tag}"
             digest="$(tr -d '\n' <"${digest_file}")"
             [[ "${digest}" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "Invalid manifest digest" >&2; exit 1; }
