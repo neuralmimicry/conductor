@@ -717,6 +717,30 @@ fn safe_review_excerpt(message: &str) -> String {
     }
 }
 
+pub fn restart_workload_findings(payload: &Value, restart_ms: i64, now_ms: i64) -> Value {
+    let items = payload["items"].as_array();
+    let mut logs = Vec::new();
+    let mut timestamp_gaps = 0usize;
+    for item in items.into_iter().flatten().take(16) {
+        for line in item["logs"].as_str().unwrap_or_default().lines().take(100) {
+            let Some((timestamp, message)) = line.split_once(' ') else {
+                timestamp_gaps += 1;
+                continue;
+            };
+            let Ok(at) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
+                timestamp_gaps += 1;
+                continue;
+            };
+            logs.push(serde_json::json!({"ts_ms":at.timestamp_millis(),"message":message,"category":"workload",
+                "level":if message.to_ascii_lowercase().contains("error"){"error"}else{"info"}}));
+        }
+    }
+    let findings = post_restart_log_findings(&logs, restart_ms, now_ms);
+    serde_json::json!({"findings":findings,"timestamp_gaps":timestamp_gaps,"upstream_errors":payload["error_count"],
+        "truncated":payload["truncated"] == true || items.is_some_and(|rows|rows.len()>16) || logs.len()>=200,
+        "review_complete":false,"raw_logs_retained":false})
+}
+
 /// Only operator-owned SSH coordinates that match a fresh unique inventory IP
 /// may be used. No agent-supplied host, command, key or SSH configuration executes.
 fn review_ssh_args(
@@ -1044,6 +1068,24 @@ pub async fn restart_monitoring_evidence(
 mod post_restart_tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn workload_review_examines_only_correlated_lines_and_records_coverage_gaps() {
+        let restart = 10_000_000;
+        let report = restart_workload_findings(
+            &json!({"error_count":1,"truncated":true,"items":[{"logs":
+            "1970-01-01T02:46:40Z ERROR postgres connection pool password=private\n1970-01-01T00:00:01Z old kernel panic\nno_timestamp ERROR 503"}]}),
+            restart,
+            restart + 100_000,
+        );
+        assert_eq!(report["findings"]["examined"], 1);
+        assert_eq!(
+            report["findings"]["findings"][0]["excerpt"],
+            "[sensitive log excerpt redacted]"
+        );
+        assert_eq!(report["timestamp_gaps"], 1);
+        assert_eq!(report["truncated"], true);
+        assert_eq!(report["review_complete"], false);
+    }
     #[test]
     fn ssh_review_refuses_unpinned_hosts_and_command_injection() {
         let mut settings = crate::config::RestartReviewSshConfig {

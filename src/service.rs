@@ -1346,7 +1346,14 @@ impl ConductorService {
                 .find_work_item_by_dedupe_key(&format!("post-restart-review:{id}"))
                 .await?
             {
-                if existing.status.is_terminal() || existing.admin_override {
+                if existing.status.is_terminal()
+                    || existing.admin_override
+                    || existing.execution_approved
+                    || matches!(
+                        existing.status,
+                        WorkStatus::Scheduled | WorkStatus::InOperation
+                    )
+                {
                     continue;
                 }
             }
@@ -1432,6 +1439,8 @@ impl ConductorService {
                         workload_sources.push(json!({"service":service.service_key,"namespace":target.namespace,
                             "deployment":target.deployment,"previous":previous,"available":result.is_ok(),
                             "sha256":result.as_ref().ok().map(host_recovery_fingerprint),
+                            "analysis":result.as_ref().ok().filter(|data|data["namespace"]==target.namespace && data["deployment"]==target.deployment)
+                                .map(|data|crate::host_recovery::restart_workload_findings(data,started,now_ms)),
                             "reference":format!("{}/k8s/workload/logs?namespace={}&deployment={}&previous={previous}",control.base_url(),target.namespace,target.deployment)}));
                     }
                 }
@@ -1503,7 +1512,14 @@ impl ConductorService {
         let mut item = if let Some(existing) =
             self.repository.find_work_item_by_dedupe_key(&key).await?
         {
-            if existing.status.is_terminal() || existing.admin_override {
+            if existing.status.is_terminal()
+                || existing.admin_override
+                || existing.execution_approved
+                || matches!(
+                    existing.status,
+                    WorkStatus::Scheduled | WorkStatus::InOperation
+                )
+            {
                 return Ok(());
             }
             if existing.plan == plan {
@@ -9605,6 +9621,17 @@ mod tests {
             false
         );
         assert!(items[0].tags.iter().any(|t| t == "recurrence-prevention"));
+        let mut claimed = items[0].clone();
+        claimed.status = WorkStatus::InOperation;
+        claimed.execution_approved = true;
+        claimed.progress_pct = 30;
+        repository.upsert_work_item(&claimed).await.unwrap();
+        assert_eq!(service.review_recent_warm_restarts().await.unwrap(), 0);
+        let retained = repository.get_work_item(claimed.id).await.unwrap().unwrap();
+        assert_eq!(retained.status, WorkStatus::InOperation);
+        assert!(retained.execution_approved);
+        assert_eq!(retained.progress_pct, 30);
+        assert_eq!(retained.plan, claimed.plan);
         server.abort();
     }
 
