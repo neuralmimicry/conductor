@@ -24,6 +24,16 @@ runtime needs a trusted gh CLI supporting `attestation verify --source-digest`
 (e.g. 2.83.0), approved registry/GitHub credentials and published image attestations;
 missing tooling/evidence blocks delivery, without a weaker fallback.
 
+The release producer now calls the reusable dual-architecture CI workflow before
+Debian builds. It uses the commit-pinned GitHub provenance action to attest each
+Debian package, each architecture image and the published index using their actual
+registry digests. Signing authority is scoped to producer jobs; ordinary validation
+remains read-only. Release publication is serialized and refuses an existing tag
+for another source or an existing asset with different/missing digest evidence.
+Tag resolution explicitly selects `refs/tags`, avoiding branch/tag ambiguity.
+These producer changes require a successful canonical release run before any new
+package/provenance can be accepted.
+
 UAT requires independently discovered UAT service coordinates and Continuum's
 `validation_isolation_verified=true` proof for a supported state/credential/network
 isolation adapter. That adapter is not yet implemented: creating an arbitrary

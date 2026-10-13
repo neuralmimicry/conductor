@@ -257,7 +257,7 @@ jobs:
             return response.json();
           };
           const tag = encodeURIComponent(process.env.RELEASE_TAG);
-          const commit = await request(`commits/${tag}`);
+          const commit = await request(`commits/refs%2Ftags%2F${tag}`);
           if (commit && commit.sha !== process.env.GITHUB_SHA) throw Error('Existing release tag belongs to another source');
           const release = await request(`releases/tags/${tag}`);
           if (release) {

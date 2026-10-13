@@ -660,7 +660,7 @@ pub async fn execute_release_stage(
     let commit = github(
         config,
         &candidate.repository,
-        &format!("commits/{}", candidate.release_tag),
+        &format!("commits/refs%2Ftags%2F{}", candidate.release_tag),
     )
     .await?;
     verify_package(&candidate, &release, &commit)?;
