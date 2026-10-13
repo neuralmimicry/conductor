@@ -355,7 +355,7 @@ fn base_url_candidates(service: &ServiceSnapshot, external: &ExternalServiceConf
     candidates
 }
 
-fn apply_external_auth(
+pub(crate) fn apply_external_auth(
     mut request: reqwest::RequestBuilder,
     external: &ExternalServiceConfig,
 ) -> reqwest::RequestBuilder {

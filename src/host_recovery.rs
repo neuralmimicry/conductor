@@ -647,3 +647,487 @@ mod tests {
         );
     }
 }
+
+/// These are investigation signals, never a claimed root cause or permission
+/// to reset a host again. Ignore unrelated timestamps and redact risky excerpts.
+pub fn post_restart_log_findings(logs: &[Value], restart_ms: i64, now_ms: i64) -> Value {
+    let mut findings = Vec::new();
+    let mut examined = 0usize;
+    for log in logs.iter().take(200) {
+        let Some(at) = log["ts_ms"].as_i64() else {
+            continue;
+        };
+        if at < restart_ms.saturating_sub(3_600_000)
+            || at > now_ms.min(restart_ms.saturating_add(3_600_000))
+        {
+            continue;
+        }
+        examined += 1;
+        let message = log["message"].as_str().unwrap_or_default();
+        let lower = message.to_ascii_lowercase();
+        let signals: Vec<_> = [
+            ("memory", "out of memory"),
+            ("memory", "oom"),
+            ("kernel", "panic"),
+            ("storage", "i/o error"),
+            ("storage", "corrupt"),
+            ("storage", "failed to mount"),
+            ("database", "connection pool"),
+            ("database", "postgres"),
+            ("authentication", "auth request"),
+            ("availability", "503"),
+            ("availability", "500"),
+            ("service", "crashloop"),
+            ("service", "segfault"),
+        ]
+        .iter()
+        .filter(|(_, term)| lower.contains(term))
+        .map(|(kind, _)| *kind)
+        .collect();
+        if !signals.is_empty()
+            || matches!(log["level"].as_str(), Some("error" | "critical" | "fatal"))
+        {
+            let excerpt = safe_review_excerpt(message);
+            findings.push(serde_json::json!({"ts_ms":at,"signals":signals,"category":log["category"],"excerpt":excerpt}));
+        }
+    }
+    serde_json::json!({"examined":examined,"findings":findings,
+        "bounded":true,"truncated":logs.len() >= 200,"root_cause_confirmed":false,
+        "previous_boot_coverage_verified":false,"investigation_required":true})
+}
+
+fn safe_review_excerpt(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    if [
+        "password",
+        "authorization",
+        "bearer ",
+        "token",
+        "secret",
+        "cookie",
+        "private key",
+        "://",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+    {
+        "[sensitive log excerpt redacted]".into()
+    } else {
+        message.chars().take(480).collect()
+    }
+}
+
+/// Only operator-owned SSH coordinates that match a fresh unique inventory IP
+/// may be used. No agent-supplied host, command, key or SSH configuration executes.
+fn review_ssh_args(
+    settings: &crate::config::RestartReviewSshConfig,
+    device: &Value,
+    restart_ms: i64,
+) -> anyhow::Result<Vec<String>> {
+    use anyhow::{anyhow, ensure};
+    ensure!(
+        device["id"] == settings.device_id
+            && device["addresses"]
+                .as_array()
+                .is_some_and(|addresses| addresses
+                    .iter()
+                    .any(|a| a.as_str() == Some(settings.address.as_str()))),
+        "SSH address is not inventory-pinned"
+    );
+    settings
+        .address
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| anyhow!("SSH address must be an IP"))?;
+    ensure!(
+        !settings.username.is_empty()
+            && settings.username.len() <= 64
+            && settings
+                .username
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+        "SSH username is invalid"
+    );
+    for path in [&settings.identity_file, &settings.known_hosts_file] {
+        ensure!(
+            std::path::Path::new(path).is_absolute() && !path.contains(['\n', '\r', '\0']),
+            "SSH evidence requires absolute key and known-host paths"
+        );
+    }
+    ensure!(restart_ms > 3_600_000, "invalid restart timestamp");
+    Ok(vec![
+        "-F".into(),
+        "/dev/null".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=yes".into(),
+        "-o".into(),
+        format!("UserKnownHostsFile={}", settings.known_hosts_file),
+        "-o".into(),
+        "GlobalKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        "IdentitiesOnly=yes".into(),
+        "-o".into(),
+        "ForwardAgent=no".into(),
+        "-o".into(),
+        "ClearAllForwardings=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=5".into(),
+        "-o".into(),
+        "ConnectionAttempts=1".into(),
+        "-i".into(),
+        settings.identity_file.clone(),
+        "-l".into(),
+        settings.username.clone(),
+        settings.address.clone(),
+    ])
+}
+
+pub async fn restart_ssh_evidence(
+    settings: Option<&crate::config::RestartReviewSshConfig>,
+    device: Option<&Value>,
+    inventory_fresh: bool,
+    restart_ms: i64,
+) -> Value {
+    use tokio::io::AsyncReadExt;
+    let unavailable = |gap: &str| serde_json::json!({"available":false,"gap":gap,"logs":[],"review_complete":false});
+    let (Some(settings), Some(device)) = (settings, device) else {
+        return unavailable("Approved SSH evidence settings or inventory device unavailable");
+    };
+    if !inventory_fresh {
+        return unavailable("Inventory is stale; SSH collection held");
+    }
+    let Ok(args) = review_ssh_args(settings, device, restart_ms) else {
+        return unavailable("SSH coordinates/key/known-host policy failed inventory validation");
+    };
+    let mut sources = Vec::new();
+    let mut logs = Vec::new();
+    for (source, flags) in [
+        ("previous_boot", "-b -1 -p warning"),
+        ("previous_kernel", "-b -1 -k"),
+        ("current_services", "-b 0 -p warning"),
+    ] {
+        // The remote shell receives only fixed words and validated integer times.
+        let command = format!(
+            "sudo -n /usr/bin/journalctl --no-pager --output=json -n 200 {flags} --since=@{} --until=@{}",
+            (restart_ms - 3_600_000) / 1000,
+            (restart_ms + 3_600_000) / 1000
+        );
+        let result = async {
+            let mut child = tokio::process::Command::new("/usr/bin/ssh")
+                .args(&args)
+                .arg(command)
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()?;
+            let mut bytes = Vec::new();
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("no stdout"))?
+                .take(262_145)
+                .read_to_end(&mut bytes)
+                .await?;
+            anyhow::ensure!(bytes.len() <= 262_144, "journal exceeds evidence bound");
+            anyhow::ensure!(child.wait().await?.success(), "journal command failed");
+            let text = std::str::from_utf8(&bytes)?;
+            let mut rows = Vec::new();
+            for line in text.lines() {
+                let entry: Value = serde_json::from_str(line)?;
+                let at = entry["__REALTIME_TIMESTAMP"]
+                    .as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .ok_or_else(|| anyhow::anyhow!("journal timestamp missing"))?
+                    / 1000;
+                if at < restart_ms - 3_600_000 || at > restart_ms + 3_600_000 {
+                    continue;
+                }
+                rows.push(serde_json::json!({"ts_ms":at,"message":safe_review_excerpt(entry["MESSAGE"].as_str().unwrap_or_default()),"level":if matches!(entry["PRIORITY"].as_str(),Some("0"|"1"|"2"|"3")) {"error"} else {"warning"},"category":source,"boot_id":entry["_BOOT_ID"]}));
+                if rows.len() >= 200 {
+                    break;
+                }
+            }
+            Ok::<_, anyhow::Error>(rows)
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(10), result).await {
+            Ok(Ok(rows)) => {
+                sources.push(serde_json::json!({"source":source,"available":!rows.is_empty(),"records":rows.len(),"truncated":rows.len() >= 200,"findings":post_restart_log_findings(&rows,restart_ms,restart_ms+3_600_000),"boot_ids":rows.iter().filter_map(|r|r["boot_id"].as_str()).collect::<std::collections::BTreeSet<_>>(),"gap":if rows.is_empty(){Some("No correlated journal entries; previous-boot coverage unproven")}else{None}}));
+                logs.extend(rows);
+            }
+            _ => sources.push(serde_json::json!({"source":source,"available":false,"gap":"SSH/journal collection unavailable or exceeded time/output bounds"})),
+        }
+    }
+    let findings = post_restart_log_findings(&logs, restart_ms, restart_ms + 3_600_000);
+    serde_json::json!({"available":!logs.is_empty(),"sources":sources,"findings":findings,"bounded":true,"review_complete":false})
+}
+
+async fn bounded_monitoring_json(
+    external: &crate::config::ExternalServiceConfig,
+    path: &str,
+    params: &[(String, String)],
+) -> anyhow::Result<Value> {
+    anyhow::ensure!(external.enabled, "monitor disabled");
+    let base = external
+        .base_url
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("monitor URL missing"))?;
+    let url = reqwest::Url::parse(base)?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty()
+            && url.password().is_none(),
+        "invalid monitoring URL"
+    );
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(
+            external.timeout_seconds.clamp(1, 10),
+        ))
+        .build()?;
+    let mut response = crate::integrations::apply_external_auth(
+        client
+            .get(format!("{}{path}", base.trim_end_matches('/')))
+            .query(params),
+        external,
+    )
+    .send()
+    .await?
+    .error_for_status()?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            bytes.len() + chunk.len() <= 262_144,
+            "monitor response too large"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn range_summary(value: &Value, start: i64, end: i64) -> anyhow::Result<Value> {
+    anyhow::ensure!(
+        value["status"] == "success" && value["data"]["resultType"] == "matrix",
+        "range response invalid"
+    );
+    let rows = value["data"]["result"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("missing series"))?;
+    anyhow::ensure!(
+        !rows.is_empty() && rows.len() <= 64,
+        "range series missing/excessive"
+    );
+    let mut samples = Vec::new();
+    let mut coverage_verified = true;
+    for row in rows {
+        let mut times = Vec::new();
+        for sample in row["values"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing samples"))?
+        {
+            let at = sample[0]
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("bad timestamp"))?;
+            let reading = sample[1]
+                .as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+                .ok_or_else(|| anyhow::anyhow!("bad sample"))?;
+            anyhow::ensure!(
+                at.is_finite() && at >= start as f64 && at <= end as f64 && reading.is_finite(),
+                "out-of-window/non-finite sample"
+            );
+            samples.push((at, reading));
+            times.push(at);
+            anyhow::ensure!(samples.len() <= 8192, "too many samples");
+        }
+        times.sort_by(f64::total_cmp);
+        coverage_verified &= times.first().is_some_and(|at| *at <= start as f64 + 60.0)
+            && times.last().is_some_and(|at| *at >= end as f64 - 60.0)
+            && times.windows(2).all(|w| w[1] - w[0] <= 120.0);
+    }
+    anyhow::ensure!(!samples.is_empty(), "no samples");
+    Ok(
+        serde_json::json!({"series":rows.len(),"samples":samples.len(),"coverage_verified":coverage_verified,"gap":if coverage_verified{None}else{Some("Incomplete sample coverage around the restart; available samples cannot establish outage health")},"first_sample":samples.iter().map(|s|s.0).fold(f64::INFINITY,f64::min),"last_sample":samples.iter().map(|s|s.0).fold(f64::NEG_INFINITY,f64::max),"minimum":samples.iter().map(|s|s.1).fold(f64::INFINITY,f64::min),"maximum":samples.iter().map(|s|s.1).fold(f64::NEG_INFINITY,f64::max),"root_cause_confirmed":false}),
+    )
+}
+
+pub async fn restart_monitoring_evidence(
+    config: &crate::config::ConductorConfig,
+    host: &str,
+    restart_ms: i64,
+    now_ms: i64,
+) -> Value {
+    if host.is_empty()
+        || host.len() > 128
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        || restart_ms <= 3_600_000
+        || now_ms < restart_ms
+    {
+        return serde_json::json!({"available":false,"gap":"Invalid host or restart window","review_complete":false});
+    }
+    let start = (restart_ms - 3_600_000) / 1000;
+    let end = now_ms.min(restart_ms + 3_600_000) / 1000;
+    let queries = [
+        (
+            "host_probe_success",
+            format!("probe_success{{device=\"{host}\"}}"),
+        ),
+        (
+            "host_memory_available",
+            format!("node_memory_MemAvailable_bytes{{host=\"{host}\"}}"),
+        ),
+        (
+            "host_filesystem_available",
+            format!("node_filesystem_avail_bytes{{host=\"{host}\",fstype!~\"tmpfs|overlay\"}}"),
+        ),
+        (
+            "host_boot_time",
+            format!("node_boot_time_seconds{{host=\"{host}\"}}"),
+        ),
+        (
+            "host_readiness",
+            format!(
+                "kube_node_status_condition{{node=\"{host}\",condition=\"Ready\",status=\"true\"}}"
+            ),
+        ),
+        (
+            "host_memory_pressure",
+            format!(
+                "kube_node_status_condition{{node=\"{host}\",condition=\"MemoryPressure\",status=\"true\"}}"
+            ),
+        ),
+        (
+            "host_disk_pressure",
+            format!(
+                "kube_node_status_condition{{node=\"{host}\",condition=\"DiskPressure\",status=\"true\"}}"
+            ),
+        ),
+        (
+            "estate_ingress_5xx",
+            "sum(rate(nginx_ingress_controller_requests{status=~\"5..\"}[5m]))".into(),
+        ),
+    ];
+    let prometheus = futures::future::join_all(queries.into_iter().map(|(name,query)| async move {
+        let params = vec![("query".into(),query),("start".into(),start.to_string()),("end".into(),end.to_string()),("step".into(),"60".into())];
+        let result = bounded_monitoring_json(&config.integrations.prometheus,"/api/v1/query_range",&params).await.and_then(|v|range_summary(&v,start,end));
+        match result { Ok(summary) => serde_json::json!({"query":name,"available":true,"summary":summary}), Err(_) => serde_json::json!({"query":name,"available":false,"gap":"Monitoring unavailable, missing series or invalid/oversized time-window evidence"}) }
+    })).await;
+    let params = vec![
+        ("from".into(), (start * 1000).to_string()),
+        ("to".into(), (end * 1000).to_string()),
+        ("limit".into(), "100".into()),
+        ("tags".into(), format!("host:{host}")),
+    ];
+    let grafana = match bounded_monitoring_json(
+        &config.integrations.grafana,
+        "/api/annotations",
+        &params,
+    )
+    .await
+    {
+        Ok(value) if value.is_array() && value.as_array().unwrap().len() <= 100 => {
+            let rows: Vec<_> = value.as_array().unwrap().iter().filter(|v|v["time"].as_i64().is_some_and(|t|t>=start*1000 && t<=end*1000) && v["tags"].as_array().is_some_and(|tags|tags.iter().any(|t|t.as_str()==Some(&format!("host:{host}")))))
+                .map(|v|serde_json::json!({"id":v["id"],"time":v["time"],"text":safe_review_excerpt(v["text"].as_str().unwrap_or_default())})).collect();
+            serde_json::json!({"available":!rows.is_empty(),"annotations":rows,"truncated":value.as_array().unwrap().len()==100,"gap":if rows.is_empty(){Some("No correlated host annotations; this does not prove an uneventful restart")}else{None}})
+        }
+        _ => {
+            serde_json::json!({"available":false,"gap":"Grafana annotation evidence unavailable or invalid"})
+        }
+    };
+    serde_json::json!({"window_start":start,"window_end":end,"prometheus":prometheus,"grafana":grafana,"review_complete":false,"root_cause_confirmed":false})
+}
+
+#[cfg(test)]
+mod post_restart_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn ssh_review_refuses_unpinned_hosts_and_command_injection() {
+        let mut settings = crate::config::RestartReviewSshConfig {
+            device_id: "qc01".into(),
+            address: "192.168.1.61".into(),
+            username: "pbisaacs".into(),
+            identity_file: "/run/secrets/ssh-key".into(),
+            known_hosts_file: "/etc/conductor/known_hosts".into(),
+        };
+        let device = json!({"id":"qc01","addresses":["192.168.1.61"]});
+        let args = review_ssh_args(&settings, &device, 10_000_000).unwrap();
+        assert!(args.iter().any(|a| a == "StrictHostKeyChecking=yes"));
+        assert!(args.iter().any(|a| a == "ForwardAgent=no"));
+        settings.address = "192.168.1.62".into();
+        assert!(review_ssh_args(&settings, &device, 10_000_000).is_err());
+        settings.address = "192.168.1.61".into();
+        settings.username = "root; reboot".into();
+        assert!(review_ssh_args(&settings, &device, 10_000_000).is_err());
+    }
+    #[test]
+    fn monitoring_rejects_missing_nonfinite_and_unrelated_samples() {
+        assert!(
+            range_summary(
+                &json!({"status":"success","data":{"resultType":"matrix","result":[]}}),
+                100,
+                200
+            )
+            .is_err()
+        );
+        for sample in [json!([150, "NaN"]), json!([99, "1"])] {
+            assert!(range_summary(&json!({"status":"success","data":{"resultType":"matrix","result":[{"values":[sample]}]}}),100,200).is_err());
+        }
+        assert_eq!(range_summary(&json!({"status":"success","data":{"resultType":"matrix","result":[{"values":[[100,"1"],[160,"0"]]}]}}),100,200).unwrap()["minimum"],0.0);
+    }
+    #[tokio::test]
+    async fn monitoring_review_collects_correlated_evidence_without_accepting_it_as_root_cause() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        use std::collections::HashMap;
+        let app = Router::new().route("/api/v1/query_range",get(|Query(query):Query<HashMap<String,String>>|async move {
+            let at = query["start"].parse::<i64>().unwrap();
+            Json(json!({"status":"success","data":{"resultType":"matrix","result":[{"values":[[at,"1"]]}]}}))
+        })).route("/api/annotations",get(||async {Json(json!([]))}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = crate::config::ConductorConfig::default();
+        config.integrations.prometheus.enabled = true;
+        config.integrations.prometheus.base_url = Some(base.clone());
+        config.integrations.grafana.enabled = true;
+        config.integrations.grafana.base_url = Some(base);
+        let report = restart_monitoring_evidence(&config, "qc01", 10_000_000, 10_100_000).await;
+        assert_eq!(report["prometheus"][0]["available"], true);
+        assert_eq!(report["grafana"]["available"], false);
+        assert_eq!(report["review_complete"], false);
+        assert_eq!(report["root_cause_confirmed"], false);
+        let malicious =
+            restart_monitoring_evidence(&config, "qc01\"}", 10_000_000, 10_100_000).await;
+        assert_eq!(malicious["available"], false);
+        server.abort();
+    }
+    #[test]
+    fn startup_review_correlates_faults_and_redacts_sensitive_log_excerpts() {
+        let report = post_restart_log_findings(
+            &[
+                json!({"ts_ms":900_000,"message":"kernel OOM killed postgres","level":"error","category":"journal"}),
+                json!({"ts_ms":900_001,"message":"postgres password=private","level":"error"}),
+                json!({"ts_ms":-10_000_000,"message":"old kernel panic","level":"error"}),
+            ],
+            1_000_000,
+            1_100_000,
+        );
+        assert_eq!(report["examined"], 2);
+        assert_eq!(report["findings"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            report["findings"][1]["excerpt"],
+            "[sensitive log excerpt redacted]"
+        );
+        assert_eq!(report["root_cause_confirmed"], false);
+    }
+    #[test]
+    fn missing_logs_or_quiet_root_page_do_not_close_recurrence_investigation() {
+        let report = post_restart_log_findings(&[], 1_000_000, 1_100_000);
+        assert_eq!(report["examined"], 0);
+        assert_eq!(report["investigation_required"], true);
+        assert_eq!(report["previous_boot_coverage_verified"], false);
+    }
+}

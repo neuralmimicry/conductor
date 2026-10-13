@@ -59,3 +59,46 @@ isolation adapter; publish image provenance; qualify functional measurement
 endpoints; add native-package and single-writer traffic-cutover adapters; and
 exercise complete restart/rollback/reconciliation against isolated live targets.
 The source implementation is not evidence that these live transitions passed.
+
+Conductor also reviews Continuum's authenticated `/devices/recovery-history`
+after startup and every five minutes, even when host mutation policy is disabled.
+Each warm restart produces one durable, deduplicated investigation with the
+recovery identity, affected services, correlated Tracey logs, and bounded
+previous/current workload-log references. Missing/corrupt/truncated audit history
+creates an evidence-gap work item. Findings are investigation signals, never an
+automatic root-cause claim, second reset or production approval.
+
+Prometheus range queries cover the restart hour before/after it: host probes,
+node readiness/pressure, available memory/filesystem space, boot time and estate
+ingress 5xx. Missing series, non-finite samples and gaps remain visible. Grafana
+annotations must match `host:DEVICE` and the time window. The existing operator
+integration URLs and credentials are used; HTTP responses have size/deadline
+limits and redirects are rejected. Monitoring availability does not close the
+recurrence investigation.
+
+Optional `host_recovery.review_ssh` entries separately allowlist read-only journal
+collection, without enabling any restart action:
+
+```yaml
+host_recovery:
+  review_ssh:
+    - device_id: qc01
+      address: 192.168.1.61
+      username: pbisaacs
+      identity_file: /run/secrets/restart-review-ssh
+      known_hosts_file: /etc/conductor/restart-review-known-hosts
+```
+
+The IP must match the unique device in fresh Continuum inventory. Fixed SSH uses
+only the approved key/known-host file, strict verification, BatchMode and no agent
+forwarding. Fixed read-only `sudo -n journalctl` commands query previous-boot
+warnings/kernel and current-boot warnings with numeric time bounds. Each source
+has a ten-second, 256 KiB, 200-record limit; sensitive excerpts are redacted.
+Boot IDs and truncation/gaps are recorded. Empty journals do not prove complete
+previous-boot coverage; persistent journals/retention still need qualification.
+
+Production re-fetches fresh complete recovery history and requires a successful
+work item with `plan.review_complete=true` for every recorded warm restart.
+Any open restart-review work also holds promotion. Completing the review requires
+independent evidence for recurrence prevention, remaining faults, owners and
+scoped follow-ups through the governed workflow.

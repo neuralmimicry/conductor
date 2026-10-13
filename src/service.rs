@@ -1274,6 +1274,278 @@ impl ConductorService {
         Ok(actions)
     }
 
+    /// Startup and periodic read-only review, independent of mutation policy.
+    /// Every recorded warm restart remains a recurrence investigation until its
+    /// correlated logs, cause, recovery and follow-up acceptance are reviewed.
+    pub async fn review_recent_warm_restarts(&self) -> Result<usize> {
+        let services = self.repository.list_service_snapshots().await?;
+        let Some(control) = ContinuumClient::from_sources(
+            &self.config.integrations.continuum,
+            services.iter().find(|s| s.service_key == "continuum"),
+        )
+        .await?
+        else {
+            return Ok(0);
+        };
+        let history = match control
+            .recovery_history()
+            .await
+            .and_then(crate::release::payload)
+        {
+            Ok(value) if value["entries"].is_array() && value["truncated"] == false => value,
+            _ => {
+                self.persist_post_restart_review("audit-source-unavailable", "estate", json!({
+                    "action":"restore_restart_review_evidence", "gaps":["Continuum warm-restart history is unavailable, malformed or truncated"],
+                    "investigation_required":true,"review_complete":false
+                }), &[], true).await?;
+                return Ok(0);
+            }
+        };
+        if let Some(mut gap) = self
+            .repository
+            .find_work_item_by_dedupe_key("post-restart-review:audit-source-unavailable")
+            .await?
+        {
+            if !gap.admin_override && gap.status == WorkStatus::OnHold {
+                gap.status = WorkStatus::Success;
+                gap.progress_pct = 100;
+                gap.finished_at = Some(now_utc());
+                gap.notes.push("Continuum audit source restored; individual restart investigations remain separate work items.".into());
+                self.repository.upsert_work_item(&gap).await?;
+            }
+        }
+        let inventory = control
+            .device_inventory()
+            .await
+            .and_then(crate::release::payload)?;
+        let fleet = control
+            .tracey_fleet()
+            .await
+            .and_then(crate::release::payload)
+            .ok();
+        let now_ms = now_utc().timestamp_millis();
+        let mut reviewed = 0;
+        for episode in history["entries"].as_array().unwrap().iter().take(32) {
+            if episode["action"] != "warm_restart" {
+                continue;
+            }
+            let Some(id) = episode["request_id"].as_str() else {
+                continue;
+            };
+            let Some(host) = episode["device_id"].as_str() else {
+                continue;
+            };
+            let Some(started) = episode["started_at_unix_ms"].as_i64() else {
+                continue;
+            };
+            if started <= 0 || started > now_ms {
+                continue;
+            }
+            if let Some(existing) = self
+                .repository
+                .find_work_item_by_dedupe_key(&format!("post-restart-review:{id}"))
+                .await?
+            {
+                if existing.status.is_terminal() || existing.admin_override {
+                    continue;
+                }
+            }
+            let mut gaps = Vec::new();
+            let mapped: Vec<_> = services
+                .iter()
+                .filter(|s| {
+                    service_is_mapped_to_host(s, host)
+                        || self
+                            .config
+                            .host_recovery
+                            .targets
+                            .iter()
+                            .filter(|t| t.device_id == host)
+                            .any(|t| t.service_map.values().any(|key| key == &s.service_key))
+                })
+                .collect();
+            let affected: Vec<_> = mapped.iter().map(|s| s.service_key.clone()).collect();
+            if mapped.is_empty() {
+                gaps.push("Hosted service/dependency mappings need reconciliation before recurrence work can be scoped".to_string());
+            }
+            let matching: Vec<_> = fleet
+                .as_ref()
+                .and_then(|f| f["agents"].as_array())
+                .into_iter()
+                .flatten()
+                .filter(|agent| {
+                    agent["host"]
+                        .as_str()
+                        .is_some_and(|h| h.eq_ignore_ascii_case(host))
+                })
+                .collect();
+            let analysis = if matching.len() == 1 {
+                if let Some(agent) = matching[0]["agent_id"].as_str() {
+                    control
+                        .tracey_host_logs(agent)
+                        .await
+                        .and_then(crate::release::payload)
+                        .ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let logs = analysis
+                .as_ref()
+                .filter(|a| {
+                    a["agent"]["host"]
+                        .as_str()
+                        .is_some_and(|h| h.eq_ignore_ascii_case(host))
+                })
+                .and_then(|a| a["logs"].as_array())
+                .cloned()
+                .unwrap_or_default();
+            let findings = crate::host_recovery::post_restart_log_findings(&logs, started, now_ms);
+            if findings["examined"] == 0 {
+                gaps.push(
+                    "No correlated host log records are available around this restart".into(),
+                );
+            }
+            gaps.push("Previous/current boot journal, kernel, NFS/storage, PostgreSQL and authenticated user-path coverage must be explicitly verified; telemetry excerpts alone are incomplete".into());
+            let mut workload_sources = Vec::new();
+            for service in mapped.iter().take(8) {
+                let target = self
+                    .config
+                    .recovery
+                    .targets
+                    .iter()
+                    .find(|t| t.service_key == service.service_key);
+                if let Some(target) = target {
+                    for previous in [true, false] {
+                        let result = control
+                            .post_restart_workload_logs(
+                                &target.namespace,
+                                &target.deployment,
+                                previous,
+                            )
+                            .await
+                            .and_then(crate::release::payload);
+                        // Keep source identity/hash and status; potentially sensitive raw
+                        // container logs stay in their owning protected log service.
+                        workload_sources.push(json!({"service":service.service_key,"namespace":target.namespace,
+                            "deployment":target.deployment,"previous":previous,"available":result.is_ok(),
+                            "sha256":result.as_ref().ok().map(host_recovery_fingerprint),
+                            "reference":format!("{}/k8s/workload/logs?namespace={}&deployment={}&previous={previous}",control.base_url(),target.namespace,target.deployment)}));
+                    }
+                }
+            }
+            let device = inventory["devices"]
+                .as_array()
+                .and_then(|rows| {
+                    let matching: Vec<_> = rows.iter().filter(|d| d["id"] == host).collect();
+                    if matching.len() == 1 {
+                        Some(matching[0])
+                    } else {
+                        None
+                    }
+                })
+                .cloned();
+            let ssh_settings: Vec<_> = self
+                .config
+                .host_recovery
+                .review_ssh
+                .iter()
+                .filter(|s| s.device_id == host)
+                .collect();
+            let (ssh_evidence, monitoring_evidence) = tokio::join!(
+                crate::host_recovery::restart_ssh_evidence(
+                    if ssh_settings.len() == 1 {
+                        Some(ssh_settings[0])
+                    } else {
+                        None
+                    },
+                    device.as_ref(),
+                    inventory_is_fresh(&inventory, now_ms),
+                    started
+                ),
+                crate::host_recovery::restart_monitoring_evidence(
+                    &self.config,
+                    host,
+                    started,
+                    now_ms
+                )
+            );
+            let host_evidence_missing =
+                findings["examined"] == 0 && ssh_evidence["available"] != true;
+            let plan = json!({"action":"investigate_warm_restart_recurrence","recovery":episode,
+                "affected_services":affected,"registered_host":device,"host_log_review":findings,
+                "ssh_journal_review":ssh_evidence,"monitoring_review":monitoring_evidence,
+                "workload_log_sources":workload_sources,"gaps":gaps,"review_complete":false,
+                "requirements_text":"Examine the previous and current boot journals, kernel/BMC hardware events, service/container logs, NFS/storage integrity, PostgreSQL startup/pool failures and authentication/500/503 paths for the recorded warm restart. Separate observations from root cause. Identify recurrence prevention and lingering faults; record owner, priority, acceptance and recovery plan for each follow-up. Obtain missing/expired logs or add persistent bounded logging. Do not issue another reset, weaken trading/authentication gates or promote production from this investigation. Return an independently reviewable report and any scoped improvement proposals through the governed Refiner/Conductor/Continuum workflow."});
+            self.persist_post_restart_review(id, host, plan, &affected, host_evidence_missing)
+                .await?;
+            reviewed += 1;
+        }
+        Ok(reviewed)
+    }
+
+    async fn persist_post_restart_review(
+        &self,
+        request: &str,
+        host: &str,
+        plan: Value,
+        affected: &[String],
+        missing: bool,
+    ) -> Result<()> {
+        let key = format!("post-restart-review:{request}");
+        let status = if missing {
+            WorkStatus::OnHold
+        } else {
+            WorkStatus::Planned
+        };
+        let mut item = if let Some(existing) =
+            self.repository.find_work_item_by_dedupe_key(&key).await?
+        {
+            if existing.status.is_terminal() || existing.admin_override {
+                return Ok(());
+            }
+            if existing.plan == plan {
+                return Ok(());
+            }
+            let mut item = existing;
+            item.plan = plan;
+            item.status = status;
+            item.execution_approved = false;
+            item.approval_metadata = json!({});
+            item
+        } else {
+            WorkItem::from_new(serde_json::from_value(json!({"dedupe_key":key,
+                "title":format!("Review warm-restart logs and prevent recurrence on {host}"),
+                "summary":"Correlate the recovery episode with host/service/dependency logs and independently qualify recurrence prevention and lingering-fault actions.",
+                "target_service":affected.first().cloned(),"delivery_stage":"development",
+                "status":status,"priority":100,"execution_approved":false,"verification_required":true,
+                "tags":["post-restart-review","recurrence-prevention"],"plan":plan,
+                "source":"conductor_startup_restart_review"}))?)
+        };
+        item.updated_at = now_utc();
+        self.repository.upsert_work_item(&item).await?;
+        let mut event = ConductorEvent::new(
+            "host_recovery.log_review",
+            format!("Warm-restart follow-up recorded for {host}"),
+            json!({"request_id":request,"device_id":host,"work_item_id":item.id,"affected_services":affected,
+                "logs_missing":missing,"review_complete":false}),
+        );
+        event.work_item_id = Some(item.id);
+        event.status = Some(
+            if missing {
+                "evidence_gap"
+            } else {
+                "follow_up_required"
+            }
+            .into(),
+        );
+        self.repository.insert_conductor_event(&event).await?;
+        let _ = self.events.send(event);
+        Ok(())
+    }
+
     pub async fn host_recovery_status(&self) -> Result<Value> {
         let events = self.repository.list_conductor_events(5_000).await?;
         let latest = latest_host_recovery_assessments(&events);
@@ -5259,6 +5531,19 @@ pub fn spawn_background_loops(service: ConductorService) {
     );
     let maintenance_interval =
         Duration::from_secs(service.config.storage.maintenance_interval_seconds.max(300));
+
+    // Always run the read-only post-restart task at startup, even when automatic
+    // workload/host mutation is disabled. Retry while discovery/dependencies recover.
+    let restart_review = service.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        loop {
+            if let Err(error) = restart_review.review_recent_warm_restarts().await {
+                tracing::warn!(error = %error, "post-warm-restart log review requires evidence reconciliation");
+            }
+            tokio::time::sleep(Duration::from_secs(300)).await;
+        }
+    });
 
     if service.config.recovery.enabled {
         let recovery_service = service.clone();
@@ -9280,5 +9565,72 @@ mod tests {
         assert_eq!(current.status, WorkStatus::Scheduled);
         assert!(current.execution_approved);
         assert_eq!(current.rollout_strategy, RolloutStrategy::Canary);
+    }
+    #[tokio::test]
+    async fn startup_restart_review_reads_host_logs_and_deduplicates_follow_up() {
+        let app = Router::new()
+            .route("/health", get(|| async { Json(json!({"status":"ok","service":"nmc_server"})) }))
+            .route("/devices/recovery-history", get(|| async { Json(json!({"success":true,"data":{
+                "truncated":false,"entries":[{"action":"warm_restart","request_id":"warm-restart-review-0001","device_id":"qc01",
+                    "started_at_unix_ms":now_utc().timestamp_millis()-1000,"phase":"complete","verified":true}]
+            }})) }))
+            .route("/devices/inventory", get(|| async { Json(json!({"success":true,"data":{"devices":[{"id":"qc01"}]}})) }))
+            .route("/tracey/fleet", get(|| async { Json(json!({"success":true,"data":{"agents":[{"host":"qc01","agent_id":"tracey-qc01"}]}})) }))
+            .route("/tracey/agents/tracey-qc01/analysis", get(|| async { Json(json!({"success":true,"data":{
+                "agent":{"host":"qc01"},"logs":[{"ts_ms":now_utc().timestamp_millis()-1500,
+                    "level":"error","category":"journal","message":"OOM killed postgres"}]
+            }})) }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let repository = Arc::new(MemoryRepository::new());
+        let mut config = ConductorConfig::default();
+        config.integrations.continuum.base_url = Some(base);
+        config.integrations.continuum.timeout_seconds = 1;
+        assert!(!config.host_recovery.enabled);
+        let service =
+            ConductorService::new(config, repository.clone(), build_http_client(1).unwrap());
+        assert_eq!(service.review_recent_warm_restarts().await.unwrap(), 1);
+        assert_eq!(service.review_recent_warm_restarts().await.unwrap(), 1);
+        let items = repository.list_work_items().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(!items[0].execution_approved);
+        assert_eq!(items[0].status, WorkStatus::Planned);
+        assert_eq!(items[0].plan["review_complete"], false);
+        assert_eq!(items[0].plan["host_log_review"]["examined"], 1);
+        assert_eq!(
+            items[0].plan["host_log_review"]["root_cause_confirmed"],
+            false
+        );
+        assert!(items[0].tags.iter().any(|t| t == "recurrence-prevention"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn missing_recovery_history_creates_a_durable_evidence_gap() {
+        let app = Router::new().route(
+            "/health",
+            get(|| async { Json(json!({"status":"ok","service":"nmc_server"})) }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let repository = Arc::new(MemoryRepository::new());
+        let mut config = ConductorConfig::default();
+        config.integrations.continuum.base_url = Some(base);
+        config.integrations.continuum.timeout_seconds = 1;
+        let service =
+            ConductorService::new(config, repository.clone(), build_http_client(1).unwrap());
+        assert_eq!(service.review_recent_warm_restarts().await.unwrap(), 0);
+        let items = repository.list_work_items().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, WorkStatus::OnHold);
+        assert!(!items[0].execution_approved);
+        assert_eq!(items[0].plan["review_complete"], false);
+        server.abort();
     }
 }

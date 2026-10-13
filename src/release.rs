@@ -381,7 +381,7 @@ async fn attest_image(
         }
     }
 }
-fn payload(mut value: Value) -> Result<Value> {
+pub(crate) fn payload(mut value: Value) -> Result<Value> {
     for _ in 0..8 {
         if value.get("success").is_none() {
             ensure!(value.is_object(), "Continuum returned a non-object payload");
@@ -542,6 +542,40 @@ async fn wait_ready(
     }
 }
 
+fn require_restart_reviews(recovery: &Value, reviews: &[WorkItem], now_ms: i64) -> Result<()> {
+    let observed = recovery["observed_at_unix_ms"]
+        .as_i64()
+        .context("restart history freshness missing")?;
+    ensure!(
+        observed <= now_ms && now_ms - observed <= 60_000,
+        "warm-restart history is stale or future dated"
+    );
+    ensure!(
+        recovery["truncated"] == false && recovery["entries"].is_array(),
+        "fresh complete warm-restart history is required before production"
+    );
+    for episode in recovery["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"] == "warm_restart")
+    {
+        let request = episode["request_id"]
+            .as_str()
+            .context("restart history identity missing")?;
+        let key = format!("post-restart-review:{request}");
+        ensure!(
+            reviews
+                .iter()
+                .any(|work| work.dedupe_key.as_deref() == Some(key.as_str())
+                    && work.status == crate::models::WorkStatus::Success
+                    && work.plan["review_complete"] == true),
+            "recorded warm restart has no completed independently verified log/recurrence review"
+        );
+    }
+    Ok(())
+}
+
 pub async fn execute_release_stage(
     repo: &dyn ConductorRepository,
     config: &ConductorConfig,
@@ -559,6 +593,14 @@ pub async fn execute_release_stage(
     let production = item.delivery_stage == DeliveryStage::Production;
     let identity = candidate.identity()?;
     if production {
+        let reviews = repo.list_work_items().await?;
+        ensure!(
+            !reviews.iter().any(
+                |work| work.tags.iter().any(|tag| tag == "post-restart-review")
+                    && work.status != crate::models::WorkStatus::Success
+            ),
+            "post-warm-restart log review or recurrence-prevention evidence is still open; production promotion is held"
+        );
         let history = repo.list_work_executions_for_item(item.id, 100).await?;
         let uat = history
             .iter()
@@ -657,6 +699,15 @@ pub async fn execute_release_stage(
     )
     .await?
     .context("Continuum control is unavailable")?;
+    if production {
+        let recovery = payload(control.recovery_history().await?)?;
+        let reviews = repo.list_work_items().await?;
+        require_restart_reviews(
+            &recovery,
+            &reviews,
+            crate::models::now_utc().timestamp_millis(),
+        )?;
+    }
     let initial = status(&control, target).await?;
     ensure!(
         running(&initial, target, &target.expected_image, None),
@@ -831,6 +882,22 @@ mod tests {
     }
     fn jobs(c: &ReleaseCandidate) -> Value {
         json!({"total_count":3,"jobs":(["Test","Build ARM64","Publish"].iter().map(|name|json!({"name":name,"run_id":c.run_id,"head_sha":c.source_sha,"status":"completed","conclusion":"success"})).collect::<Vec<_>>())})
+    }
+    #[test]
+    fn production_requires_fresh_review_for_each_recorded_restart() {
+        let now = 10_000_000;
+        let mut history = json!({"observed_at_unix_ms":now,"truncated":false,"entries":[{"action":"warm_restart","request_id":"restart-0001"}]});
+        assert!(require_restart_reviews(&history, &[], now).is_err());
+        let mut review = WorkItem::from_new(serde_json::from_value(json!({"title":"review","summary":"review","dedupe_key":"post-restart-review:restart-0001","plan":{"review_complete":false}})).unwrap());
+        review.status = crate::models::WorkStatus::Success;
+        assert!(require_restart_reviews(&history, &[review.clone()], now).is_err());
+        review.plan["review_complete"] = json!(true);
+        assert!(require_restart_reviews(&history, &[review.clone()], now).is_ok());
+        history["observed_at_unix_ms"] = json!(now - 60_001);
+        assert!(require_restart_reviews(&history, &[review.clone()], now).is_err());
+        history["observed_at_unix_ms"] = json!(now);
+        history["truncated"] = json!(true);
+        assert!(require_restart_reviews(&history, &[review], now).is_err());
     }
     #[test]
     fn exact_success_cannot_cover_wrong_source_attempt_or_pending_work() {
