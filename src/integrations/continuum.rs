@@ -164,6 +164,49 @@ impl ContinuumClient {
         super::decode_json(request.send().await?).await
     }
 
+    pub async fn deployment_status(
+        &self,
+        cluster: &str,
+        namespace: &str,
+        deployment: &str,
+    ) -> Result<Value> {
+        let mut request = self
+            .client
+            .get(format!("{}/k8s/deployment/status", self.base_url))
+            .query(&[
+                ("cluster_id", cluster),
+                ("namespace", namespace),
+                ("deployment", deployment),
+            ]);
+        if let Some(token) = &self.bearer_token {
+            request = request.bearer_auth(token);
+        }
+        super::decode_json(request.send().await?).await
+    }
+
+    pub async fn rollout_image(
+        &self,
+        target: &crate::release::DeploymentTarget,
+        image: &str,
+        expected: &str,
+        request_id: &str,
+        change_id: &str,
+        production: bool,
+    ) -> Result<Value> {
+        let mut body = serde_json::json!({"cluster_id":target.cluster_id,"namespace":target.namespace,"deployment":target.deployment,"container":target.container,"image":image,"expected_image":expected,"request_id":request_id,"change_id":change_id});
+        if production {
+            body["require_zero_unavailable"] = serde_json::json!(true);
+        }
+        let mut request = self
+            .client
+            .post(format!("{}/k8s/deployment/image-rollout", self.base_url))
+            .json(&body);
+        if let Some(token) = &self.bearer_token {
+            request = request.bearer_auth(token);
+        }
+        super::decode_json(request.send().await?).await
+    }
+
     pub async fn restart_deployment(
         &self,
         cluster_id: &str,

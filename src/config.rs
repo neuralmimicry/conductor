@@ -139,6 +139,8 @@ pub struct IntegrationsConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DeliveryConfig {
+    /// Operator-owned release contracts; an empty map blocks automated delivery.
+    pub qualified_releases: BTreeMap<String, crate::release::ReleasePolicy>,
     pub auto_advance: bool,
     pub dora_window_days: i64,
     pub require_uat_before_production: bool,
@@ -550,6 +552,7 @@ impl Default for IntegrationsConfig {
 impl Default for DeliveryConfig {
     fn default() -> Self {
         Self {
+            qualified_releases: BTreeMap::new(),
             auto_advance: true,
             dora_window_days: 30,
             require_uat_before_production: true,

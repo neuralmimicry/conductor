@@ -121,7 +121,7 @@ pub async fn run_independent_validation(
         return IndependentValidationReport {
             enabled: false,
             enforced: config.require_success,
-            passed: true,
+            passed: !config.require_success,
             completeness: "disabled".to_string(),
             repo_path: repo_path.map(display_path),
             required_checks: required_checks.to_vec(),
@@ -135,7 +135,7 @@ pub async fn run_independent_validation(
         return IndependentValidationReport {
             enabled: true,
             enforced: config.require_success,
-            passed: true,
+            passed: !config.require_success,
             completeness: "skipped".to_string(),
             repo_path: None,
             required_checks: required_checks.to_vec(),
@@ -149,7 +149,7 @@ pub async fn run_independent_validation(
         return IndependentValidationReport {
             enabled: true,
             enforced: config.require_success,
-            passed: true,
+            passed: !config.require_success,
             completeness: "skipped".to_string(),
             repo_path: Some(display_path(repo_path)),
             required_checks: required_checks.to_vec(),
@@ -255,7 +255,7 @@ async fn run_commands_in_dir(
     IndependentValidationReport {
         enabled: true,
         enforced: config.require_success,
-        passed: !has_failure,
+        passed: !has_failure && (!config.require_success || !has_unavailable),
         completeness,
         repo_path: repo_path_buf.as_deref().map(display_path),
         required_checks,
@@ -449,7 +449,10 @@ mod tests {
     async fn independent_validation_tolerates_missing_tooling_when_allowed() {
         let repo = tempdir().expect("tempdir");
         let report = run_commands_in_dir(
-            &ValidationConfig::default(),
+            &ValidationConfig {
+                require_success: false,
+                ..ValidationConfig::default()
+            },
             Some(repo.path()),
             vec!["definitely-not-a-real-validation-tool".to_string()],
             vec![],
