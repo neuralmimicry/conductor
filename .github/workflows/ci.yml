@@ -26,6 +26,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Prepare the pinned release verification runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.22.1'
+
+      - name: Verify exact GitHub tag reference resolution
+        run: node --test scripts/release-tag.test.mjs
       - name: Check OCI source labels
         shell: bash
         run: |

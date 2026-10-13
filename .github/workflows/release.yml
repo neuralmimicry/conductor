@@ -220,6 +220,16 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out exact release verification source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Prepare the pinned release verification runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.22.1'
+
       - name: Download Debian packages
         uses: actions/download-artifact@v4
         with:
@@ -240,17 +250,18 @@ jobs:
           node --input-type=module <<'JS'
           import fs from 'node:fs';
           import crypto from 'node:crypto';
+          import {resolveReleaseTag} from './scripts/release-tag.mjs';
           const request = async path => {
             const response = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/${path}`, {
               headers: {Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json'},
-              signal: AbortSignal.timeout(15000)
+              redirect: 'error', signal: AbortSignal.timeout(15000)
             });
             if (response.status === 404) return null;
             if (!response.ok) throw Error('Release identity observation failed');
             return response.json();
           };
           const tag = encodeURIComponent(process.env.RELEASE_TAG);
-          const commit = await request(`commits/refs%2Ftags%2F${tag}`);
+          const commit = await resolveReleaseTag(request, process.env.RELEASE_TAG);
           if (commit && commit.sha !== process.env.GITHUB_SHA) throw Error('Existing release tag belongs to another source');
           const release = await request(`releases/tags/${tag}`);
           if (release) {
