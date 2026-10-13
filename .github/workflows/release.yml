@@ -14,16 +14,22 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
+  validate:
+    name: Validate source
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   version:
     name: Resolve release version
     runs-on: [self-hosted, Linux, X64]
@@ -116,7 +122,13 @@ jobs:
 
   build-deb:
     name: Build ${{ matrix.runner_arch }} Debian package
-    needs: version
+    needs:
+      - version
+      - validate
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
       fail-fast: false
@@ -194,6 +206,11 @@ jobs:
       - name: Inspect Debian package
         run: dpkg-deb --info "dist/conductor_${{ needs.version.outputs.deb_version }}_${{ matrix.deb_arch }}.deb"
 
+      - name: Attest Debian package source and build
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: dist/*.deb
+
       - name: Upload Debian package artifact
         uses: actions/upload-artifact@v4
         with:
@@ -207,6 +224,8 @@ jobs:
       - version
       - build-deb
     runs-on: [self-hosted, Linux, X64]
+    permissions:
+      contents: write
     steps:
       - name: Download Debian packages
         uses: actions/download-artifact@v4
@@ -218,6 +237,39 @@ jobs:
       - name: Generate checksums
         working-directory: release-assets
         run: sha256sum *.deb > SHA256SUMS
+
+      - name: Preserve existing tag and asset identities
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag_name }}
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+          const request = async path => {
+            const response = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/${path}`, {
+              headers: {Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json'},
+              signal: AbortSignal.timeout(15000)
+            });
+            if (response.status === 404) return null;
+            if (!response.ok) throw Error('Release identity observation failed');
+            return response.json();
+          };
+          const tag = encodeURIComponent(process.env.RELEASE_TAG);
+          const commit = await request(`commits/${tag}`);
+          if (commit && commit.sha !== process.env.GITHUB_SHA) throw Error('Existing release tag belongs to another source');
+          const release = await request(`releases/tags/${tag}`);
+          if (release) {
+            if (!commit) throw Error('Existing release has no verifiable source tag');
+            for (const name of fs.readdirSync('release-assets')) {
+              const asset = release.assets.find(asset => asset.name === name);
+              if (!asset) continue;
+              const digest = 'sha256:' + crypto.createHash('sha256').update(fs.readFileSync(`release-assets/${name}`)).digest('hex');
+              if (asset.digest !== digest) throw Error('Existing immutable release asset differs; publish a new version');
+            }
+          }
+          JS
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -242,6 +294,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -293,6 +347,7 @@ jobs:
             --username "${GHCR_USERNAME}" --password-stdin
 
       - name: Build and push architecture image
+        id: image
         shell: bash
         env:
           ARCH: ${{ matrix.arch }}
@@ -316,7 +371,17 @@ jobs:
             .
           image_id="$(tr -d '\n' <"${iid_file}")"
           test -n "${image_id}" || { echo "Podman did not emit an image ID" >&2; exit 1; }
-          podman --cgroup-manager=cgroupfs push "${image_id}" "docker://${image_ref}"
+          digest_file="${RUNNER_TEMP}/conductor-${ARCH}-registry-digest"
+          podman --cgroup-manager=cgroupfs push --digestfile "${digest_file}" "${image_id}" "docker://${image_ref}"
+          digest="$(tr -d '\n' <"${digest_file}")"
+          [[ "${digest}" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "Invalid registry digest" >&2; exit 1; }
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Attest architecture image source and build
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: ${{ env.IMAGE_REPO }}
+          subject-digest: ${{ steps.image.outputs.digest }}
 
   publish-container:
     name: Publish multi-arch container
@@ -327,6 +392,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     env:
       IMAGE_REPO: ghcr.io/${{ github.repository }}
       IMAGE_VERSION: ${{ needs.version.outputs.app_version }}
@@ -364,6 +431,7 @@ jobs:
             --username "${GHCR_USERNAME}" --password-stdin
 
       - name: Create and push multi-arch tags
+        id: manifest
         shell: bash
         run: |
           set -euo pipefail
@@ -375,6 +443,21 @@ jobs:
           podman --cgroup-manager=cgroupfs manifest add "${manifest}" \
             "docker://${IMAGE_REPO}:${IMAGE_VERSION}-arm64"
           for tag in latest "${IMAGE_VERSION}" "${IMAGE_TAG}" "${COMMIT_SHORT}"; do
-            podman --cgroup-manager=cgroupfs manifest push --all "${manifest}" \
+            digest_file="${RUNNER_TEMP}/conductor-manifest-registry-digest"
+            podman --cgroup-manager=cgroupfs manifest push --all --digestfile "${digest_file}" "${manifest}" \
               "docker://${IMAGE_REPO}:${tag}"
+            digest="$(tr -d '\n' <"${digest_file}")"
+            [[ "${digest}" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "Invalid manifest digest" >&2; exit 1; }
+            if [[ -n "${expected_digest:-}" && "${digest}" != "${expected_digest}" ]]; then
+              echo "Published tags have inconsistent immutable digests" >&2
+              exit 1
+            fi
+            expected_digest="${digest}"
           done
+          echo "digest=${expected_digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Attest multi-architecture image source and build
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: ${{ env.IMAGE_REPO }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
