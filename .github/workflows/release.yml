@@ -351,6 +351,7 @@ jobs:
             --network=slirp4netns \
             --pull \
             --build-arg "CONDUCTOR_VERSION=source" \
+            --build-arg "CONDUCTOR_SOURCE_VERSION=${IMAGE_VERSION}" \
             --build-arg "TARGET_PAGE_SIZE=${PAGE_SIZE}" \
             --iidfile "${iid_file}" \
             -f Containerfile \

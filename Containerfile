@@ -2,6 +2,7 @@ ARG TARGET_PAGE_SIZE=4k
 FROM docker.io/library/rust:1.88-bookworm AS source-deb
 
 ARG CONDUCTOR_VERSION=source
+ARG CONDUCTOR_SOURCE_VERSION=
 
 RUN apt-get -o Acquire::ForceIPv4=true update \
     && apt-get install -y --no-install-recommends \
@@ -19,8 +20,9 @@ COPY migrations ./migrations
 COPY packaging ./packaging
 COPY scripts ./scripts
 RUN set -eu; \
-    if [ "${CONDUCTOR_VERSION}" != "source" ] && [ "${CONDUCTOR_VERSION}" != "latest" ]; then \
-        release_version="${CONDUCTOR_VERSION#v}"; \
+    source_version="${CONDUCTOR_SOURCE_VERSION:-${CONDUCTOR_VERSION}}"; \
+    if [ "${source_version}" != "source" ] && [ "${source_version}" != "latest" ]; then \
+        release_version="${source_version#v}"; \
         bash scripts/set-release-version.sh "${release_version}"; \
     fi; \
     rustup component add rustfmt; \
