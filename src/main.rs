@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = ConductorService::new(config.clone(), repository, http);
     spawn_background_loops(service.clone());
 
-    let router = build_router(service);
+    let router = build_router(service.clone());
     let listener = tokio::net::TcpListener::bind(config.server.bind_addr.as_str()).await?;
     tracing::info!(
         version = app_version,
@@ -55,7 +55,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Conductor listening"
     );
     axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            service.begin_shutdown();
+        })
         .await?;
     Ok(())
 }

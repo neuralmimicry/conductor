@@ -11,7 +11,7 @@ use futures::{StreamExt, stream};
 use reqwest::Client;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
 
 use crate::{
@@ -69,6 +69,7 @@ pub struct ConductorService {
     pub repository: Arc<dyn ConductorRepository>,
     pub http: Client,
     pub events: broadcast::Sender<ConductorEvent>,
+    shutdown: watch::Sender<bool>,
 }
 
 const EXTERNAL_SYNC_CONCURRENCY: usize = 8;
@@ -90,11 +91,13 @@ impl ConductorService {
         http: Client,
     ) -> Self {
         let (events, _) = broadcast::channel(256);
+        let (shutdown, _) = watch::channel(false);
         Self {
             config: Arc::new(config),
             repository,
             http,
             events,
+            shutdown,
         }
     }
 
@@ -105,6 +108,14 @@ impl ConductorService {
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<ConductorEvent> {
         self.events.subscribe()
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.shutdown.send_replace(true);
+    }
+
+    pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown.subscribe()
     }
 
     fn event_callback(&self) -> ExecutionEventCallback {
@@ -3973,6 +3984,9 @@ impl ConductorService {
     }
 
     pub async fn run_execution_cycle(&self) -> Result<Vec<WorkExecution>> {
+        if *self.shutdown.borrow() {
+            return Ok(Vec::new());
+        }
         let started = Instant::now();
         self.publish_event(ConductorEvent::new(
             "execution.cycle.started",

@@ -1171,29 +1171,39 @@ async fn stream_executions(
 ) -> ApiResult<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>> {
     service.authorize_read_with_token(&headers, query.token.as_deref())?;
     let receiver = service.subscribe_events();
-    let stream = stream::unfold(receiver, |mut receiver| async move {
-        match receiver.recv().await {
-            Ok(event) => {
-                let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-                Some((
-                    Ok::<Event, Infallible>(Event::default().data(payload)),
-                    receiver,
-                ))
+    let shutdown = service.subscribe_shutdown();
+    let stream = stream::unfold(
+        (receiver, shutdown),
+        |(mut receiver, mut shutdown)| async move {
+            let event = tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stopping| *stopping) => return None,
+                event = receiver.recv() => event,
+            };
+            match event {
+                Ok(event) => {
+                    let payload =
+                        serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+                    Some((
+                        Ok::<Event, Infallible>(Event::default().data(payload)),
+                        (receiver, shutdown),
+                    ))
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    let payload = json!({
+                        "event_type": "execution.stream.lagged",
+                        "message": format!("execution stream skipped {} event(s)", skipped),
+                        "skipped": skipped,
+                    });
+                    Some((
+                        Ok::<Event, Infallible>(Event::default().data(payload.to_string())),
+                        (receiver, shutdown),
+                    ))
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                let payload = json!({
-                    "event_type": "execution.stream.lagged",
-                    "message": format!("execution stream skipped {} event(s)", skipped),
-                    "skipped": skipped,
-                });
-                Some((
-                    Ok::<Event, Infallible>(Event::default().data(payload.to_string())),
-                    receiver,
-                ))
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
-        }
-    });
+        },
+    );
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
@@ -2590,6 +2600,42 @@ mod tests {
             payload["findings"][0]["finding_key"].as_str(),
             Some("repository_test_baseline:gail")
         );
+    }
+
+    #[tokio::test]
+    async fn event_streams_close_on_shutdown_including_late_subscribers() {
+        for already_stopping in [false, true] {
+            let service = test_service();
+            if already_stopping {
+                service.begin_shutdown();
+            }
+            let response = build_router(service.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/executions/stream")
+                        .header("authorization", "Bearer secret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = Box::pin(to_bytes(response.into_body(), 4096));
+            if !already_stopping {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(10), &mut body)
+                        .await
+                        .is_err(),
+                    "event stream must remain open before shutdown"
+                );
+                service.begin_shutdown();
+            }
+            let bytes = tokio::time::timeout(Duration::from_secs(1), body)
+                .await
+                .expect("shutdown closes the stream")
+                .expect("stream ends cleanly");
+            assert!(bytes.is_empty());
+        }
     }
 
     #[tokio::test]
