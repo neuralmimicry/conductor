@@ -1810,14 +1810,16 @@ async fn probe_business_product(client: &Client, service: &ServiceSnapshot) -> R
         .ok_or_else(|| anyhow!("business product has no internal URL"))?;
     let external = ExternalServiceConfig::default();
     let ready = get_json_with_auth(client, base, "/readyz", &external).await?;
-    let healthy = ready.get("status").and_then(Value::as_str) == Some("ready");
+    let identity_matches =
+        ready.get("service").and_then(Value::as_str) == Some(service.service_key.as_str());
+    let healthy = identity_matches && ready.get("status").and_then(Value::as_str) == Some("ready");
     Ok(ProbeResult {
         endpoint: Some(format!("{base}/readyz")),
         summary: format!(
             "{} database readiness; business/model qualification is separate",
             service.display_name
         ),
-        metrics: json!({"readiness":ready,"path_used":"/readyz","model_qualification":"not_assessed"}),
+        metrics: json!({"readiness":ready,"path_used":"/readyz","model_qualification":"not_assessed","identity_matches":identity_matches}),
         health: if healthy {
             ServiceHealth::Healthy
         } else {
@@ -2769,7 +2771,7 @@ mod business_product_probe_tests {
         config.integrations.continuum.base_url = Some("http://127.0.0.1:1".into());
         config.integrations.continuum.bearer_token = Some("must-never-be-forwarded".into());
         let now = crate::models::now_utc();
-        let service = ServiceSnapshot {
+        let mut service = ServiceSnapshot {
             service_key: "cora".into(),
             display_name: "Cora".into(),
             kind: "tenant_service".into(),
@@ -2800,6 +2802,11 @@ mod business_product_probe_tests {
         assert_eq!(result.health, ServiceHealth::Healthy);
         assert_eq!(result.endpoint, Some(format!("{base}/readyz")));
         assert_eq!(result.metrics["model_qualification"], "not_assessed");
+        service.service_key = "foresight".into();
+        let wrong_identity = probe_service(&build_http_client(2).unwrap(), &config, &service)
+            .await
+            .unwrap();
+        assert_eq!(wrong_identity.health, ServiceHealth::Degraded);
         server.abort();
     }
 }

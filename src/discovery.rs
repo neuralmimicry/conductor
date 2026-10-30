@@ -864,6 +864,7 @@ fn collect_services(
                     // Runtime coordinates are fixed by the shared role's
                     // business-stack template; do not invent a public ingress.
                     vars.insert(format!("continuum_tenant_{key}_port"), json!(8080));
+                    vars.insert(format!("continuum_tenant_{key}_auth_required"), json!(true));
                     vars.insert(
                         format!("continuum_tenant_{key}_repo_url"),
                         json!(format!("https://github.com/neuralmimicry/{key}.git")),
