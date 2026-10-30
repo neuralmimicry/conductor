@@ -1336,8 +1336,28 @@ impl ConductorService {
             .ok();
         let now_ms = now_utc().timestamp_millis();
         let mut reviewed = 0;
-        for episode in history["entries"].as_array().unwrap().iter().take(32) {
-            if episode["action"] != "warm_restart" {
+        let mut episodes = history["entries"].as_array().unwrap().clone();
+        // Durable work survives a rotated audit or Conductor's own reboot.
+        for item in self.repository.list_work_items().await? {
+            if item.plan["execution_mode"] != "conductor_reset_rca" {
+                continue;
+            }
+            if item.plan["analysis_complete"] == true {
+                crate::reset_rca::reconcile(self.repository.as_ref(), item).await?;
+            } else if let Some(recovery) = item.plan.get("recovery") {
+                if !episodes
+                    .iter()
+                    .any(|e| e["request_id"] == recovery["request_id"])
+                {
+                    episodes.push(recovery.clone());
+                }
+            }
+        }
+        for episode in &episodes {
+            if !matches!(
+                episode["action"].as_str(),
+                Some("warm_restart" | "cold_restart" | "reboot")
+            ) {
                 continue;
             }
             let Some(id) = episode["request_id"].as_str() else {
@@ -1357,16 +1377,29 @@ impl ConductorService {
                 .find_work_item_by_dedupe_key(&format!("post-restart-review:{id}"))
                 .await?
             {
+                if self.config.host_recovery.automatic_restart_investigations
+                    && existing.plan["analysis_complete"] == true
+                {
+                    crate::reset_rca::reconcile(self.repository.as_ref(), existing).await?;
+                    continue;
+                }
+                let resumable = self.config.host_recovery.automatic_restart_investigations
+                    && existing.plan["execution_mode"] == "conductor_reset_rca";
                 if existing.status.is_terminal()
                     || existing.admin_override
-                    || existing.execution_approved
-                    || matches!(
-                        existing.status,
-                        WorkStatus::Scheduled | WorkStatus::InOperation
-                    )
+                    || (!resumable
+                        && (existing.execution_approved
+                            || matches!(
+                                existing.status,
+                                WorkStatus::Scheduled | WorkStatus::InOperation
+                            )))
                 {
                     continue;
                 }
+            }
+            if self.config.host_recovery.automatic_restart_investigations {
+                self.persist_post_restart_review(id, host, json!({"action":"investigate_host_reset", "execution_mode":"conductor_reset_rca", "recovery":episode,
+                    "analysis_complete":false,"review_complete":false,"phase":"collecting_evidence"}), &[], true).await?;
             }
             let mut gaps = Vec::new();
             let mapped: Vec<_> = services
@@ -1492,15 +1525,57 @@ impl ConductorService {
                     now_ms
                 )
             );
+            let prior = episode["previous_observed_at_unix_ms"]
+                .as_i64()
+                .or_else(|| episode["boot_observation"]["previous_observed_at_unix_ms"].as_i64())
+                .filter(|at| *at > 0 && *at < started - 3_600_000);
+            let pre_outage_review = if let Some(at) = prior {
+                let (ssh, monitoring) = tokio::join!(
+                    crate::host_recovery::restart_ssh_evidence(
+                        ssh_settings
+                            .first()
+                            .filter(|_| ssh_settings.len() == 1)
+                            .copied(),
+                        device.as_ref(),
+                        inventory_is_fresh(&inventory, now_ms),
+                        at
+                    ),
+                    crate::host_recovery::restart_monitoring_evidence(
+                        &self.config,
+                        host,
+                        at,
+                        now_ms
+                    )
+                );
+                json!({"last_healthy_at_unix_ms":at,"ssh":ssh,"monitoring":monitoring})
+            } else {
+                Value::Null
+            };
+            let controller_review = if let Some(controller) = episode["controller_id"].as_str() {
+                control
+                    .controller_diagnostics(controller)
+                    .await
+                    .and_then(crate::release::payload)
+                    .ok()
+            } else {
+                None
+            };
             let host_evidence_missing =
                 findings["examined"] == 0 && ssh_evidence["available"] != true;
-            let plan = json!({"action":"investigate_warm_restart_recurrence","recovery":episode,
+            let plan = json!({"action":"investigate_host_reset","recovery":episode,
+                "execution_mode":if self.config.host_recovery.automatic_restart_investigations {"conductor_reset_rca"} else {"manual_review"},
                 "affected_services":affected,"registered_host":device,"host_log_review":findings,
                 "ssh_journal_review":ssh_evidence,"monitoring_review":monitoring_evidence,
+                "pre_outage_review":pre_outage_review,"controller_review":controller_review,
                 "workload_log_sources":workload_sources,"gaps":gaps,"review_complete":false,
                 "requirements_text":"Examine the previous and current boot journals, kernel/BMC hardware events, service/container logs, NFS/storage integrity, PostgreSQL startup/pool failures and authentication/500/503 paths for the recorded warm restart. Separate observations from root cause. Identify recurrence prevention and lingering faults; record owner, priority, acceptance and recovery plan for each follow-up. Obtain missing/expired logs or add persistent bounded logging. Do not issue another reset, weaken trading/authentication gates or promote production from this investigation. Return an independently reviewable report and any scoped improvement proposals through the governed Refiner/Conductor/Continuum workflow."});
             self.persist_post_restart_review(id, host, plan, &affected, host_evidence_missing)
                 .await?;
+            if self.config.host_recovery.automatic_restart_investigations {
+                if let Err(error) = crate::reset_rca::run(self, id, host, &services).await {
+                    tracing::warn!(device_id=host, request_id=id, error=%error, "reset investigation will resume after its dependencies recover");
+                }
+            }
             reviewed += 1;
         }
         Ok(reviewed)
@@ -1515,7 +1590,11 @@ impl ConductorService {
         missing: bool,
     ) -> Result<()> {
         let key = format!("post-restart-review:{request}");
-        let status = if missing {
+        let automatic = self.config.host_recovery.automatic_restart_investigations
+            && request != "audit-source-unavailable";
+        let status = if automatic {
+            WorkStatus::InOperation
+        } else if missing {
             WorkStatus::OnHold
         } else {
             WorkStatus::Planned
@@ -1523,13 +1602,15 @@ impl ConductorService {
         let mut item = if let Some(existing) =
             self.repository.find_work_item_by_dedupe_key(&key).await?
         {
+            let resumable = automatic && existing.plan["execution_mode"] == "conductor_reset_rca";
             if existing.status.is_terminal()
                 || existing.admin_override
-                || existing.execution_approved
-                || matches!(
-                    existing.status,
-                    WorkStatus::Scheduled | WorkStatus::InOperation
-                )
+                || (!resumable
+                    && (existing.execution_approved
+                        || matches!(
+                            existing.status,
+                            WorkStatus::Scheduled | WorkStatus::InOperation
+                        )))
             {
                 return Ok(());
             }
@@ -1539,18 +1620,22 @@ impl ConductorService {
             let mut item = existing;
             item.plan = plan;
             item.status = status;
-            item.execution_approved = false;
-            item.approval_metadata = json!({});
+            item.execution_approved = automatic;
+            item.approval_metadata = json!({"approved":automatic,"schedule_now":false,"mode":"owner_authorized_reset_investigation","executor":"conductor_internal_rca"});
             item
         } else {
             WorkItem::from_new(serde_json::from_value(json!({"dedupe_key":key,
-                "title":format!("Review warm-restart logs and prevent recurrence on {host}"),
+                "title":format!("Investigate host reset and prevent recurrence on {host}"),
                 "summary":"Correlate the recovery episode with host/service/dependency logs and independently qualify recurrence prevention and lingering-fault actions.",
                 "target_service":affected.first().cloned(),"delivery_stage":"development",
-                "status":status,"priority":100,"execution_approved":false,"verification_required":true,
+                "status":status,"priority":100,"execution_approved":automatic,"verification_required":true,
                 "tags":["post-restart-review","recurrence-prevention"],"plan":plan,
                 "source":"conductor_startup_restart_review"}))?)
         };
+        if automatic {
+            item.approval_metadata = json!({"approved":true,"schedule_now":false,"mode":"owner_authorized_reset_investigation","executor":"conductor_internal_rca"});
+            item.started_at.get_or_insert_with(now_utc);
+        }
         item.updated_at = now_utc();
         self.repository.upsert_work_item(&item).await?;
         let mut event = ConductorEvent::new(
@@ -5571,7 +5656,14 @@ pub fn spawn_background_loops(service: ConductorService) {
             if let Err(error) = restart_review.review_recent_warm_restarts().await {
                 tracing::warn!(error = %error, "post-warm-restart log review requires evidence reconciliation");
             }
-            tokio::time::sleep(Duration::from_secs(300)).await;
+            tokio::time::sleep(Duration::from_secs(
+                restart_review
+                    .config
+                    .host_recovery
+                    .restart_review_interval_seconds
+                    .clamp(30, 3600),
+            ))
+            .await;
         }
     });
 
@@ -7900,6 +7992,9 @@ fn work_item_requires_ai_review(item: &WorkItem) -> bool {
 
 fn approval_dependency_blockers(item: &WorkItem, work_items: &[WorkItem]) -> Vec<String> {
     let mut blockers = Vec::new();
+    if let Some(blocker) = crate::reset_rca::generic_execution_blocker(item) {
+        blockers.push(blocker);
+    }
     for reference in &item.depends_on {
         let reference = reference.trim();
         if reference.is_empty() {
@@ -9596,6 +9691,91 @@ mod tests {
         assert!(current.execution_approved);
         assert_eq!(current.rollout_strategy, RolloutStrategy::Canary);
     }
+    #[tokio::test]
+    async fn reset_rca_resumes_after_conductor_restart_and_deduplicates_resolution() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let history_present = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let history = history_present.clone();
+        let app = Router::new()
+            .route("/health", get(|| async { Json(json!({"status":"ok","service":"nmc_server"})) }))
+            .route("/devices/recovery-history", get(move || { let history=history.clone(); async move {
+                Json(json!({"success":true,"data":{"truncated":false,"entries":if history.load(Ordering::SeqCst) {
+                    vec![json!({"action":"reboot","request_id":"self-host-boot","device_id":"qc01","controller_id":"qc01-bmc","started_at_unix_ms":now_utc().timestamp_millis()-1000,"phase":"observed"})]
+                } else {vec![]}}}))
+            }}))
+            .route("/devices/inventory", get(|| async {Json(json!({"success":true,"data":{"devices":[{"id":"qc01"}]}}))}))
+            .route("/tracey/fleet", get(|| async {Json(json!({"success":true,"data":{"agents":[]}}))}))
+            .route("/v1/llm/complete", post(move || {let counter=counter.clone(); async move {
+                let n=counter.fetch_add(1,Ordering::SeqCst);
+                if n==0 { return (StatusCode::SERVICE_UNAVAILABLE,Json(json!({"error":"Gail still recovering"}))); }
+                (StatusCode::OK,Json(json!({"text":json!({"summary":"Abrupt outage; no crash dump. Storage fault is a hypothesis.","hypotheses":["Storage or platform failure remains unconfirmed"],"missing_evidence":["Panic trace"],"resolution_actions":[
+                    {"title":"Retain bounded diagnostics","kind":"configuration","target_service":"conductor","requirements":"Add bounded persistent diagnostics and rollback","acceptance":["Replay test preserves pre-outage evidence"]},
+                    {"title":"Inspect SATA path","kind":"hardware","target_service":"conductor","requirements":"Inspect cabling in maintenance window","acceptance":["SATA errors cease under observed load"]}
+                ]}).to_string()})))
+            }}));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let repository = Arc::new(MemoryRepository::new());
+        let mut config = ConductorConfig::default();
+        config.integrations.continuum.base_url = Some(base.clone());
+        config.integrations.continuum.timeout_seconds = 1;
+        config.integrations.gail.enabled = true;
+        config.integrations.gail.base_url = Some(base);
+        config.host_recovery.automatic_restart_investigations = true;
+        let mut own_host = conductor_self_test_service(&config, None);
+        own_host.hosts = vec!["qc01".into()];
+        repository
+            .replace_service_snapshots(&[own_host])
+            .await
+            .unwrap();
+        let service = ConductorService::new(
+            config.clone(),
+            repository.clone(),
+            build_http_client(2).unwrap(),
+        );
+        service.review_recent_warm_restarts().await.unwrap();
+        let pending = repository
+            .find_work_item_by_dedupe_key("post-restart-review:self-host-boot")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.status, WorkStatus::InOperation);
+        assert!(pending.execution_approved);
+        assert_eq!(pending.plan["review_complete"], false);
+        // The original audit can rotate while Conductor's host is down.
+        history_present.store(false, Ordering::SeqCst);
+        drop(service);
+        let recovered =
+            ConductorService::new(config, repository.clone(), build_http_client(2).unwrap());
+        recovered.review_recent_warm_restarts().await.unwrap();
+        recovered.review_recent_warm_restarts().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let items = repository.list_work_items().await.unwrap();
+        assert_eq!(items.len(), 3);
+        let parent = items
+            .iter()
+            .find(|i| i.dedupe_key.as_deref() == Some("post-restart-review:self-host-boot"))
+            .unwrap();
+        assert_eq!(parent.plan["analysis_complete"], true);
+        assert_eq!(parent.plan["review_complete"], false);
+        let hardware = items.iter().find(|i| i.plan["kind"] == "hardware").unwrap();
+        assert_eq!(hardware.status, WorkStatus::OnHold);
+        assert!(!hardware.execution_approved);
+        assert!(!approval_dependency_blockers(hardware, &items).is_empty());
+        let software = items
+            .iter()
+            .find(|i| i.plan["kind"] == "configuration")
+            .unwrap();
+        assert_eq!(software.status, WorkStatus::Scheduled);
+        assert!(software.execution_approved);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn startup_restart_review_reads_host_logs_and_deduplicates_follow_up() {
         let app = Router::new()

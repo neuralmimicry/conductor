@@ -412,6 +412,9 @@ async fn dispatch_claimed_work_item_inner(
             .find(|service| service.service_key == target)
     });
     let mut dependency_blockers = dependency_blockers(item, &work_items);
+    if let Some(blocker) = crate::reset_rca::generic_execution_blocker(item) {
+        dependency_blockers.push(blocker);
+    }
     if item.delivery_stage.requires_live_readiness() {
         if let Some(target_key) = item.target_service.as_deref() {
             dependency_blockers.extend(deployment_dependency_blockers(

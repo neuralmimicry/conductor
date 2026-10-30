@@ -21,6 +21,7 @@ use crate::{
         DiscoveryRun, ProbeResult, RepositorySnapshot, RunStatus, ServiceHealth, ServiceSnapshot,
         now_utc, topology_from_services, unique_strings,
     },
+    product_catalog::business_product,
 };
 
 pub struct DiscoveryOutput {
@@ -838,8 +839,57 @@ fn collect_services(
             }
         }
 
+        // A shared deployment role is not a runtime service. Fan its selected
+        // products out before generic role discovery, preserving per-product
+        // playbooks, dependencies and repository identity.
+        if playbook
+            .roles
+            .iter()
+            .any(|role| role == "continuum_tenant_business_suite")
+        {
+            let mut shared = role_defaults
+                .get("continuum_tenant_business_suite")
+                .cloned()
+                .unwrap_or_default();
+            overlay_map(&mut shared, &playbook.vars);
+            if let Some(products) = shared
+                .get("continuum_business_products")
+                .and_then(Value::as_array)
+            {
+                for key in products.iter().filter_map(Value::as_str) {
+                    let Some(product) = business_product(key) else {
+                        continue;
+                    };
+                    let mut vars = relevant_global_vars(global_vars, key);
+                    // Runtime coordinates are fixed by the shared role's
+                    // business-stack template; do not invent a public ingress.
+                    vars.insert(format!("continuum_tenant_{key}_port"), json!(8080));
+                    vars.insert(
+                        format!("continuum_tenant_{key}_repo_url"),
+                        json!(format!("https://github.com/neuralmimicry/{key}.git")),
+                    );
+                    vars.insert("continuum_business_product".into(), json!(key));
+                    let entry = entries.entry(key.into()).or_insert_with(|| {
+                        MutableService::new(
+                            key,
+                            product.name,
+                            "tenant_service",
+                            "continuum_tenant_business_suite",
+                        )
+                    });
+                    entry
+                        .capabilities
+                        .extend(product.capabilities.iter().map(|value| value.to_string()));
+                    entry
+                        .dependencies
+                        .extend(product.dependencies.iter().map(|value| value.to_string()));
+                    entry.absorb(&playbook.file_name, &playbook.hosts, &vars, &imported);
+                }
+            }
+        }
+
         for role in &playbook.roles {
-            if role == "continuum_tenant_k8s_app" {
+            if role == "continuum_tenant_k8s_app" || role == "continuum_tenant_business_suite" {
                 continue;
             }
             if role == "tracey_host_agent" {
@@ -2437,6 +2487,9 @@ fn runtime_type_for_service(service: &ServiceSnapshot) -> String {
 }
 
 fn purpose_for_service(service: &ServiceSnapshot) -> String {
+    if let Some(product) = business_product(&service.service_key) {
+        return product.purpose.into();
+    }
     match service.service_key.as_str() {
         "conductor" => "governed_improvement_control_plane".to_string(),
         "continuum" => "cluster_control_plane".to_string(),
@@ -2466,6 +2519,9 @@ fn criticality_for_service(service: &ServiceSnapshot) -> String {
 }
 
 fn runtime_type_for_repository_name(name: &str) -> Option<String> {
+    if business_product(&normalize_repo_name(name)).is_some() {
+        return Some("workflow_service".into());
+    }
     match normalize_repo_name(name).as_str() {
         "jirastats" => Some("analysis_tooling".to_string()),
         "rag_demo" => Some("workflow_service".to_string()),
@@ -2478,6 +2534,9 @@ fn runtime_type_for_repository_name(name: &str) -> Option<String> {
 }
 
 fn purpose_for_repository_name(name: &str) -> Option<String> {
+    if let Some(product) = business_product(&normalize_repo_name(name)) {
+        return Some(product.purpose.into());
+    }
     match normalize_repo_name(name).as_str() {
         "conductor" => Some("governed_improvement_control_plane".to_string()),
         "rag_demo" => Some("code_generation_executor".to_string()),
@@ -2501,6 +2560,13 @@ fn criticality_for_repository_name(name: &str) -> String {
 }
 
 fn repository_capabilities_by_name(name: &str) -> BTreeSet<String> {
+    if let Some(product) = business_product(&normalize_repo_name(name)) {
+        return product
+            .capabilities
+            .iter()
+            .map(|value| value.to_string())
+            .collect();
+    }
     match normalize_repo_name(name).as_str() {
         "conductor" => ["governance", "inventory", "execution_control"]
             .into_iter()
@@ -2821,5 +2887,89 @@ mod tests {
         );
         assert!(service.playbooks.contains(&"playbook.yml".to_string()));
         assert!(service.capabilities.contains(&"ansible".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod business_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn shared_role_fans_out_and_deduplicates_real_product_coordinates() {
+        let defaults = BTreeMap::from([(
+            "continuum_tenant_business_suite".into(),
+            serde_json::from_value(
+                json!({"continuum_business_products":["cora","foresight","verity","relay"]}),
+            )
+            .unwrap(),
+        )]);
+        let books = vec![
+            PlaybookDocument {
+                file_name: "continuum_tenant_business_suite_site.yml".into(),
+                hosts: vec!["rk1".into()],
+                roles: vec!["continuum_tenant_business_suite".into()],
+                vars: Map::new(),
+                import_playbook: None,
+            },
+            PlaybookDocument {
+                file_name: "continuum_tenant_cora_site.yml".into(),
+                hosts: vec!["rk1".into()],
+                roles: vec!["continuum_tenant_business_suite".into()],
+                vars: serde_json::from_value(json!({"continuum_business_products":["cora"]}))
+                    .unwrap(),
+                import_playbook: None,
+            },
+        ];
+        let services = collect_services(
+            &ConductorConfig::default(),
+            &books,
+            &defaults,
+            &BTreeMap::new(),
+            &InventoryIndex::default(),
+            &[],
+        );
+        assert_eq!(services.len(), 4);
+        for product in crate::product_catalog::BUSINESS_PRODUCTS {
+            let service = services
+                .iter()
+                .find(|service| service.service_key == product.key)
+                .unwrap();
+            assert_eq!(
+                service.internal_url.as_deref(),
+                Some(
+                    format!(
+                        "http://{}.{}.svc.cluster.local:8080",
+                        product.key, product.key
+                    )
+                    .as_str()
+                )
+            );
+            assert!(service.public_url.is_none());
+            assert_eq!(
+                service.repo_url.as_deref(),
+                Some(format!("https://github.com/neuralmimicry/{}.git", product.key).as_str())
+            );
+            assert_eq!(
+                service.dependencies,
+                product
+                    .dependencies
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(purpose_for_service(service), product.purpose);
+            assert!(!service.capabilities.is_empty());
+        }
+        assert_eq!(
+            services
+                .iter()
+                .find(|service| service.service_key == "cora")
+                .unwrap()
+                .playbooks
+                .len(),
+            2
+        );
     }
 }

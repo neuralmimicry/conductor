@@ -554,12 +554,12 @@ fn require_restart_reviews(recovery: &Value, reviews: &[WorkItem], now_ms: i64) 
         recovery["truncated"] == false && recovery["entries"].is_array(),
         "fresh complete warm-restart history is required before production"
     );
-    for episode in recovery["entries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|e| e["action"] == "warm_restart")
-    {
+    for episode in recovery["entries"].as_array().unwrap().iter().filter(|e| {
+        matches!(
+            e["action"].as_str(),
+            Some("warm_restart" | "cold_restart" | "reboot")
+        )
+    }) {
         let request = episode["request_id"]
             .as_str()
             .context("restart history identity missing")?;
