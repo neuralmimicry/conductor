@@ -84,7 +84,46 @@ impl ContinuumClient {
     /// Read the verified device registry through Continuum. Host recovery must
     /// never construct controller mappings from names or addresses on its own.
     pub async fn recovery_history(&self) -> Result<Value> {
-        self.get_json("/devices/recovery-history").await
+        let mut entries = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut observed = None;
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            let path = match &cursor {
+                Some(c) => format!("/devices/recovery-history?page=true&cursor={c}"),
+                None => "/devices/recovery-history?page=true".to_string(),
+            };
+            let page = crate::release::payload(self.get_json(&path).await?)?;
+            anyhow::ensure!(
+                page["truncated"] == false && page["entries"].is_array(),
+                "reset history page is incomplete"
+            );
+            if observed.is_none() {
+                observed = page.get("observed_at_unix_ms").cloned();
+            }
+            entries.extend(page["entries"].as_array().unwrap().iter().cloned());
+            if page["has_more"] != true {
+                return Ok(
+                    serde_json::json!({"success":true,"data":{"entries":entries,"truncated":false,"observed_at_unix_ms":observed}}),
+                );
+            }
+            let next = page["next_cursor"]
+                .as_str()
+                .ok_or_else(|| anyhow!("reset history cursor missing"))?
+                .to_string();
+            anyhow::ensure!(
+                next.len() <= 160
+                    && next
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"_.:-".contains(&c))
+                    && seen.insert(next.clone()),
+                "invalid/repeated reset cursor"
+            );
+            cursor = Some(next);
+        }
+        Err(anyhow!(
+            "reset history exceeds bounded catch-up; preserve cursor evidence"
+        ))
     }
     pub async fn tracey_host_logs(&self, agent: &str) -> Result<Value> {
         anyhow::ensure!(

@@ -827,7 +827,7 @@ pub async fn restart_ssh_evidence(
     let mut sources = Vec::new();
     let mut logs = Vec::new();
     for (source, flags) in [
-        ("previous_boot", "-b -1 -p warning"),
+        ("previous_boot", "-b -1"),
         ("previous_kernel", "-b -1 -k"),
         ("current_services", "-b 0 -p warning"),
     ] {
@@ -877,7 +877,7 @@ pub async fn restart_ssh_evidence(
         };
         match tokio::time::timeout(std::time::Duration::from_secs(10), result).await {
             Ok(Ok(rows)) => {
-                sources.push(serde_json::json!({"source":source,"available":!rows.is_empty(),"records":rows.len(),"truncated":rows.len() >= 200,"findings":post_restart_log_findings(&rows,restart_ms,restart_ms+3_600_000),"boot_ids":rows.iter().filter_map(|r|r["boot_id"].as_str()).collect::<std::collections::BTreeSet<_>>(),"gap":if rows.is_empty(){Some("No correlated journal entries; previous-boot coverage unproven")}else{None}}));
+                sources.push(serde_json::json!({"source":source,"available":!rows.is_empty(),"records":rows.len(),"first_record_at_unix_ms":rows.iter().filter_map(|r|r["ts_ms"].as_i64()).min(),"last_record_at_unix_ms":rows.iter().filter_map(|r|r["ts_ms"].as_i64()).max(),"truncated":rows.len() >= 200,"findings":post_restart_log_findings(&rows,restart_ms,restart_ms+3_600_000),"boot_ids":rows.iter().filter_map(|r|r["boot_id"].as_str()).collect::<std::collections::BTreeSet<_>>(),"gap":if rows.is_empty(){Some("No correlated journal entries; previous-boot coverage unproven")}else{None}}));
                 logs.extend(rows);
             }
             _ => sources.push(serde_json::json!({"source":source,"available":false,"gap":"SSH/journal collection unavailable or exceeded time/output bounds"})),

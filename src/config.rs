@@ -328,6 +328,10 @@ pub struct RecoveryTargetConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostRecoveryConfig {
+    /// Owner-authorized read-only RCA and governed resolution work, including
+    /// catch-up after Conductor itself was unavailable on the recovered host.
+    pub automatic_restart_investigations: bool,
+    pub restart_review_interval_seconds: u64,
     /// Read-only SSH evidence is separately allowlisted from recovery mutations.
     pub review_ssh: Vec<RestartReviewSshConfig>,
     pub enabled: bool,
@@ -763,6 +767,8 @@ impl Default for RecoveryConfig {
 impl Default for HostRecoveryConfig {
     fn default() -> Self {
         Self {
+            automatic_restart_investigations: false,
+            restart_review_interval_seconds: 300,
             review_ssh: Vec::new(),
             enabled: false,
             dry_run: true,
